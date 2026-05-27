@@ -349,6 +349,64 @@ Gitbulk Triage Tool = goal:
 
     # ─── ON-DISK CONVENTIONS ─────────────────────────────────────────────────
 
+    Invariants Framework Implementation = decision:
+      id: ivp4wq7n
+      why: >
+        invariants/ implements the policy-as-named-chains model from
+        node c4jzm5pn. Three internal files:
+
+          invariants/base.py
+            - Result types: three frozen dataclasses Pass, Skip(reason),
+              Fail(reason). Type alias Result = Pass | Skip | Fail.
+              Consumer call sites use isinstance dispatch (no match
+              statement requirement; works on 3.10+).
+            - InvariantKind enum: UNIVERSAL, PER_REPO, PER_PR. Per-
+              subcommand applicability is a separate ClassVar
+              (frozenset[str]) — kind says WHAT scope, subcommands
+              says WHICH subcommands.
+            - InvariantContext frozen dataclass: policy, runstate,
+              repo (optional), pr (optional, typed Any until Phase
+              2's PRInfo), gh (optional, Any until Phase 2's GHClient).
+              Universal invariants leave repo/pr/gh as None; per-repo
+              invariants assert ctx.repo is not None inside check().
+            - Invariant ABC with ClassVar name/kind/subcommands and
+              abstract check(ctx) -> Result.
+
+          invariants/registry.py
+            - Module-level dict _REGISTRY: dict[str, type[Invariant]].
+            - @register decorator: raises ValueError on duplicate name.
+            - get(name), all_invariants() (returns shallow copy),
+              for_subcommand(sub) -> list filtered by subcommands set.
+            - _clear() test-only helper. Tests use a fixture to
+              snapshot+restore around each test so registrations don't
+              leak.
+
+          invariants/runner.py
+            - ChainResult frozen dataclass:
+                passed: bool
+                fail_reason: str | None
+                skips: tuple[tuple[str, str], ...]   # (name, reason)
+            - run_chain(invariants, ctx, *, skip_set, target) iterates,
+              recording each outcome to ctx.runstate.record_invariant.
+              Stops on first Fail. Per the user choice this session:
+              an invariant that RAISES is caught and converted to Fail
+              (the run aborts), with the traceback summary captured in
+              ctx.runstate.record_error so the audit trail is debuggable.
+              A non-Result return raises TypeError (programmer bug).
+
+        Override semantics from node r4nzp7kq (cmdline-wins) are
+        NOT enforced inside run_chain itself; the caller (CLI
+        handler, Phase 2) computes the effective skip_set from
+        config + cmdline before calling. This keeps run_chain a
+        pure executor and makes the override-audit point a single
+        location in the CLI layer instead of leaking through here.
+
+        Invariant kinds drive WHICH chain a CLI handler builds and
+        in what order (universal once, then per-repo, then per-PR).
+        Phase 1C delivers the framework only; concrete invariants
+        from the design-notes catalog land in Phase 2 onward.
+      approved-by: daniel, 2026-05-27
+
     Dashboard Composition = decision:
       id: dwq3kpn4
       why: >
