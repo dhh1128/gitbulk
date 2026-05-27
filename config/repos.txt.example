@@ -1,0 +1,12 @@
+# gitbulk repo list — one owner/repo per line.
+# Blank lines and lines starting with # are ignored.
+# Local clone is assumed to be at ~/code/<repo-basename>.
+
+# Provenant
+provenant-dev/origin-platform
+provenant-dev/origin-agent-svc
+provenant-dev/origin-clerk-svc
+provenant-dev/agentprep
+
+# Open source
+# hyperledger/aries-cloudagent-python

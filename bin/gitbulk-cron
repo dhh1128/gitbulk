@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Cron-friendly wrapper around `gitbulk`.
+# Captures all output to a timestamped log under ~/.cache/gitbulk/cron/.
+# On non-zero exit, symlinks the log as last-failure.log for easy inspection.
+#
+# Usage from crontab:
+#   0 3 * * * /home/you/code/gitbulk/bin/gitbulk-cron report
+#
+set -u
+
+LOG_DIR="${HOME}/.cache/gitbulk/cron"
+mkdir -p "${LOG_DIR}"
+
+TS=$(date +%Y%m%dT%H%M%S)
+SUBCMD="${1:-report}"
+LOG="${LOG_DIR}/${TS}-${SUBCMD}.log"
+
+gitbulk "$@" >"${LOG}" 2>&1
+rc=$?
+
+if [ ${rc} -ne 0 ]; then
+    ln -sf "${LOG}" "${LOG_DIR}/last-failure.log"
+fi
+
+exit ${rc}
