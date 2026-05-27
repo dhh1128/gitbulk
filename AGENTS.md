@@ -89,6 +89,16 @@ Tests MUST NOT call `gh`, `git fetch`, or any other network operation.
 Subprocess and network dependencies are injected so tests stay offline,
 deterministic, and fast.
 
+### Coverage standard
+
+100% branch coverage on `src/gitbulk/`, enforced in CI. A gap requires
+an approved `deviation:` node in `this.i` (see `docs/methodology.md` §6);
+a gap without one is a defect, not a judgment call. The framing — "a bug
+in gitbulk can damage real work in real repos" — applies most acutely
+to the local-git safety contract above, where an untested fallback could
+be the branch that writes to the main clone instead of a worktree. The
+decision is recorded in `this.i` as node `cn4pk7zq`.
+
 ### Sign off every commit
 
 DCO is enforced in repos this tool operates on, and the same discipline
