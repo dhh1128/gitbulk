@@ -349,6 +349,43 @@ Gitbulk Triage Tool = goal:
 
     # ─── ON-DISK CONVENTIONS ─────────────────────────────────────────────────
 
+    CLI Wiring Phase 1C = decision:
+      id: clip7nm4
+      why: >
+        cli.py grows real handlers for two subcommands that no longer
+        live in the "not yet implemented" pool:
+
+          `gitbulk invariants` — reads
+          gitbulk.invariants.all_invariants() and prints one line per
+          registered invariant: "name  [kind]  applies-to: <subs>".
+          When the registry is empty (Phase 1C state — concrete
+          invariants land in Phase 2+), prints a brief explanatory
+          message and returns 0.
+
+          `gitbulk ack` — calls sentinel.clear_attention() and reports
+          "cleared" or "no sentinel was set"; returns 0 either way.
+
+        Exit-code → ATTENTION wiring in main():
+          - On exit 2 (EXIT_ATTENTION_NEEDED) or 3 (EXIT_INVARIANT_SKIPPED):
+            if no sentinel is already present, write a fallback sentinel
+            with subcommand + "?" runid. Phase 2+ handlers will pre-empt
+            this by writing their own richer sentinel with the real
+            runid before returning.
+          - Exit 4 (EXIT_OVERRIDES_APPLIED) does NOT trigger ATTENTION
+            per design-notes §8 — it's an audit signal logged in
+            invariants.log, not user-visible attention-needed state.
+          - Subcommand handlers that return 0 do NOT clear ATTENTION;
+            clearing is explicitly the user's gesture via `gitbulk ack`,
+            because a 0-exit on one subcommand does not necessarily
+            mean every concern from a previous subcommand has been
+            resolved.
+
+        Subcommand stubs for report/summarize/dispatch/merge/
+        rebase-onto-default/close-stale/show continue to return 99
+        until their respective phases (2-5) implement them; main()'s
+        wiring does not change for those.
+      approved-by: daniel, 2026-05-27
+
     Invariants Framework Implementation = decision:
       id: ivp4wq7n
       why: >
