@@ -1,35 +1,49 @@
 # gitbulk policy and classification config.
-# Copy to ~/.config/gitbulk/gitbulk.yaml and edit.
+# Copy to ~/.config/gitbulk/gitbulk.yaml and edit. Every value below is
+# optional; missing keys fall back to the documented defaults from
+# `this.i`. Unknown keys are rejected loudly — typos like
+# `min_buisness_days` will fail validation rather than silently no-op.
 
 defaults:
-  merge_policy: strict          # strict | ci-only | never
-  min_age_days: 5               # auto-merge: PR must be at least this old
-  stale_age_days: 60            # close-stale: inactivity threshold
-  stale_cooloff_days: 7         # close-stale: must have been warned at least this long ago
-  default_branch_only: true     # refuse to merge PRs targeting non-default branch
-  worktree_root: /tmp/gitbulk   # disposable worktree location
-  dispatch_concurrency: 2       # max parallel claude invocations
+  merge_policy: strict           # strict | ci-only | never
+  min_business_days: 3           # business days (M-F local TZ) since "ready"
+  unresolved_burden: me          # me | other | either — who marks threads resolved
+  bot_threads_block: true        # if true, unresolved bot threads also block "ready"
+  stale_age_days: 60             # close-stale: inactivity threshold
+  stale_cooloff_days: 7          # close-stale: must have been warned at least this long ago
+  # skip_checks: []              # invariants suppressed for every repo
+  # extra_checks: []             # extra invariants enabled for every repo
 
 humans:
-  org: provenant-dev            # gitbulk enumerates org members via `gh api orgs/<org>/members`
+  org: provenant-dev             # gitbulk enumerates org members via `gh api orgs/<org>/members`
   cache_ttl_hours: 24
-  exceptions: []                # org members that are actually bots
-  always_human: []              # extra logins outside the org that should count as human
+  exceptions: []                 # org members that are actually bots
+  always_human: []               # extra logins outside the org that should count as human
 
-bots:                           # known non-human accounts; extend as needed
+bots:                            # known non-human accounts; extend as needed
   - github-copilot[bot]
   - copilot-pull-request-reviewer[bot]
   - dependabot[bot]
   - github-actions[bot]
   - renovate[bot]
 
-# Per-repo overrides. Keys are owner/repo strings from repos.txt.
+# Per-repo overrides. Keys are owner/repo strings from repos.txt. Scalar
+# fields override the matching `defaults.` value; list fields
+# (skip_checks, extra_checks) are APPENDED to the defaults list rather
+# than replacing it.
 repos: {}
   # provenant-dev/origin-experimental-svc:
   #   merge_policy: ci-only
-  #   min_age_days: 1
+  #   min_business_days: 1
   # someorg/personal-project:
   #   skip_checks: [repo.agentprep_verified]
+  # provenant-dev/origin-platform:
+  #   unresolved_burden: other     # acting as maintainer here, not contributor
+
+# Disposable worktree root. Defaults to ~/.cache/gitbulk/worktrees/
+# (per this.i node mw6kp2nq). Override only if you need a different
+# location — e.g., a tmpfs mount.
+# worktree_root: ~/.cache/gitbulk/worktrees
 
 notifications:
   # Layers 1-4 (file-based) are always-on and require no config here.
