@@ -349,6 +349,45 @@ Gitbulk Triage Tool = goal:
 
     # ─── ON-DISK CONVENTIONS ─────────────────────────────────────────────────
 
+    Business Day Arithmetic API = decision:
+      id: gmw3npk7
+      why: >
+        util/businessdays.py provides two pure functions used by the
+        merge-readiness clock from node bg4pqn7m:
+        is_business_day(dt) -> bool and
+        add_business_days(start, n) -> datetime. Conventions:
+
+        (a) Weekdays only: Monday through Friday are business days; no
+        holiday awareness. Matches the policy lock in bg4pqn7m.
+
+        (b) add_business_days preserves time-of-day. Friday 17:00 plus
+        1 business day equals Monday 17:00. Reason: ready_since is a
+        wall-clock moment, not a calendar day — "3 business days
+        later" most naturally means "the same wall-clock moment 3
+        business days later." Rejected "round to midnight at the end
+        of day N" because it would let a Friday-17:00-ready PR become
+        merge-eligible at Wednesday 00:00, six hours short of three
+        full business days.
+
+        (c) If start is itself a weekend, the count begins from the
+        next business day. add_business_days(Saturday 17:00, 1) is
+        Monday 17:00. Reason: a PR that becomes ready over the weekend
+        shouldn't accrue weekend "credit" toward its age threshold.
+
+        (d) n=0 is identity (returns start unchanged even if weekend);
+        n<0 raises ValueError. gitbulk never needs to subtract business
+        days; rejecting the case loudly is safer than silently
+        defining backward semantics.
+
+        (e) The function does not normalize timezone. Callers pass
+        tz-aware datetimes and the local-TZ semantics from
+        bg4pqn7m are the caller's responsibility — this module is
+        TZ-agnostic arithmetic on whatever tzinfo the caller supplies.
+
+        Excluded from v1: business_days_between() count function. No
+        caller needs it yet; added when one does (YAGNI).
+      approved-by: daniel, 2026-05-27
+
     Paths Module Conventions = decision:
       id: 3pw7qkn2
       why: >
