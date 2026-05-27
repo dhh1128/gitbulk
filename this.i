@@ -349,6 +349,75 @@ Gitbulk Triage Tool = goal:
 
     # ─── ON-DISK CONVENTIONS ─────────────────────────────────────────────────
 
+    Locks Module API And Semantics = decision:
+      id: hk5pq3nm
+      why: >
+        locks.py implements the two-lock concurrency model from node
+        lj5pqn4kr using fcntl.flock POSIX advisory locks. Public API
+        is two context managers:
+
+            global_lock(mode, *, timeout=None, subcommand=None)
+            repo_lock(slug,  *, timeout=None, subcommand=None)
+
+        Conventions:
+
+        (a) Library: fcntl.flock from the Python stdlib. No external
+        dep. gitbulk targets Linux (constraint 6jz4n2pq plus the
+        cron-on-Linux deployment model); Windows is not a goal. Cost:
+        no native Windows support; accepted explicitly.
+
+        (b) Mode is a string enum ("shared" | "exclusive") at the API
+        surface, mapping to LOCK_SH / LOCK_EX inside the
+        implementation. Reads as prose at call sites and is
+        extensible if upgrade patterns appear later.
+        repo_lock takes no mode — always exclusive (per lj5pqn4kr).
+
+        (c) Acquisition blocks forever by default; an optional
+        timeout kwarg (float seconds) lets interactive callers fail
+        fast with a LockTimeoutError. Cron is the primary target —
+        overlapping nightly runs should serialize, not fail
+        spuriously. Stuck processes are surfaced via metadata
+        (see (e)), not via aggressive default timeouts. Timeout
+        implementation: poll with LOCK_NB + sleep(min(0.1,
+        remaining)); raises LockTimeoutError including the holder's
+        metadata when the deadline elapses.
+
+        (d) Lock files persist empty after release rather than being
+        deleted. Their purpose is to be a stable fcntl target;
+        deletion would create an unlink/create/lock race on next
+        acquire.
+
+        (e) The holder writes JSON metadata to the lock file on
+        acquire:
+            {"pid": int,
+             "started_at": ISO-8601 UTC,
+             "subcommand": str | None}
+        Rationale: `cat ~/.cache/gitbulk/run.lock` shows who holds
+        the lock at a glance, which is the practical debugging win
+        when a stuck process keeps the next cron run waiting. A
+        future `gitbulk locks` subcommand (Phase 6) can scan
+        locks_dir/ and report systematically. Reset of metadata on
+        release: lock file is left in place but its contents reflect
+        the most-recent holder; on release the fd is just closed,
+        which implicitly releases the flock per POSIX semantics.
+
+        (f) Reentrancy is not supported: a process re-acquiring the
+        same lock has undefined behavior (documented, not asserted).
+        gitbulk's subcommand-per-process architecture never
+        re-acquires.
+
+        (g) Lock-event logging via logging.getLogger("gitbulk.locks");
+        cli.py later wires handlers to route into the run dir's
+        invariants.log. locks.py does NOT depend on runstate
+        directly (which would be circular — runstate uses locks).
+
+        (h) Tests use mocked fcntl.flock for argument verification
+        (LOCK_SH / LOCK_EX / LOCK_NB), plus a small set of
+        subprocess-spawned tests for genuine inter-process
+        contention, since fcntl.flock is per-process and threads in
+        the same process all see the lock as held.
+      approved-by: daniel, 2026-05-27
+
     Business Day Arithmetic API = decision:
       id: gmw3npk7
       why: >
