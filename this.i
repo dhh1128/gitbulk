@@ -347,6 +347,48 @@ Gitbulk Triage Tool = goal:
         friction at exactly the moment when the user needs the
         lowest-friction path forward.
 
+    # ─── ON-DISK CONVENTIONS ─────────────────────────────────────────────────
+
+    Paths Module Conventions = decision:
+      id: 3pw7qkn2
+      why: >
+        paths.py is the single source of truth for every file and
+        directory gitbulk reads or writes; reading paths.py tells you
+        gitbulk's entire on-disk footprint. Four conventions are
+        load-bearing:
+
+        (a) XDG-only path resolution: $XDG_CONFIG_HOME and
+        $XDG_CACHE_HOME are honored as the override mechanism, falling
+        back to ~/.config and ~/.cache respectively. No gitbulk-specific
+        override env var. Rationale: XDG is the documented platform
+        standard; tests monkeypatch the XDG vars to tmp_path and thereby
+        exercise the same code path production users will. Rejected
+        GITBULK_ROOT because it would split the world into "production
+        XDG behavior" vs "test-only override behavior" — that's exactly
+        the divergence that lets test-only paths rot.
+
+        (b) Compact ISO 8601 UTC for run-directory timestamps:
+        YYYYMMDDTHHMMSSZ (e.g., 20260527T194501Z). Sortable by `ls`,
+        filesystem-friendly (no colons), timezone-unambiguous. Rejected
+        epoch (unreadable when grepping run dirs) and hyphenated ISO
+        (longer with no readability gain since runs are not read aloud).
+        Always UTC so cross-timezone log comparison is straightforward.
+
+        (c) Slug normalization for filesystem use: owner/repo becomes
+        owner__repo (double underscore). Already established in this.i
+        node mw6kp2nq for worktrees; reused for locks/ and findings/ so
+        a single convention covers every place gitbulk encodes a slug
+        into a path. Malformed slugs (anything not matching exactly
+        owner/repo) raise ValueError at the boundary rather than
+        silently producing odd filenames.
+
+        (d) No memoization in path helpers: each call reads env vars
+        and constructs the Path fresh. The cost (a few microseconds
+        per call) is irrelevant; the benefit is that test fixtures
+        setting and unsetting XDG vars work without cache-clearing
+        rituals.
+      approved-by: daniel, 2026-05-27
+
     # ─── NETWORK BEHAVIOR ────────────────────────────────────────────────────
 
     Serial GraphQL Coalescing No Rate Limiter = decision:
