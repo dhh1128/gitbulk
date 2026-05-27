@@ -1,7 +1,9 @@
 """Command-line entry point for gitbulk.
 
-Phase 0 scaffold: all subcommands are wired into argparse but raise
-NotImplementedError. Real behavior arrives in subsequent phases.
+Phase 1C wires real handlers for ``ack`` and ``invariants``; the remaining
+subcommands keep returning EXIT_NOT_IMPLEMENTED until their respective
+phases land. Exit-code → ATTENTION sentinel fallback per this.i node
+``clip7nm4``.
 """
 
 import argparse
@@ -28,24 +30,13 @@ SUBCOMMANDS = [
     ("invariants", "List the invariant registry and which subcommands use them."),
 ]
 
+_ATTENTION_TRIGGER_CODES = {EXIT_ATTENTION_NEEDED, EXIT_INVARIANT_SKIPPED}
+
 
 def _check_python_version() -> None:
     if sys.version_info < (3, 10):
         print("gitbulk requires Python 3.10 or later.", file=sys.stderr)
         raise SystemExit(EXIT_STRUCTURAL_FAILURE)
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="gitbulk",
-        description="Nightly PR triage across many GitHub repositories.",
-    )
-    parser.add_argument("--version", action="version", version=f"gitbulk {__version__}")
-    subparsers = parser.add_subparsers(dest="subcommand", metavar="SUBCOMMAND")
-    for name, help_text in SUBCOMMANDS:
-        sp = subparsers.add_parser(name, help=help_text)
-        sp.set_defaults(handler=_not_implemented(name))
-    return parser
 
 
 def _not_implemented(name: str):
@@ -59,6 +50,69 @@ def _not_implemented(name: str):
     return handler
 
 
+def _ack_handler(_args: argparse.Namespace) -> int:
+    from gitbulk import sentinel
+
+    if sentinel.clear_attention():
+        print("ATTENTION sentinel cleared.")
+    else:
+        print("No ATTENTION sentinel was set.")
+    return EXIT_OK
+
+
+def _invariants_handler(_args: argparse.Namespace) -> int:
+    from gitbulk import invariants
+
+    registered = invariants.all_invariants()
+    if not registered:
+        print(
+            "No invariants registered yet. "
+            "(Concrete invariants land in Phase 2 and later.)"
+        )
+        return EXIT_OK
+    for name in sorted(registered):
+        cls = registered[name]
+        subs = ", ".join(sorted(cls.subcommands))
+        print(f"{name}  [{cls.kind.value}]  applies-to: {subs}")
+    return EXIT_OK
+
+
+_SPECIAL_HANDLERS = {
+    "ack": _ack_handler,
+    "invariants": _invariants_handler,
+}
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="gitbulk",
+        description="Nightly PR triage and fleet maintenance across many GitHub repositories.",
+    )
+    parser.add_argument("--version", action="version", version=f"gitbulk {__version__}")
+    subparsers = parser.add_subparsers(dest="subcommand", metavar="SUBCOMMAND")
+    for name, help_text in SUBCOMMANDS:
+        sp = subparsers.add_parser(name, help=help_text)
+        handler = _SPECIAL_HANDLERS.get(name, _not_implemented(name))
+        sp.set_defaults(handler=handler)
+    return parser
+
+
+def _maybe_set_attention(exit_code: int, subcommand: str) -> None:
+    """If the exit code warrants ATTENTION and no handler set one, write a fallback."""
+    if exit_code not in _ATTENTION_TRIGGER_CODES:
+        return
+    from gitbulk import sentinel
+
+    if sentinel.has_attention():
+        return
+    sentinel.set_attention(
+        exit_code,
+        subcommand,
+        "?",
+        "set by main(); handler did not write its own sentinel",
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     _check_python_version()
     parser = build_parser()
@@ -66,7 +120,9 @@ def main(argv: list[str] | None = None) -> int:
     if not args.subcommand:
         parser.print_help()
         return EXIT_OK
-    return args.handler(args)
+    exit_code = args.handler(args)
+    _maybe_set_attention(exit_code, args.subcommand)
+    return exit_code
 
 
 if __name__ == "__main__":
