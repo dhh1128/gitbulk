@@ -349,6 +349,43 @@ Gitbulk Triage Tool = goal:
 
     # ─── ON-DISK CONVENTIONS ─────────────────────────────────────────────────
 
+    Dashboard Composition = decision:
+      id: dwq3kpn4
+      why: >
+        dashboard.py rewrites ~/.cache/gitbulk/dashboard.md to be
+        the single-screen view of recent gitbulk state per node
+        tp4kq2nr.
+
+        API:
+            rewrite_dashboard() -> Path
+        Returns the path written, for ergonomic chaining.
+
+        Discovery: scans paths.runs_dir() for symlinks named
+        `latest-<subcommand>` (these exist only after a successful
+        runstate.complete() per kp7nw4mq.e). For each, reads
+        manifest.yaml (timestamps, exit_code) and the first ~15
+        lines of summary.md. A subcommand with no latest-* symlink
+        gets a "no runs yet" placeholder.
+
+        Markdown structure: one H2 section per subcommand; first
+        line per section is metadata
+        ("Run: <runid>  Exit: <code>  Completed: <iso>"), followed
+        by an excerpt of summary.md fenced or as a blockquote.
+
+        Incomplete runs (manifest.completed_at missing) are marked
+        with an explicit "**[INCOMPLETE]**" tag so the user sees
+        crashed cron runs immediately. This is the layer-3 visibility
+        property that lets ATTENTION sentinel and dashboard.md
+        together explain "what's gitbulk doing right now?" without
+        opening any run directories.
+
+        Atomic write via tmp + os.replace, same pattern as runstate.
+
+        Excerpt length: hardcoded to ~15 lines; truncation marker
+        "... (truncated; see <run-dir>/summary.md)" appended if
+        longer. Phase 6 polish can make this configurable.
+      approved-by: daniel, 2026-05-27
+
     ATTENTION Sentinel API = decision:
       id: snk7p4qm
       why: >
