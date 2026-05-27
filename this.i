@@ -349,6 +349,82 @@ Gitbulk Triage Tool = goal:
 
     # ─── ON-DISK CONVENTIONS ─────────────────────────────────────────────────
 
+    Run State Module Schema And API = decision:
+      id: kp7nw4mq
+      why: >
+        runstate.py manages the per-run audit trail. A RunState
+        object owns one directory at
+        runs_dir()/<timestamp>-<subcommand>/ and is the single place
+        every subcommand records its decisions.
+
+        Public API is class-based — a run is a long-lived stateful
+        thing, not a function:
+
+            RunState.begin(subcommand, argv, config_snapshot)
+            rs.record_invariant(name, target, result, reason)
+            rs.record_error(message, *, level, context)
+            rs.record_repo_state(slug, payload)
+            rs.write_summary(markdown)
+            rs.complete(exit_code)
+            rs.run_dir (property)
+
+        Schema decisions:
+
+        (a) manifest.yaml carries the full inline config snapshot —
+        the parsed gitbulk.yaml contents plus the contents of
+        repos.txt — not just a hash. Rationale: gitbulk.yaml lives at
+        ~/.config/gitbulk/ which is NOT in git; a hash without the
+        snapshot becomes irrecoverable on the next config edit. Cost:
+        10–50 KB per run for a 150-repo config; at ~100 runs/year
+        that is ~5 MB/year. Reproducibility of any past decision is
+        the load-bearing benefit.
+
+        (b) invariants.log and errors.log are JSON Lines (one JSON
+        object per line). Each event carries a UTC timestamp plus
+        event-specific fields. Rationale: machine-parseable for
+        `gitbulk show`, ad-hoc `jq` queries, and any future
+        dashboard. Not directly cat-friendly; users use `gitbulk
+        show` or `jq` to render. Accepted because the audit trail's
+        primary consumer is tooling, not eyeballing.
+
+        (c) state.yaml is rewritten atomically (write to .tmp,
+        rename over) on every record_repo_state call. Crash safety:
+        if the process dies mid-run, the most recent successful
+        per-repo write is durable on disk. Append-style YAML would
+        be smaller but harder to validate after a partial write.
+
+        (d) manifest.yaml is rewritten on complete() to add
+        completed_at and exit_code. A missing completed_at field
+        flags an incomplete/crashed run to `gitbulk show`. Atomic
+        via tmp+rename.
+
+        (e) latest-<subcommand> symlink is updated only at
+        complete(). A run that crashed never becomes "latest"; the
+        previous successful run remains the latest until a new run
+        completes. Atomicity: create latest-<sub>.tmp pointing at
+        the new run, then rename over the existing latest-<sub>.
+        Symlink target is RELATIVE (just the run dir's basename) so
+        the cache dir is relocatable without breaking symlinks.
+
+        (f) Append-only logs use buffered file.write() with no
+        locking. Events from a single subcommand process are written
+        serially by that process. Concurrent gitbulk runs each have
+        their own run directory, so no cross-process log contention
+        exists.
+
+        (g) record_invariant's `result` argument is one of "PASS",
+        "SKIP", or "FAIL" (uppercase strings); these mirror the
+        chain-runner Pass/Skip/Fail outcomes from node c4jzm5pn but
+        are serialized as strings to keep YAML/JSON simple.
+        record_invariant validates and raises ValueError on other
+        values.
+
+        (h) RunState does NOT take any lock on the run directory.
+        Subcommands acquire global_lock() in their CLI handler
+        before calling RunState.begin(). runstate.py and locks.py
+        have no circular dep; locks.py is the lower layer.
+      approved-by: daniel, 2026-05-27
+
     Locks Module API And Semantics = decision:
       id: hk5pq3nm
       why: >
