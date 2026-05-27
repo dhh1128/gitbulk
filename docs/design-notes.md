@@ -1,12 +1,20 @@
 # gitbulk design notes
 
-Captured from the design conversation that produced the Phase 0 scaffold.
-Treat this as the source of truth for *intent* — when intent and code
-disagree, fix one or the other deliberately and update this doc.
+Captured from the design conversation that produced the Phase 0 scaffold
+and the Phase 1A foundations session.
 
-This is not a spec. AGENTS.md is the contract; this file is the
-"why we chose what we chose" record, plus the list of decisions still
-open at the time the scaffold landed.
+> **Authoritative source:** As of 2026-05-27, [`../this.i`](../this.i) is
+> the source of truth for design decisions. This file is the *narrative
+> explainer* that points into it. When `this.i` and this file disagree,
+> `this.i` wins.
+>
+> Node ids (e.g., `7mxr4pql`) below cross-reference into `this.i`. See
+> [`methodology.md`](methodology.md) for what intent nodes are and why
+> they exist as a separate layer above the code.
+
+This is not a spec. AGENTS.md is the contract; `this.i` is the
+"why we chose what we chose" record; this file is the human-readable
+walking tour of both.
 
 ---
 
@@ -253,28 +261,34 @@ discipline per phase.
 - Cron file installation. The user wires their own crontab around
   `bin/gitbulk-cron`.
 
-## 11. Open questions (carry into next design session)
+## 11. Resolution status of the Phase-0 open questions
 
-1. **Default `min_age_days`** for auto-merge. Discussed without
-   landing. Candidates: 2, 3, 5, 7. Likely best set per-repo anyway.
-2. **Worktree root**: `/tmp/gitbulk/` (fast, cleared on reboot) vs
-   `~/code/<repo>/.git/gitbulk-worktrees/<runid>` (survives reboot,
-   stays with the repo so a crashed dispatch is easier to recover).
-3. **`summarize` prompt design**: the stub at `prompts/triage.md`
-   captures the intent but the actual prompt deserves refinement once
-   the report's structured output format is settled.
-4. **`rebase-onto-default` UX on conflicts**: should the worktree
-   persist with a conflict-marked state for manual fix-up, or be torn
-   down? The current sketch keeps it; verify that's what we want.
-5. **Per-repo policy precedence**: when both `repos.<name>.skip_checks`
-   and a cmdline `--require` mention the same invariant, who wins? Lean
-   toward cmdline wins, but state it explicitly.
-6. **`gh` rate limiting**: ~150 repos × multiple `gh` calls = potential
-   for hitting unauthed-feeling secondary limits. Decide on a rate
-   limiter or batching strategy in Phase 2.
-7. **What to do when a PR's local clone is missing**: skip with a
-   prominent warning, auto-clone, or fail? Current default leans
-   "skip with warning."
+Phase-0 closed with seven open questions. All seven now have positions
+recorded in `this.i` — six as decisions, one as a deferred tension:
+
+| # | Question | Resolution | `this.i` node |
+|---|---|---|---|
+| 1 | Default `min_age_days` for auto-merge | 3 business days (M–F, local TZ, no holidays) since `ready_since`; "ready" itself is stricter than GitHub-clean (bot threads block too) | `bg4pqn7m` + `zk3r4nqp` |
+| 2 | Worktree root location | `~/.cache/gitbulk/worktrees/<runid>/<owner>__<repo>/` — survives reboot for crash forensics, XDG-conventional | `mw6kp2nq` |
+| 3 | `summarize` prompt design | Deferred to Phase 3 entry — depends on `report`'s structured output, which doesn't exist yet | `kw2pn7qz` (tension) |
+| 4 | `rebase-onto-default` UX on conflicts | Keep the conflicted worktree; write `CONFLICT.md` with fix-up commands; `gitbulk gc` skips worktrees in conflict state | `vp7n2krq` |
+| 5 | Per-repo policy precedence | Cmdline always wins. Relaxing (`--skip-check`) trips exit 4 + WARNING; tightening (`--require`) logs INFO only | `r4nzp7kq` |
+| 6 | `gh` rate limiting | Serial per-repo + GraphQL coalescing, no limiter in v1 (~300 calls vs 5000/hr budget) | `gd4kp7nz` |
+| 7 | Missing local clone | Skip-with-warning, scoped to subcommands that need a clone; never auto-clone, never fail the whole run | `5xqp2nkr` |
+
+### New decisions and tensions opened during the Phase-1A session
+
+| Topic | `this.i` node | Status |
+|---|---|---|
+| Personal account owns the public repo (dhh1128/gitbulk, not provenant-dev) | `6xp4kq2n` | decision |
+| Local repos are first-class citizens — fleet = (repos × PRs), not just PRs | `xq4npk7r` | decision |
+| Methodology adoption (`this.i`, speculative interview, gates, adversarial review) | `nh4kp2rq` | decision |
+| 100% branch coverage on `src/gitbulk/`, enforced in CI | `cn4pk7zq` | decision |
+| `dispatch` execution kernel — subprocess multiprompt, shared kernel, or reimplement | `mp7kn4qz` | tension (Phase 4) |
+| Multiprompt packaging future — multiprompt's own this.i / CI / release story | `fw5kq6np` | tension (Phase 4) |
+| Scan and findings artifact convention — format, location, lifecycle | `ck7n4pqr` | tension (Phase 4) |
+| Repo cleanup subcommand scope — worktrees, branches, refs | `jw3kpn4q` | tension (Phase 5/6) |
+| Default branch rename handling | `rj7p4kqn` | tension |
 
 When in doubt, bias toward "skip with reason logged" over "do something
 risky."
