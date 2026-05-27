@@ -1,0 +1,495 @@
+# gitbulk intent file
+# Component: gitbulk (personal nightly PR-triage tool)
+# Format: intent code — nodes are named trees of key: value pairs.
+#   goal:       — purposive outcome.
+#   decision:   — an architectural choice made and locked.
+#   constraint: — a non-negotiable boundary condition.
+#   tension:    — an open question or deferred decision; do not resolve silently.
+#   deviation:  — an approved exemption from a project standard (see
+#                 docs/methodology.md §6).
+#   Each node carries id: (opaque base32, 6–12 chars, [a-z2-7]) and
+#   why: (rebuttal-surface rationale; see methodology.md §2).
+# Seed: pre-populated 2026-05-27 from the Phase 0 scaffold conversation,
+#       the resolved items in docs/design-notes.md §2–§10 and §11, and
+#       the deferred items captured as tension: nodes below.
+#       Per methodology §5, decisions made during implementation are added
+#       to this file BEFORE the code commit that implements them.
+
+Gitbulk Triage Tool = goal:
+  id: q3kfzm7n
+  why: >
+    Triage open pull requests across roughly 150 repositories nightly without
+    human attention, in a way that can run from cron and cannot damage
+    in-progress local work. The set is too large to inspect by hand each day;
+    by-hand triage degrades to "ignore most of it" within a week. gitbulk
+    converts that backlog into a structured report, optional automated
+    progressions (merge, rebase-onto-default, close-stale), and a sentinel
+    that surfaces the small subset that actually needs human attention.
+
+    Beyond PRs, the fleet itself is the object of maintenance: orphaned
+    worktrees, undeleted post-merge remote branches, stale local refs, and
+    repos that need work no PR yet exists for are all within gitbulk's
+    scope (see node xq4npk7r). "Triage" is the leading verb but "maintain"
+    is the full picture; the file-based artifacts and unattended-cron
+    discipline cover both.
+
+  children:
+
+    # ─── CONSTRAINTS (non-negotiable) ────────────────────────────────────────
+
+    Local Git Safety Contract = constraint:
+      id: 7mxr4pql
+      why: >
+        gitbulk must never modify the working tree, index, or HEAD of any
+        clone under ~/code/. The user is actively editing those clones; a
+        rogue checkout, pull, reset, or stash would silently destroy
+        in-progress work that the user has no way to detect before next
+        login. Operations that require a checkout MUST use git worktree add
+        into a disposable path (see node mw6kp2nq). Read-only git -C
+        invocations (rev-parse, status --porcelain, config --get, log) are
+        fine. This is the most important rule in the project; every mutating
+        code path is suspect until proven to honor it.
+
+    Network Via gh CLI Only = constraint:
+      id: hp4nck2v
+      why: >
+        All GitHub network access goes through the gh CLI, never raw HTTPS
+        or PyGithub. The user has gh authenticated globally; layering a
+        second credential path (token file, keyring, env var) would create
+        a place where credentials can leak or drift out of sync with gh's
+        rotation. gh also provides GraphQL access for free and has built-in
+        secondary-rate-limit handling. Cost: gh's argv interface is the
+        contract we depend on, which is less stable than a library API;
+        we accept that tradeoff for the credential-management simplification.
+
+    SSH Git Authentication = constraint:
+      id: ks52rg4w
+      why: >
+        Git fetch/push operations use SSH, not HTTPS. The user's ssh-agent
+        is already configured across all clones; layering an HTTPS-token
+        path in gitbulk would duplicate the credential surface that node
+        hp4nck2v simplified away, and produce a tool that breaks when the
+        user rotates their token. Cost: gitbulk cannot operate on repos
+        that only allow HTTPS clone — accepted, since all target repos
+        (provenant-dev plus the user's own OSS work) support ssh.
+
+    Python 3.10 Minimum Version = constraint:
+      id: 6jz4n2pq
+      why: >
+        Minimum Python is 3.10, enforced at startup in cli.py. AGENTS.md
+        mandates this, and modern type-hint syntax (X | None, list[T]
+        without imports, match statements) reads more cleanly than the
+        3.9-compatible equivalents. Cost: gitbulk will not run on Debian
+        stable until it catches up; accepted since the user controls their
+        own runtime.
+
+    # ─── METHODOLOGY & DISCIPLINE ────────────────────────────────────────────
+
+    Methodology Adoption = decision:
+      id: nh4kp2rq
+      why: >
+        gitbulk follows the development methodology defined in
+        docs/methodology.md (copied from origin-platform): structured intent
+        in this.i, the speculative interview before each phase of
+        implementation, this.i commits ordered before the code commits they
+        justify, named adversarial reviewer roles at gate boundaries,
+        deviation: nodes for any standard exceptions, and TDD discipline per
+        AGENTS.md. This is sensitive automation against ~150 real repos;
+        the "speculative interview forces decisions to be explicit"
+        discipline is exactly the safety net this tool's blast radius
+        requires. Cost: more upfront process per phase than ad-hoc dev would
+        need; the user has explicitly bought into that cost.
+
+    Hundred Percent Branch Coverage Of Src = decision:
+      id: cn4pk7zq
+      why: >
+        Coverage standard is 100% branch coverage on src/gitbulk/. The
+        framing in AGENTS.md — "a bug in gitbulk can damage real work in
+        real repos" — applies most acutely to the local-git safety contract
+        (node 7mxr4pql), where an untested fallback branch could be the one
+        that writes to the main clone instead of a worktree. Any gap
+        requires an approved deviation: node; a gap without one is a defect.
+        CI enforces this gate. Cost: writing tests for every branch,
+        including obvious-looking defensive code; accepted because this
+        tool's defensive code is exactly where the working-tree-safety rule
+        lives.
+
+    # ─── SCOPE & OWNERSHIP ───────────────────────────────────────────────────
+
+    Personal Tool Single User = decision:
+      id: nfk2zpr3
+      why: >
+        gitbulk is built for one user (the maintainer), not a team. No
+        multi-tenancy, no auth model, no access controls, no shared-state
+        coordination beyond what the user runs concurrently themselves.
+        Treating it as personal infra removes a large class of design
+        surface a generalized tool would require (config namespacing,
+        per-user run dirs, role-based subcommand gating). If a second user
+        ever appears, that is the moment to revisit the simplification;
+        until then this assumption is load-bearing.
+
+    Local Repos Are First Class Citizens = decision:
+      id: xq4npk7r
+      why: >
+        Local clones, their branches, their worktrees, and the cruft that
+        accumulates around them are managed objects in their own right —
+        not just bearers of pull requests. The fleet gitbulk maintains is
+        (repos × PRs), not just PRs. Concretely in scope: orphaned
+        worktrees from crashed dispatches, undeleted post-merge remote
+        branches, stale local branches that match merged/closed PRs, and
+        repos that need work no PR yet exists for (e.g., "this repo has
+        no CI", "this README is stale"). The local-git safety contract
+        (node 7mxr4pql) still applies in full: gitbulk inspects and
+        reasons about clones but never writes to a working tree the user
+        is editing. Rationale for promoting repos to first-class status:
+        cruft compounds silently — "I'll clean up after the merge" never
+        actually happens at fleet scale, so gitbulk must do it
+        automatically the way it triages PRs. Rejected alternative: keep
+        gitbulk PR-only and have a separate tool for repo-level work.
+        Rejected because the candidate set, locking model, invariant
+        framework, run state, and notification layer are all the same
+        between the two concerns; splitting would duplicate infrastructure
+        for no semantic gain.
+
+    Personal Account Owns The Public Repo = decision:
+      id: 6xp4kq2n
+      why: >
+        The repo lives under dhh1128/gitbulk (public), not under
+        provenant-dev/. gitbulk is personal infrastructure (see node
+        nfk2zpr3): it triages PRs across the user's full repo set, most
+        of which happen to be under provenant-dev but many of which are
+        not. Housing the tool under the user's personal account avoids
+        implying that provenant-dev maintains it, sponsors it, or stands
+        behind it; this is the maintainer's nightly cron, not an
+        org-platform service. Public visibility is incidental — gitbulk
+        has no secrets — and being public makes the methodology-driven
+        development process (this.i commits, speculative interviews,
+        adversarial reviews) legible to anyone who wants to learn from it.
+      approved-by: daniel, 2026-05-27
+
+    Cron Driven Unattended Primary Mode = decision:
+      id: 4kp7nb2x
+      why: >
+        Primary execution mode is unattended cron. Every UX decision
+        downstream of this — file-based notifications (node tp4kq2nr),
+        ATTENTION sentinel, exit-code signaling, dry-run defaults
+        (node 2vqp4nk6) — follows from "no human is watching when this
+        runs." An interactive mode is supported (run a subcommand by hand
+        any time), but the interactive path must not require human
+        attention to be safe; it must produce the same artifacts the cron
+        path does.
+
+    # ─── CLI ARCHITECTURE ────────────────────────────────────────────────────
+
+    Subcommand CLI Architecture = decision:
+      id: 7w4mxr5z
+      why: >
+        argparse subcommands (report, summarize, dispatch, merge,
+        rebase-onto-default, close-stale, show, ack, invariants), not a
+        single monolithic command with flags. Each subcommand maps to a
+        single mental model — "what did you ask gitbulk to do?" — and
+        each can declare its own lock requirements, invariant chain, and
+        exit-code semantics independently. Rejected: a single `gitbulk run`
+        that consumes a config-defined pipeline, which would have made
+        cron entries shorter but lost the one-purpose-per-cron-entry
+        isolation that prevents a failing merge from disabling the nightly
+        report.
+
+    Mutating Subcommands Default Dry Run = decision:
+      id: 2vqp4nk6
+      why: >
+        Every mutating subcommand (merge, rebase-onto-default, close-stale,
+        dispatch) defaults to --dry-run and requires --apply to actually
+        act. A misconfigured cron entry must not silently merge PRs the
+        user hasn't reviewed. Cost: first-time use of any mutating
+        subcommand requires --apply on every invocation forever; accepted
+        as the audit signal it is.
+
+    Two File Configuration = decision:
+      id: ws2pn4kr
+      why: >
+        Configuration lives in two files at ~/.config/gitbulk/: repos.txt
+        (plain owner/repo per line, # comments, blanks ignored) and
+        gitbulk.yaml (policy and classification). Rejected richer formats
+        (YAML for repos, inline tags) because repos.txt is the file the
+        user edits most often and minimizing its friction matters more
+        than format consistency. Cost: per-repo policy and repo membership
+        live in different files, so adding a repo with custom policy means
+        editing both; accepted as the optimized common case.
+
+    # ─── POLICY EXPRESSION ───────────────────────────────────────────────────
+
+    Invariants Framework = decision:
+      id: c4jzm5pn
+      why: >
+        Operations on repos and PRs are expressed as chains of named
+        invariants (Pass/Skip/Fail functions) registered in a central
+        registry. Subcommand X's behavior is fully defined by which
+        invariants it includes and in what order — there is no other
+        place where policy hides. This makes policy auditable
+        (`gitbulk invariants` lists everything), suppressions explicit
+        (`--skip-check NAME` logs a WARNING into run state), and the
+        deny-by-default stance enforceable: a new operation that touches
+        repos or PRs must compose existing invariants or add new ones,
+        not bypass the chain. Cost: some indirection compared to inline
+        checks; accepted for the auditability it buys.
+
+    Cmdline Wins Over Config For Overrides = decision:
+      id: r4nzp7kq
+      why: >
+        When cmdline and config disagree about an invariant's status,
+        cmdline always wins. Asymmetric audit: cmdline RELAXING
+        (--skip-check on something the config required) trips exit
+        code 4 plus a WARNING in invariants.log; cmdline TIGHTENING
+        (--require on something the config skipped) logs INFO only.
+        Rationale: tightening is always safe, relaxing is the auditable
+        event. Rejected: most-restrictive-wins, which would have removed
+        the user's ability to actively loosen a single run when they know
+        what they are doing.
+
+    # ─── PR CLASSIFICATION & MERGE-READINESS ─────────────────────────────────
+
+    Unknown Accounts Default Non Human = decision:
+      id: pj5kn2zw
+      why: >
+        For humans-vs-bots classification, unknown logins default to
+        non-human. The set of bots grows over time (new CI tools, new
+        review bots), so the default needs to favor the failure mode that
+        is correctable rather than the one that silently merges
+        unreviewed code. If a real human appears under an unknown login,
+        gitbulk skips their input and the user adds them to
+        humans.always_human or org_members — discoverable. If a new bot
+        defaulted to human, it might silently mark a PR "approved" by a
+        bot, which is invisible until something breaks downstream.
+
+    Ready To Merge Stricter Than GitHub = decision:
+      id: zk3r4nqp
+      why: >
+        gitbulk's "ready to merge" is stricter than GitHub's
+        mergeable_state == clean. A PR is ready iff (a) GitHub says clean
+        (CI green, required checks passed, mergeable), AND (b) all review
+        threads — including bot threads — are resolved, AND (c) it has
+        been continuously in this state for the configured age threshold.
+        ready_since is the start of the most recent continuous ready
+        window. Bot threads counted in (b) per user preference 2026-05-27:
+        a forgotten Dependabot nag or unaddressed maintainer comment
+        should block auto-merge; the cost of merging with an unresolved
+        concern is much higher than the cost of pausing until it is
+        resolved.
+
+    Three Business Days From Continuously Ready = decision:
+      id: bg4pqn7m
+      why: >
+        Default age threshold for auto-merge is 3 business days (M–F,
+        local timezone, no holiday awareness) since ready_since
+        (node zk3r4nqp). Three days lets async review cycles complete
+        without letting trivial PRs sit indefinitely. Business days
+        rather than calendar days because weekend hours are not review
+        hours; "the conversation has been quiet for 3 days" means
+        something different over a Tue–Fri span than over a Fri–Mon span.
+        Per-repo overrides remain the primary tuning knob. Rejected:
+        2 days (too aggressive), 5 days (too conservative for a personal
+        tool), measuring from PR creation (lets actively-edited week-old
+        PRs slip through).
+
+    Unresolved Thread Burden Configurable Default Author = decision:
+      id: hj3nq5kp
+      why: >
+        Whose responsibility is it to mark a review thread resolved?
+        Default: the PR author (i.e. the user, since gitbulk operates on
+        their PRs). Configurable per-repo via
+        defaults.unresolved_burden: me|other|either. When the user is in
+        CODEOWNERS for a repo and acting as maintainer rather than
+        contributor, "other" or "either" lets them flip the burden onto
+        the human reviewer. Default stays "me" because that is the safer
+        failure mode — the user is more likely to forget to resolve their
+        own threads than to forget the repo's burden setting.
+
+    # ─── WORKTREE & LOCAL CLONE HANDLING ─────────────────────────────────────
+
+    Worktree Root Under XDG Cache = decision:
+      id: mw6kp2nq
+      why: >
+        Default worktree root is
+        ~/.cache/gitbulk/worktrees/<runid>/<owner>__<repo>/.
+        Configurable via gitbulk.yaml worktree_root. Rejected /tmp/gitbulk/
+        because a crashed dispatch loses its worktree before the user can
+        examine it the morning after; rejected per-repo
+        .git/gitbulk-worktrees/ because it pollutes user-owned clone dirs
+        and forces gitbulk gc to walk every clone. ~/.cache/ honors XDG,
+        puts all gitbulk disposable state in one place, and survives
+        reboot for crash forensics.
+
+    Missing Local Clone Skips With Warning = decision:
+      id: 5xqp2nkr
+      why: >
+        The local.exists invariant is in the chain only for subcommands
+        that need a clone (rebase-onto-default, merge, dispatch); report
+        and summarize do not run the check at all because they operate
+        purely on gh data. When a repo configured in repos.txt has no
+        clone under ~/code/, the affected subcommand skips that repo,
+        logs a WARNING, and the run contributes to exit code 3.
+        Rejected: auto-clone (slow first run, grows disk silently) and
+        fail-the-run (one missing repo would tank the other 149). General
+        principle from design-notes §11: bias toward skip-with-reason-
+        logged over do-something-risky.
+
+    Rebase Conflicts Persist The Worktree = decision:
+      id: vp7n2krq
+      why: >
+        When rebase-onto-default produces a conflict, the worktree is
+        left in-place with conflict markers and a CONFLICT.md is written
+        into the run directory containing the absolute worktree path and
+        suggested fix-up commands. gitbulk gc (Phase 5/6) GCs worktrees
+        older than N days unless they are in git-status conflict state.
+        Rejected: tear down the worktree on conflict, which would force
+        the user to recreate it manually before resolving — extra
+        friction at exactly the moment when the user needs the
+        lowest-friction path forward.
+
+    # ─── NETWORK BEHAVIOR ────────────────────────────────────────────────────
+
+    Serial GraphQL Coalescing No Rate Limiter = decision:
+      id: gd4kp7nz
+      why: >
+        v1 hits gh serially per repo, coalescing related queries via
+        GraphQL where the data shape allows. Estimated load: 150 repos
+        × 1–2 GraphQL calls = ~300 calls per run, well under the 5000/hour
+        primary limit. Secondary rate limits are concurrency-sensitive,
+        so staying serial sidesteps them naturally without an explicit
+        limiter. A token-bucket rate limiter is YAGNI for v1; add only
+        if 429s are observed in practice. Cost: report wall-clock time
+        is ~minutes not ~seconds; accepted for a nightly cron job.
+
+    # ─── CONCURRENCY & NOTIFICATION ──────────────────────────────────────────
+
+    Global Plus Per Repo Lock = decision:
+      id: lj5pqn4kr
+      why: >
+        Two locks: a global advisory lock at ~/.cache/gitbulk/run.lock
+        (fcntl.flock, shared for read-only subcommands, exclusive for
+        mutating ones), and per-repo exclusive locks at
+        ~/.cache/gitbulk/locks/<owner>__<repo>.lock for the duration of
+        any mutating op. This lets two report runs overlap, a merge wait
+        for any in-flight report, and a merge on repo A run concurrently
+        with a report on repo B. Rejected: single global exclusive lock
+        (would serialize everything, including independent reads), and
+        no locking (concurrent mutating ops could produce inconsistent
+        run state and racing worktree creation).
+
+    Four Layer File Based Notification = decision:
+      id: tp4kq2nr
+      why: >
+        v1 ships layers 1–4 — run artifacts in ~/.cache/gitbulk/runs/,
+        exit codes (0/1/2/3/4/99), a dashboard.md rewritten each run,
+        and an ATTENTION sentinel file — all file-based. External
+        adapters (ntfy.sh, slack, desktop notifications) are deferred
+        because each one adds credentials/services that complicate first
+        deploy; v1 should be installable and runnable with zero account
+        setup beyond the gh CLI the user already has. Shell-prompt or
+        tmux-statusline integration consumes the ATTENTION sentinel for
+        live visibility without an external service.
+
+    # ─── TENSIONS (deferred, do not resolve silently) ────────────────────────
+
+    Summarize Prompt Design = tension:
+      id: kw2pn7qz
+      why: >
+        The prompt that `gitbulk summarize` sends to claude -p has not
+        been designed. The stub at prompts/triage.md captures intent but
+        the actual prompt depends on the structured output format that
+        `gitbulk report` produces — which is itself unbuilt (Phase 2).
+        Deferred to Phase 3 entry: the speculative interview at that
+        gate will design the prompt with real report output in hand.
+        Resolving earlier would produce a prompt against an imagined
+        data shape.
+
+    Dispatch Execution Kernel = tension:
+      id: mp7kn4qz
+      why: >
+        `gitbulk dispatch` needs bounded parallel claude -p execution
+        against many worktrees with timeout, CTRL+C drain, and per-target
+        log capture. ../origin-platform/scripts/multiprompt.py already
+        implements this. Three options to resolve at Phase 4 entry:
+        (a) subprocess multiprompt as-is (needs multiprompt feature
+        additions for explicit-target-list input and external state-file
+        path); (b) extract the execution kernel from multiprompt into a
+        small standalone package that both tools consume; (c) reimplement
+        the kernel inside gitbulk. User has flagged a leaning toward (b)
+        or (c). Resolution deferred until Phase 4 entry, when concrete
+        candidate-set shapes from gitbulk's invariants exist to design
+        against. Related: tension fw5kq6np.
+
+    Multiprompt Packaging Future = tension:
+      id: fw5kq6np
+      why: >
+        multiprompt.py currently lives as a script inside
+        origin-platform/scripts/ with no this.i, no separate CI, and no
+        release artifact. gitbulk's dependency on it (if we choose option
+        (a) or (b) for tension mp7kn4qz) is risky in that configuration:
+        if origin-platform is restructured, multiprompt moves silently.
+        Whether to extract multiprompt into its own repo with proper
+        docs and CI is multiprompt's question to resolve; gitbulk's
+        relationship to it is just the forcing function that makes the
+        question visible.
+
+    Default Branch Rename Handling = tension:
+      id: rj7p4kqn
+      why: >
+        Some target repos may rename their default branch (main → dev,
+        or vice versa) while gitbulk has open PRs against the old base.
+        The pr.base_is_default invariant catches this and skips the PR,
+        but the user then needs a workflow to rebase those PRs onto the
+        new default. --allow-non-default-base lets a single run proceed
+        but does not fix the underlying PRs. Deferred: deciding whether
+        gitbulk grows a "rebase onto current default" helper for the
+        rename case, or whether the user re-bases those by hand once.
+
+    Repo Cleanup Subcommand Scope = tension:
+      id: jw3kpn4q
+      why: >
+        A repo-level cleanup subcommand (working name: tidy, but the
+        name is open) needs to address at least: (a) orphaned worktrees
+        under the worktree root (node mw6kp2nq) whose creating run
+        terminated and which are not in a conflict state per node
+        vp7n2krq, (b) post-merge remote branches that gh shows as merged
+        but still present on the remote, (c) stale local branches that
+        correspond to merged or closed PRs. Open questions: which
+        cleanups default to --apply vs --dry-run (decision 2vqp4nk6
+        suggests dry-run for everything mutating, but post-merge
+        branch deletion is arguably so safe that --apply by default
+        could be justified); what age threshold for orphan worktrees;
+        whether to integrate with `git worktree prune` or do gitbulk's
+        own walk; which invariants gate each cleanup (probably variants
+        of pr.merged_or_closed and worktree.belongs_to_us). Deferred to
+        Phase 5/6 — comes after merge and close-stale ship, since
+        cleanup's correctness depends on the same PR-state data those
+        subcommands consume.
+
+    Scan And Findings Artifact Convention = tension:
+      id: ck7n4pqr
+      why: >
+        gitbulk needs to discover work that should happen but hasn't
+        — e.g., "this repo has no CI", "this README is six months
+        out of date", "this repo should adopt the new auth library".
+        Likely mechanism: a `scan` subcommand orchestrates a multiprompt
+        run (per tension mp7kn4qz) against repos that pass an invariant
+        filter, using a user-supplied prompt; multiprompt leaves an
+        artifact per repo; gitbulk discovers those artifacts and
+        presents them via a `findings` subcommand, optionally feeding
+        them back into `dispatch` to actually do the work. Open
+        questions: (a) artifact format — structured YAML, free-form
+        markdown, or markdown with YAML frontmatter; (b) artifact
+        location — inside the repo at `.gitbulk/` (findings travel with
+        the clone, but writing inside a clone is in tension with the
+        local-git safety contract 7mxr4pql and would require a
+        deviation: node for that subdirectory) or outside at
+        `~/.cache/gitbulk/findings/<owner>__<repo>/` (preserves the
+        contract, but findings don't travel); (c) finding lifecycle —
+        when does a finding expire, who marks it resolved, can a later
+        scan re-raise a finding the user has dismissed; (d) whether
+        `scan` is a gitbulk subcommand that drives multiprompt, or
+        whether the user runs multiprompt directly and `findings` only
+        consumes. Resolution deferred to Phase 4 entry alongside
+        tension mp7kn4qz, since both depend on the same multiprompt
+        integration decision.
