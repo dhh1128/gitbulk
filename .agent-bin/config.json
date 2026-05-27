@@ -1,0 +1,7 @@
+{
+  "protected_branches": [
+    "dev",
+    "main",
+    "master"
+  ]
+}

@@ -9,3 +9,4 @@ dist/
 .coverage
 .mypy_cache/
 .ruff_cache/
+.ai-safety-check.*

@@ -1,0 +1,11 @@
+#!/usr/bin/env sh
+set -eu
+_AP_BIN=$(cd "$(dirname "$0")" && pwd)
+if command -v agentprep >/dev/null 2>&1; then
+  exec agentprep shim --shim-dir "$_AP_BIN" git "$@"
+elif [ -f "$_AP_BIN/../agentprep.py" ]; then
+  exec python3 "$_AP_BIN/../agentprep.py" shim --shim-dir "$_AP_BIN" git "$@"
+else
+  echo "AgentPrep shim could not find agentprep. Install the command or keep agentprep.py in the repository." >&2
+  exit 127
+fi
