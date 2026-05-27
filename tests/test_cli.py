@@ -11,7 +11,9 @@ from gitbulk import __version__
 from gitbulk.cli import (
     EXIT_NOT_IMPLEMENTED,
     EXIT_OK,
+    EXIT_STRUCTURAL_FAILURE,
     SUBCOMMANDS,
+    _check_python_version,
     build_parser,
     main,
 )
@@ -55,3 +57,40 @@ def test_each_subcommand_is_stubbed_with_exit_99(name):
 def test_parser_constructs_without_error():
     parser = build_parser()
     assert parser.prog == "gitbulk"
+
+
+def test_python_version_check_rejects_old_interpreter(monkeypatch):
+    monkeypatch.setattr(sys, "version_info", (3, 9, 0, "final", 0))
+    err = io.StringIO()
+    with pytest.raises(SystemExit) as exc, redirect_stderr(err):
+        _check_python_version()
+    assert exc.value.code == EXIT_STRUCTURAL_FAILURE
+    assert "Python 3.10 or later" in err.getvalue()
+
+
+def test_python_version_check_accepts_current_interpreter():
+    _check_python_version()
+
+
+def test_module_entrypoint_runs_main(monkeypatch):
+    import runpy
+
+    monkeypatch.setattr(sys, "argv", ["gitbulk", "--version"])
+    out = io.StringIO()
+    with pytest.raises(SystemExit) as exc, redirect_stdout(out):
+        runpy.run_module("gitbulk", run_name="__main__", alter_sys=True)
+    assert exc.value.code == EXIT_OK
+    assert __version__ in out.getvalue()
+
+
+def test_script_entrypoint_runs_main(monkeypatch):
+    import runpy
+    from pathlib import Path
+
+    cli_path = Path(__file__).resolve().parent.parent / "src" / "gitbulk" / "cli.py"
+    monkeypatch.setattr(sys, "argv", [str(cli_path), "--version"])
+    out = io.StringIO()
+    with pytest.raises(SystemExit) as exc, redirect_stdout(out):
+        runpy.run_path(str(cli_path), run_name="__main__")
+    assert exc.value.code == EXIT_OK
+    assert __version__ in out.getvalue()
