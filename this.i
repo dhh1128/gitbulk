@@ -349,6 +349,71 @@ Gitbulk Triage Tool = goal:
 
     # ─── ON-DISK CONVENTIONS ─────────────────────────────────────────────────
 
+    Policy Config Loader Schema = decision:
+      id: ck5pwr2n
+      why: >
+        config/policy.py parses ~/.config/gitbulk/gitbulk.yaml into a
+        frozen Policy dataclass tree:
+          Policy(defaults: Defaults, humans: HumansConfig,
+                 bots: tuple[str, ...],
+                 repos: dict[str, RepoOverride],
+                 worktree_root: Path)
+
+        Plus a helper:
+          policy_for(policy, slug) -> Defaults
+        returning the effective defaults for a repo after applying any
+        per-repo override.
+
+        Conventions:
+
+        (a) Validation library: dataclasses + hand-rolled type and
+        enum guards. No pydantic. Rationale: PyYAML is already the
+        only runtime dep; adding pydantic (10+ MB) for a ~30-line
+        schema is over-engineering for a personal tool. The
+        validation helpers (_ensure_int, _ensure_str with allowed
+        values, etc.) are reused across the parser.
+
+        (b) Unknown keys at any level (top-level, defaults, humans,
+        per-repo override) raise ConfigError. Typos like
+        min_buisness_days are usually mistakes; loud failure beats
+        silent acceptance. Forward-compat unused-but-recognized keys
+        ("notifications") are added to the allow-list explicitly.
+
+        (c) Per-repo override semantics:
+          - Scalar fields use the per-repo value if non-None, else
+            inherit from defaults.
+          - List fields (skip_checks, extra_checks) APPEND to
+            defaults rather than replace. defaults.skip_checks +
+            repos.X.skip_checks = effective skip_checks for X.
+            Rationale: "add this exception just for X" is the
+            common case; wholesale replacement would silently drop
+            project-wide exceptions when a per-repo entry exists.
+
+        (d) Missing file or empty file returns Policy() with all
+        documented defaults from this.i. A brand-new user with no
+        gitbulk.yaml gets a working tool.
+
+        (e) Defaults pinned by this.i (not invented here):
+          merge_policy default "strict"        - design-notes §2
+          min_business_days = 3                - bg4pqn7m
+          unresolved_burden = "me"             - hj3nq5kp
+          bot_threads_block = True             - zk3r4nqp
+          worktree_root default                - mw6kp2nq
+
+        (f) worktree_root is expanded for ~ (user-friendly) and
+        defaults to paths.default_worktree_root(). Per-run usage
+        of the worktree root happens in Phase 4 (dispatch); for
+        Phase 1 the value is just held in the Policy object.
+
+        (g) Removed fields from the Phase-0 example: default_branch_only
+        (it is an invariant property, not a tunable — pr.base_is_default
+        is always enforced), dispatch_concurrency (Phase 4 concern;
+        multiprompt owns its own concurrency model per mp7kn4qz),
+        min_age_days (renamed to min_business_days per bg4pqn7m).
+        config/gitbulk.yaml.example is updated in the same commit
+        as the loader so the documented schema is never out of sync.
+      approved-by: daniel, 2026-05-27
+
     Repos Config Loader API = decision:
       id: rj4pwn7k
       why: >
