@@ -349,6 +349,54 @@ Gitbulk Triage Tool = goal:
 
     # ─── ON-DISK CONVENTIONS ─────────────────────────────────────────────────
 
+    Repos Config Loader API = decision:
+      id: rj4pwn7k
+      why: >
+        config/repos.py parses ~/.config/gitbulk/repos.txt into a list
+        of RepoEntry records used by every subcommand.
+
+        API: load_repos(path: Path | None = None,
+                        code_root: Path | None = None) -> list[RepoEntry]
+        RepoEntry: frozen dataclass with slug, owner, name,
+                   local_path, source_line.
+
+        Conventions:
+
+        (a) Format: one "owner/repo" per line, optionally followed by
+        a "#" comment; blank lines and pure-comment lines ignored.
+        Decision rationale lives in ws2pn4kr (two-file config).
+
+        (b) Malformed slug raises ConfigError with file path + line
+        number. Loud failure beats silent skip because a typo in
+        repos.txt should never silently exclude one of 150 repos —
+        the user's mental model says "everything in repos.txt is
+        managed by gitbulk" and a silent drop violates that
+        invariant.
+
+        (c) Duplicate slugs: keep the first occurrence, log a
+        WARNING via logging.getLogger("gitbulk.config"). Not an
+        error because the most common cause is editorial — copying
+        a line and forgetting to delete the original; gitbulk should
+        not block the nightly cron over it.
+
+        (d) Local clone path resolves to `code_root / basename(repo)`
+        — e.g., dhh1128/gitbulk → ~/code/gitbulk. code_root defaults
+        to Path.home()/"code"; the loader takes an explicit override
+        so the future --code-root CLI flag has a clean injection
+        point. Note: only `basename(repo)` is used; the owner is
+        intentionally discarded for the local path because the
+        user's clones are organized as flat siblings under ~/code/,
+        not nested per-owner.
+
+        (e) RepoEntry.source_line is preserved so error messages
+        downstream ("invariant X failed for owner/repo (configured
+        in repos.txt:42)") can cite the original config location.
+
+        Excluded for now: per-line inline tags or YAML-extended
+        repos.txt formats — explicitly rejected in ws2pn4kr in
+        favor of repos.txt simplicity.
+      approved-by: daniel, 2026-05-27
+
     Run State Module Schema And API = decision:
       id: kp7nw4mq
       why: >
