@@ -349,6 +349,33 @@ Gitbulk Triage Tool = goal:
 
     # ─── ON-DISK CONVENTIONS ─────────────────────────────────────────────────
 
+    ATTENTION Sentinel API = decision:
+      id: snk7p4qm
+      why: >
+        sentinel.py manages ~/.cache/gitbulk/ATTENTION per node
+        tp4kq2nr (the file-based notification layer).
+
+        API:
+            set_attention(exit_code, subcommand, runid, summary) -> None
+            clear_attention() -> bool   # True if a sentinel was removed
+            has_attention() -> bool
+            read_attention() -> str | None
+
+        File contents: a single line of the form
+            "{exit_code} {subcommand} {runid} {summary}"
+        e.g. "2 report 20260527T194501Z 4 PRs need attention". The
+        format was chosen so `cat ~/.cache/gitbulk/ATTENTION` shows
+        WHY the prompt glyph is active without needing to run
+        `gitbulk show`.
+
+        clear_attention's bool return lets the `ack` subcommand
+        report "cleared" vs "was already clear" without raising.
+
+        No locking: the sentinel is written by exactly one subcommand
+        process at a time (guaranteed by the global lock acquired
+        upstream). read_attention silently returns None if the file
+        is missing — `has_attention` is the explicit existence test.
+
     Policy Config Loader Schema = decision:
       id: ck5pwr2n
       why: >
