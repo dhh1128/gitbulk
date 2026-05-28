@@ -65,6 +65,7 @@ defaults:
   bot_threads_block: false
   stale_age_days: 90
   stale_cooloff_days: 14
+  retain_runs: 7
   skip_checks: [foo, bar]
   extra_checks: [baz]
 """
@@ -76,8 +77,33 @@ defaults:
     assert policy.defaults.bot_threads_block is False
     assert policy.defaults.stale_age_days == 90
     assert policy.defaults.stale_cooloff_days == 14
+    assert policy.defaults.retain_runs == 7
     assert policy.defaults.skip_checks == ("foo", "bar")
     assert policy.defaults.extra_checks == ("baz",)
+
+
+def test_retain_runs_default():
+    from gitbulk.config.policy import Defaults
+    assert Defaults().retain_runs == 30
+
+
+def test_retain_runs_rejects_zero(tmp_path):
+    content = "defaults:\n  retain_runs: 0\n"
+    with pytest.raises(ConfigError, match="must be >= 1"):
+        load_policy(_write_policy(tmp_path, content))
+
+
+def test_retain_runs_per_repo_override(tmp_path):
+    content = """
+defaults:
+  retain_runs: 30
+repos:
+  owner/repo:
+    retain_runs: 7
+"""
+    policy = load_policy(_write_policy(tmp_path, content))
+    effective = policy_for(policy, "owner/repo")
+    assert effective.retain_runs == 7
 
 
 def test_humans_section(tmp_path):

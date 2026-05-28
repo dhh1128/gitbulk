@@ -228,6 +228,41 @@ def test_complete_symlink_target_is_relative(isolated_cache):
     assert target == "20260527T120000Z-merge"
 
 
+def test_complete_with_retain_runs_prunes_old_dirs(isolated_cache):
+    """RunState.complete(retain_runs=N) keeps only the newest N runs of this subcommand."""
+    when_a = datetime(2026, 5, 27, 10, 0, 0, tzinfo=timezone.utc)
+    when_b = datetime(2026, 5, 27, 11, 0, 0, tzinfo=timezone.utc)
+    when_c = datetime(2026, 5, 27, 12, 0, 0, tzinfo=timezone.utc)
+    for when in (when_a, when_b, when_c):
+        rs = RunState.begin("report", [], {}, when=when)
+        rs.complete(0, retain_runs=2)
+    remaining = sorted(
+        p.name
+        for p in paths.runs_dir().iterdir()
+        if p.is_dir() and not p.is_symlink() and p.name.endswith("-report")
+    )
+    assert remaining == [
+        "20260527T110000Z-report",
+        "20260527T120000Z-report",
+    ]
+
+
+def test_complete_without_retain_runs_does_not_prune(isolated_cache):
+    """retain_runs=None (the default) leaves old runs alone."""
+    when_a = datetime(2026, 5, 27, 10, 0, 0, tzinfo=timezone.utc)
+    when_b = datetime(2026, 5, 27, 11, 0, 0, tzinfo=timezone.utc)
+    when_c = datetime(2026, 5, 27, 12, 0, 0, tzinfo=timezone.utc)
+    for when in (when_a, when_b, when_c):
+        rs = RunState.begin("report", [], {}, when=when)
+        rs.complete(0)
+    remaining = sorted(
+        p.name
+        for p in paths.runs_dir().iterdir()
+        if p.is_dir() and not p.is_symlink() and p.name.endswith("-report")
+    )
+    assert len(remaining) == 3
+
+
 def test_complete_replaces_existing_latest_symlink(isolated_cache):
     when_a = datetime(2026, 5, 27, 10, 0, 0, tzinfo=timezone.utc)
     when_b = datetime(2026, 5, 27, 12, 0, 0, tzinfo=timezone.utc)

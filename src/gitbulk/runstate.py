@@ -156,7 +156,16 @@ class RunState:
     def write_summary(self, markdown: str) -> None:
         _atomic_write_text(self._run_dir / "summary.md", markdown)
 
-    def complete(self, exit_code: int) -> None:
+    def complete(self, exit_code: int, *, retain_runs: int | None = None) -> None:
+        """Finalize the run.
+
+        Writes ``completed_at`` and ``exit_code`` into ``manifest.yaml``,
+        atomically points ``latest-<subcommand>`` at this run, and (if
+        ``retain_runs`` is provided) prunes older runs of the same
+        subcommand beyond that count. Per Track A of this.i tension
+        jw3kpn4q, callers in Phase 2+ pass the value from
+        ``policy.defaults.retain_runs``.
+        """
         manifest_path = self._run_dir / "manifest.yaml"
         with manifest_path.open() as f:
             manifest = yaml.safe_load(f)
@@ -166,3 +175,10 @@ class RunState:
 
         symlink_path = paths.latest_run_symlink(self._subcommand)
         _atomic_write_symlink(symlink_path, self._run_dir)
+
+        if retain_runs is not None:
+            # Local import to avoid a cycle: gc imports paths; runstate also
+            # imports paths; gc must not import runstate.
+            from gitbulk import gc
+
+            gc.prune_runs(self._subcommand, retain=retain_runs)
