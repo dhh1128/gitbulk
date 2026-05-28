@@ -21,6 +21,7 @@ from gitbulk.cli import (
     EXIT_STRUCTURAL_FAILURE,
     SUBCOMMANDS,
     _check_python_version,
+    _configure_logging,
     _maybe_set_attention,
     build_parser,
     main,
@@ -219,6 +220,79 @@ def test_main_returns_exit_ok_when_no_subcommand_does_not_set_attention(isolated
         rc = main([])
     assert rc == EXIT_OK
     assert not sentinel.has_attention()
+
+
+# ─── Logging configuration ─────────────────────────────────────────────────
+
+
+@pytest.fixture
+def clean_gitbulk_logger():
+    """Snapshot+restore the gitbulk logger config so each test runs clean."""
+    import logging
+
+    gl = logging.getLogger("gitbulk")
+    saved_handlers = gl.handlers[:]
+    saved_level = gl.level
+    saved_propagate = gl.propagate
+    for h in saved_handlers:
+        gl.removeHandler(h)
+    yield gl
+    for h in gl.handlers[:]:
+        gl.removeHandler(h)
+    for h in saved_handlers:
+        gl.addHandler(h)
+    gl.setLevel(saved_level)
+    gl.propagate = saved_propagate
+
+
+def test_configure_logging_attaches_stderr_handler(clean_gitbulk_logger, monkeypatch):
+    import logging
+    monkeypatch.delenv("GITBULK_LOG_LEVEL", raising=False)
+    _configure_logging()
+    assert clean_gitbulk_logger.level == logging.INFO
+    assert any(
+        isinstance(h, logging.StreamHandler) and h.stream is sys.stderr
+        for h in clean_gitbulk_logger.handlers
+    )
+
+
+def test_configure_logging_honors_env_var(clean_gitbulk_logger, monkeypatch):
+    import logging
+    monkeypatch.setenv("GITBULK_LOG_LEVEL", "debug")  # case-insensitive
+    _configure_logging()
+    assert clean_gitbulk_logger.level == logging.DEBUG
+
+
+def test_configure_logging_invalid_env_falls_back_to_info(clean_gitbulk_logger, monkeypatch):
+    import logging
+    monkeypatch.setenv("GITBULK_LOG_LEVEL", "NOT_A_LEVEL")
+    _configure_logging()
+    assert clean_gitbulk_logger.level == logging.INFO
+
+
+def test_configure_logging_idempotent(clean_gitbulk_logger, monkeypatch):
+    """Calling twice must not stack handlers."""
+    monkeypatch.delenv("GITBULK_LOG_LEVEL", raising=False)
+    _configure_logging()
+    _configure_logging()
+    import logging
+    stderr_handlers = [
+        h for h in clean_gitbulk_logger.handlers
+        if isinstance(h, logging.StreamHandler) and h.stream is sys.stderr
+    ]
+    assert len(stderr_handlers) == 1
+
+
+def test_configure_logging_falls_back_when_env_is_other_truthy_non_level(
+    clean_gitbulk_logger, monkeypatch
+):
+    """``getattr(logging, name)`` returns non-int things for many attrs;
+    only int values are valid log levels."""
+    import logging
+    # 'getMessage' is a real attribute on logging (a method); not a level.
+    monkeypatch.setenv("GITBULK_LOG_LEVEL", "getMessage")
+    _configure_logging()
+    assert clean_gitbulk_logger.level == logging.INFO
 
 
 def test_python_version_check_rejects_old_interpreter(monkeypatch):

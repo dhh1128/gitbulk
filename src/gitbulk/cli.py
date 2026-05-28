@@ -7,6 +7,8 @@ phases land. Exit-code → ATTENTION sentinel fallback per this.i node
 """
 
 import argparse
+import logging
+import os
 import sys
 
 from gitbulk import __version__
@@ -31,6 +33,47 @@ def _check_python_version() -> None:
     if sys.version_info < (3, 10):
         print("gitbulk requires Python 3.10 or later.", file=sys.stderr)
         raise SystemExit(EXIT_STRUCTURAL_FAILURE)
+
+
+def _configure_logging() -> None:
+    """Wire a single stderr handler onto the ``gitbulk`` logger tree.
+
+    The level is INFO by default; the ``GITBULK_LOG_LEVEL`` env var (case-
+    insensitive: DEBUG / INFO / WARNING / ERROR / CRITICAL) can override.
+    An invalid value silently falls back to INFO rather than raising — a
+    misconfigured log level should not block a cron job.
+
+    We attach the handler to ``logging.getLogger("gitbulk")`` (not the root
+    logger), and we leave ``propagate=True`` so test runners that hook the
+    root logger (pytest's caplog) still see gitbulk's messages. In cron
+    production the root logger has no handler, so no duplication occurs.
+
+    Without this configuration, locks.py and any other module that calls
+    ``logging.getLogger("gitbulk.<sub>")`` would emit into the void; this
+    helper makes ``_log.debug(...)`` actually reach stderr at 2 a.m.
+    """
+    level_name = os.environ.get("GITBULK_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, None)
+    if not isinstance(level, int):
+        level = logging.INFO
+
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(
+        logging.Formatter(
+            "%(asctime)s %(levelname)s %(name)s: %(message)s",
+            datefmt="%Y-%m-%dT%H:%M:%S",
+        )
+    )
+
+    gitbulk_logger = logging.getLogger("gitbulk")
+    gitbulk_logger.setLevel(level)
+    # Idempotent: if main() is invoked twice in the same process (e.g. in
+    # tests), don't stack handlers.
+    if not any(
+        isinstance(h, logging.StreamHandler) and h.stream is sys.stderr
+        for h in gitbulk_logger.handlers
+    ):
+        gitbulk_logger.addHandler(handler)
 
 
 def _not_implemented(name: str):
@@ -109,6 +152,7 @@ def _maybe_set_attention(exit_code: int, subcommand: str) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     _check_python_version()
+    _configure_logging()
     parser = build_parser()
     args = parser.parse_args(argv)
     if not args.subcommand:
