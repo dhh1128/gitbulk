@@ -229,13 +229,20 @@ def test_read_holder_metadata_non_dict_returns_none(tmp_path):
 
 def test_read_holder_metadata_happy_path(tmp_path):
     path = tmp_path / "good.json"
-    payload = {"pid": 42, "started_at": "2026-01-01T00:00:00+00:00", "subcommand": "x"}
+    # Use a pid past Linux's default PID_MAX (32768) so the liveness check
+    # is host-independent. Low pids like 42 are real kthreads on GitHub-
+    # hosted Ubuntu runners but absent on WSL2 dev boxes — using one would
+    # make the test pass locally and fail in CI (and did, 2026-05-28).
+    bogus_pid = 2**22
+    payload = {
+        "pid": bogus_pid,
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "subcommand": "x",
+    }
     path.write_text(json.dumps(payload))
     result = locks._read_holder_metadata(path)
-    # pid-liveness check adds an "alive" field; pid 42 essentially never exists
-    # on a real system, so "alive" should be False.
     assert result is not None
-    assert result["pid"] == 42
+    assert result["pid"] == bogus_pid
     assert result["started_at"] == payload["started_at"]
     assert result["subcommand"] == payload["subcommand"]
     assert result["alive"] is False

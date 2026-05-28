@@ -52,6 +52,7 @@ class _FakePopen:
         stderr_text: str = "",
         hang: bool = False,
         raise_on_init: Exception | None = None,
+        on_complete=None,
     ) -> None:
         if raise_on_init is not None:
             raise raise_on_init
@@ -70,6 +71,13 @@ class _FakePopen:
         self._lock = threading.Lock()
         self._returncode: int | None = None
         self._stdin_text: str | None = None
+        # Called exactly once, synchronously, when this popen transitions
+        # from "running" to "complete". Used by _FakeRunnerScript to
+        # decrement its live-count atomically with the same lock the
+        # bounded-concurrency assertion reads. Replaces the older drain-
+        # thread approach which raced under CI scheduling (2026-05-28).
+        self._on_complete = on_complete
+        self._completed_signaled = False
 
     @property
     def returncode(self) -> int | None:
@@ -110,6 +118,11 @@ class _FakePopen:
         except Exception:  # pragma: no cover — stdio already closed
             pass
         self._returncode = self._exit_code
+        # Signal on_complete exactly once, under _lock, so the live-count
+        # decrement happens synchronously with the returncode transition.
+        if self._on_complete is not None and not self._completed_signaled:
+            self._completed_signaled = True
+            self._on_complete(self)
 
     def wait(self, timeout: float | None = None) -> int:
         deadline = None if timeout is None else time.monotonic() + timeout
@@ -140,6 +153,10 @@ class _FakePopen:
             self._hang = False
             self._exit_code = 137  # 128 + SIGKILL
             self._returncode = self._exit_code
+            # SIGKILL path also marks completion — same single-signal rule.
+            if self._on_complete is not None and not self._completed_signaled:
+                self._completed_signaled = True
+                self._on_complete(self)
 
     def communicate(
         self, input: str | None = None, timeout: float | None = None
@@ -180,6 +197,15 @@ class _FakeRunnerScript:
             raise cfg["raise_on_init"]
         # If a barrier is set for this prompt, install hang+release.
         barrier = self.barriers.get(prompt)
+
+        def _on_complete(p: "_FakePopen") -> None:
+            # Called synchronously by _FakePopen when its returncode
+            # transitions from None → set. Decrements live atomically
+            # with the same lock the bounded-concurrency assertion reads.
+            with self.live_lock:
+                if p in self.live:
+                    self.live.remove(p)
+
         popen = _FakePopen(
             argv,
             cwd=cwd,
@@ -190,9 +216,12 @@ class _FakeRunnerScript:
             stdout_text=cfg.get("stdout_text", ""),
             stderr_text=cfg.get("stderr_text", ""),
             hang=cfg.get("hang", barrier is not None),
+            on_complete=_on_complete,
         )
         self.created.append(popen)
-        # Track live count for the bounded-concurrency assertion.
+        # Track live count for the bounded-concurrency assertion. We hold
+        # the lock around BOTH the append and the peak read so a parallel
+        # _on_complete cannot interleave a decrement between them.
         with self.live_lock:
             self.live.append(popen)
             self.peak_live = max(self.peak_live, len(self.live))
@@ -206,15 +235,6 @@ class _FakeRunnerScript:
                 p._exit_after = 0
                 p._exit_code = cfg.get("exit_code", 0)
             threading.Thread(target=_release_when_set, daemon=True).start()
-        # Watch for completion in the background to maintain live
-        # counts (peek-style; the kernel still drives poll()).
-        def _drain(p=popen):
-            while p.poll() is None:
-                time.sleep(0.005)
-            with self.live_lock:
-                if p in self.live:
-                    self.live.remove(p)
-        threading.Thread(target=_drain, daemon=True).start()
         return popen
 
 
