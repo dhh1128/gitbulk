@@ -1090,31 +1090,41 @@ Gitbulk Triage Tool = goal:
     CI Python Matrix Policy = decision:
       id: cipym4kr
       why: >
-        CI workflow at .github/workflows/ci.yml runs the test suite
-        across Python 3.10, 3.12, and 3.13. The devops adversarial
-        review (2026-05-27) argued this is over-matrixed for a
-        single-user CLI deployed to one machine. Counter-rationale
-        for keeping the matrix:
+        CI runs the test suite on Python 3.12 ONLY (the version pinned
+        in .python-version and the user's deployment target).
 
-          - CI cost is zero on free public-repo runners (which is
-            where this lives per node 6xp4kq2n); no resource
-            pressure to economize.
-          - Test signal value of "new Python release broke
-            something" is genuinely useful for a strict-TDD repo
-            whose blast radius (real production repos) makes silent
-            regressions costly.
-          - The matrix is the user's only mechanism to discover
-            language-level regressions before they bite cron.
+        Revised 2026-05-28 from a 3.10/3.12/3.13 matrix to single-
+        version. Reasoning:
 
-        Mitigation accepted: add .python-version at repo root
-        pinning the deployment version (3.12 as of Phase 1D).
-        Contributors know which Python is "the real one"; the
-        matrix is "additionally, we want to know about
-        newer/older Python regressions."
+          - The codebase has exactly ONE Python-version-sensitive
+            code path: gh._parse_iso8601's `Z`-suffix handling
+            workaround for Python <3.11 datetime.fromisoformat. That
+            workaround is unconditional and works on every supported
+            Python, so the matrix is no longer catching anything.
 
-        Revisit if the matrix begins producing flaky failures that
-        are not actionable; drop the older/newer tier first.
-      approved-by: daniel, 2026-05-27
+          - Branch protection requires all matrix entries to be
+            green. A single flaky test (host-dependent pid liveness,
+            timing-sensitive thread scheduling) blocked merge 3×
+            instead of 1×. On 2026-05-28 the matrix turned two real
+            test bugs into a 3-way merge blocker.
+
+          - The matrix's original "newer/older Python regression"
+            signal value was theoretical; in practice the first
+            failures it caught were test-environment quirks, not
+            real Python-version regressions.
+
+          - The deployment Python is one version. Testing 3 versions
+            for a tool that runs on 1 was paying CI cost for
+            non-load-bearing signal.
+
+        If a Python-version-sensitive feature lands later (e.g. tomllib,
+        new typing syntax, async TaskGroup-only patterns), revisit by
+        adding a SECOND CI job (not a matrix) targeting that specific
+        feature's required version range.
+
+        Original 2026-05-27 rationale (matrix kept) and the security-
+        hawk F4 mitigation history live in git log for posterity.
+      approved-by: daniel, 2026-05-27; revised 2026-05-28
 
     # ─── TENSIONS (deferred, do not resolve silently) ────────────────────────
 
