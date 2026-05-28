@@ -138,12 +138,21 @@ def _dispatch_handler(args: argparse.Namespace) -> int:
     return dispatch_handler(args)
 
 
+def _show_handler(args: argparse.Namespace) -> int:
+    # Lazy import for the same reason as the other handlers — keeps the
+    # locks / paths / runstate-reading machinery out of the --help path.
+    from gitbulk.commands.show import show_handler
+
+    return show_handler(args)
+
+
 _SPECIAL_HANDLERS = {
     "ack": _ack_handler,
     "invariants": _invariants_handler,
     "report": _report_handler,
     "summarize": _summarize_handler,
     "dispatch": _dispatch_handler,
+    "show": _show_handler,
 }
 
 
@@ -202,6 +211,58 @@ def _add_summarize_args(sp: argparse.ArgumentParser) -> None:
             "(default: claude-sonnet-4-6). Accepts an alias like "
             "'opus' or a full model name."
         ),
+    )
+
+
+def _add_show_args(sp: argparse.ArgumentParser) -> None:
+    """Argparse flags specific to the ``show`` subcommand.
+
+    Positional ``subcommand`` is optional: omitted ⇒ dashboard. The
+    mutually-exclusive flag group selects which artifact to print;
+    default (no flag) is ``summary.md``. See commands/show.py for the
+    exit-code contract.
+    """
+    sp.add_argument(
+        "show_subcommand",
+        metavar="SUBCOMMAND",
+        nargs="?",
+        default=None,
+        help=(
+            "Name of the subcommand whose latest run to inspect "
+            "(e.g. report, summarize, dispatch). Omit to print the "
+            "dashboard."
+        ),
+    )
+    group = sp.add_mutually_exclusive_group()
+    group.add_argument(
+        "--state",
+        action="store_true",
+        default=False,
+        help="Print state.yaml (full structured per-repo decisions).",
+    )
+    group.add_argument(
+        "--invariants",
+        action="store_true",
+        default=False,
+        help="Print invariants.log (JSONL, one event per check).",
+    )
+    group.add_argument(
+        "--errors",
+        action="store_true",
+        default=False,
+        help="Print errors.log (JSONL, one event per error/warning).",
+    )
+    group.add_argument(
+        "--manifest",
+        action="store_true",
+        default=False,
+        help="Print manifest.yaml (argv, config snapshot, version).",
+    )
+    group.add_argument(
+        "--path",
+        action="store_true",
+        default=False,
+        help="Print the run directory path itself (handy for scripting).",
     )
 
 
@@ -302,6 +363,8 @@ def build_parser() -> argparse.ArgumentParser:
             _add_summarize_args(sp)
         elif sc.name == "dispatch":
             _add_dispatch_args(sp)
+        elif sc.name == "show":
+            _add_show_args(sp)
     return parser
 
 
