@@ -231,7 +231,167 @@ def test_read_holder_metadata_happy_path(tmp_path):
     path = tmp_path / "good.json"
     payload = {"pid": 42, "started_at": "2026-01-01T00:00:00+00:00", "subcommand": "x"}
     path.write_text(json.dumps(payload))
-    assert locks._read_holder_metadata(path) == payload
+    result = locks._read_holder_metadata(path)
+    # pid-liveness check adds an "alive" field; pid 42 essentially never exists
+    # on a real system, so "alive" should be False.
+    assert result is not None
+    assert result["pid"] == 42
+    assert result["started_at"] == payload["started_at"]
+    assert result["subcommand"] == payload["subcommand"]
+    assert result["alive"] is False
+
+
+def test_read_holder_metadata_marks_current_pid_alive(tmp_path):
+    path = tmp_path / "current.json"
+    payload = {
+        "pid": os.getpid(),
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "subcommand": "x",
+    }
+    path.write_text(json.dumps(payload))
+    result = locks._read_holder_metadata(path)
+    assert result is not None
+    assert result["alive"] is True
+
+
+def test_read_holder_metadata_no_alive_field_when_pid_missing(tmp_path):
+    path = tmp_path / "nopid.json"
+    payload = {"started_at": "2026-01-01T00:00:00+00:00", "subcommand": "x"}
+    path.write_text(json.dumps(payload))
+    result = locks._read_holder_metadata(path)
+    assert result is not None
+    # No pid in the file → no alive field added.
+    assert "alive" not in result
+
+
+def test_read_holder_metadata_no_alive_field_when_pid_is_bool(tmp_path):
+    """JSON's True/False parses as Python bool which is a subclass of int.
+    We deliberately do not call _is_pid_alive on bools."""
+    path = tmp_path / "boolpid.json"
+    payload = {
+        "pid": True,
+        "started_at": "2026-01-01T00:00:00+00:00",
+        "subcommand": "x",
+    }
+    path.write_text(json.dumps(payload))
+    result = locks._read_holder_metadata(path)
+    assert result is not None
+    assert "alive" not in result
+
+
+# ─── _is_pid_alive directly ────────────────────────────────────────────────
+
+
+def test_is_pid_alive_for_current_process():
+    assert locks._is_pid_alive(os.getpid()) is True
+
+
+def test_is_pid_alive_for_nonexistent_pid():
+    # PID 2**22 is well beyond any plausible system pid maximum on Linux.
+    assert locks._is_pid_alive(2**22) is False
+
+
+def test_is_pid_alive_permission_error_means_alive(monkeypatch):
+    """A PermissionError on os.kill(pid, 0) means the process exists but
+    is owned by another user — definitely alive from our point of view."""
+
+    def fake_kill(pid, sig):
+        raise PermissionError("not your process")
+
+    monkeypatch.setattr(os, "kill", fake_kill)
+    assert locks._is_pid_alive(1) is True
+
+
+def test_is_pid_alive_generic_oserror_treated_as_dead(monkeypatch):
+    """Defensive: an unexpected OSError from os.kill should not crash the
+    lock-error path. Treat as 'not alive' rather than propagating."""
+
+    def fake_kill(pid, sig):
+        raise OSError("something unusual")
+
+    monkeypatch.setattr(os, "kill", fake_kill)
+    assert locks._is_pid_alive(1) is False
+
+
+# ─── LockTimeoutError message reflects alive status ────────────────────────
+
+
+def test_locktimeout_message_shows_alive_when_holder_present(isolated_cache):
+    # Use this process's own pid so the holder shows as alive.
+    fd_holder = os.open(paths.global_lock_file(), os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(fd_holder, fcntl.LOCK_EX)
+    try:
+        # Pre-write metadata referencing our own pid.
+        os.lseek(fd_holder, 0, os.SEEK_SET)
+        os.ftruncate(fd_holder, 0)
+        os.write(
+            fd_holder,
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                    "subcommand": "report",
+                }
+            ).encode(),
+        )
+        with pytest.raises(LockTimeoutError) as exc_info:
+            with locks.global_lock("exclusive", timeout=0.2):
+                pass
+        err = exc_info.value
+        assert err.holder is not None
+        assert err.holder["alive"] is True
+        assert "(running)" in str(err)
+    finally:
+        os.close(fd_holder)
+
+
+def test_locktimeout_message_no_alive_field(tmp_path):
+    """If holder metadata exists but carries no alive field (e.g., metadata
+    without a pid), the message uses the plain `pid X` form rather than
+    `(running)` or `(no longer running)`."""
+    err = LockTimeoutError(
+        tmp_path / "fake.lock",
+        {
+            "pid": 12345,
+            "started_at": "2026-01-01T00:00:00+00:00",
+            "subcommand": "report",
+        },
+    )
+    text = str(err)
+    assert "pid 12345" in text
+    assert "(running)" not in text
+    assert "(no longer running" not in text
+
+
+def test_locktimeout_message_shows_stale_when_holder_dead(isolated_cache):
+    """When the recorded pid is gone, the message must say so clearly so the
+    operator does not waste time chasing a nonexistent process."""
+    fd_holder = os.open(paths.global_lock_file(), os.O_RDWR | os.O_CREAT, 0o644)
+    fcntl.flock(fd_holder, fcntl.LOCK_EX)
+    try:
+        # Pre-write metadata referencing a definitely-dead pid.
+        os.lseek(fd_holder, 0, os.SEEK_SET)
+        os.ftruncate(fd_holder, 0)
+        os.write(
+            fd_holder,
+            json.dumps(
+                {
+                    "pid": 2**22,
+                    "started_at": "2026-01-01T00:00:00+00:00",
+                    "subcommand": "report",
+                }
+            ).encode(),
+        )
+        with pytest.raises(LockTimeoutError) as exc_info:
+            with locks.global_lock("exclusive", timeout=0.2):
+                pass
+        err = exc_info.value
+        assert err.holder is not None
+        assert err.holder["alive"] is False
+        assert "no longer running" in str(err)
+        assert "stale lock metadata" in str(err)
+    finally:
+        os.close(fd_holder)
 
 
 # ─── Actual contention tests using a second FD in this process ─────────────

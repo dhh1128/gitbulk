@@ -34,22 +34,51 @@ class LockTimeoutError(TimeoutError):
     """Raised when a timeout-bounded lock acquisition fails to acquire in time.
 
     ``holder`` is the JSON metadata the previous holder wrote to the lock
-    file (may be ``None`` if metadata is unreadable).
+    file (may be ``None`` if metadata is unreadable). When ``holder`` is
+    a dict, it carries an ``alive`` key indicating whether the recorded
+    pid still exists on the system; the error message reflects this so
+    the 2 a.m. operator does not chase a pid that no longer runs.
     """
 
     def __init__(self, lock_path: Path, holder: dict | None) -> None:
         self.lock_path = lock_path
         self.holder = holder
         if holder:
+            pid = holder.get("pid")
+            alive = holder.get("alive")
+            if alive is True:
+                liveness = f"pid {pid} (running)"
+            elif alive is False:
+                liveness = f"pid {pid} (no longer running — stale lock metadata)"
+            else:
+                liveness = f"pid {pid}"
             msg = (
                 f"timed out waiting for lock at {lock_path}; "
-                f"held by pid {holder.get('pid')} "
+                f"held by {liveness} "
                 f"since {holder.get('started_at')} "
                 f"running {holder.get('subcommand') or '<unknown>'}"
             )
         else:
             msg = f"timed out waiting for lock at {lock_path} (no holder metadata)"
         super().__init__(msg)
+
+
+def _is_pid_alive(pid: int) -> bool:
+    """Return True if a process with this pid currently exists on the system.
+
+    Uses signal 0 (the standard portable liveness probe). Treats
+    PermissionError as "alive" because the process exists but is owned
+    by another user; treats any other OSError as "not alive" defensively.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def _read_holder_metadata(path: Path) -> dict | None:
@@ -61,7 +90,12 @@ def _read_holder_metadata(path: Path) -> dict | None:
         parsed = json.loads(text)
     except json.JSONDecodeError:
         return None
-    return parsed if isinstance(parsed, dict) else None
+    if not isinstance(parsed, dict):
+        return None
+    pid = parsed.get("pid")
+    if isinstance(pid, int) and not isinstance(pid, bool):
+        parsed["alive"] = _is_pid_alive(pid)
+    return parsed
 
 
 def _acquire(fd: int, lock_op: int, lock_path: Path, timeout: float | None) -> None:
