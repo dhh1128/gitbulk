@@ -567,7 +567,7 @@ Gitbulk Triage Tool = goal:
         (g) Removed fields from the Phase-0 example: default_branch_only
         (it is an invariant property, not a tunable — pr.base_is_default
         is always enforced), dispatch_concurrency (Phase 4 concern;
-        multiprompt owns its own concurrency model per mp7kn4qz),
+        the in-tree execution kernel owns concurrency per execk7nm),
         min_age_days (renamed to min_business_days per bg4pqn7m).
         config/gitbulk.yaml.example is updated in the same commit
         as the loader so the documented schema is never out of sync.
@@ -1440,8 +1440,9 @@ Gitbulk Triage Tool = goal:
             "Where things live").
 
         (f) **--model NAME override.** Same A/B story for the model;
-            default stays ``claude-sonnet-4-6`` (matches multiprompt
-            per node mp7kn4qz).
+            default stays ``claude-sonnet-4-6`` (matches the model
+            choice carried forward into the in-tree kernel per
+            node execk7nm).
 
         Out of scope for Phase 3 (revisit when needed):
           - Multi-prompt summarize (per-priority-tier prompts). The
@@ -1454,34 +1455,102 @@ Gitbulk Triage Tool = goal:
       approved-by: daniel, 2026-05-28
       # was: tension kw2pn7qz (Summarize Prompt Design, deferred at Phase 0)
 
-    Dispatch Execution Kernel = tension:
-      id: mp7kn4qz
+    Dispatch Execution Kernel In-Tree = decision:  # resolves tension mp7kn4qz
+      id: execk7nm
       why: >
-        `gitbulk dispatch` needs bounded parallel claude -p execution
-        against many worktrees with timeout, CTRL+C drain, and per-target
-        log capture. ../origin-platform/scripts/multiprompt.py already
-        implements this. Three options to resolve at Phase 4 entry:
-        (a) subprocess multiprompt as-is (needs multiprompt feature
-        additions for explicit-target-list input and external state-file
-        path); (b) extract the execution kernel from multiprompt into a
-        small standalone package that both tools consume; (c) reimplement
-        the kernel inside gitbulk. User has flagged a leaning toward (b)
-        or (c). Resolution deferred until Phase 4 entry, when concrete
-        candidate-set shapes from gitbulk's invariants exist to design
-        against. Related: tension fw5kq6np.
+        At Phase 4 entry, with gitbulk's invariants and ClaudeClient
+        Protocol now concrete, the execution kernel is reimplemented
+        in-tree at ``src/gitbulk/exec.py`` (option (c) of the original
+        tension). Chosen over (a) subprocess-multiprompt-as-is and (b)
+        extract-a-shared-package because:
 
-    Multiprompt Packaging Future = tension:
-      id: fw5kq6np
+        (1) **Surface area is small.** The kernel needed is ~250 lines:
+            ThreadPoolExecutor with bounded concurrency, per-target
+            subprocess.Popen with SIGTERM→wait-5s→SIGKILL escalation,
+            SIGINT drain (first press lets in-flight finish, second
+            press within 10s hard-kills), per-target log capture into
+            the run directory. Engineering this in-tree is cheaper than
+            negotiating a stable cross-package API.
+
+        (2) **No second consumer in sight.** Option (b) only pays off
+            with two real consumers. multiprompt.py serves a different
+            use case (free-form prompts across all repos in scratch
+            mode, with a rich-TUI display, optional --delay between
+            launches, AI filter pre-pass); gitbulk's dispatch use case
+            (templated prompts against an explicit PR list inside
+            worktrees, headless from cron) overlaps only on the
+            execution kernel itself. Until a third tool needs the same
+            primitive, packaging adds churn without leverage.
+
+        (3) **Dependency hazard.** Option (a) would force gitbulk to
+            shell out to ../origin-platform/scripts/multiprompt.py,
+            making gitbulk's cron health depend on a sibling repo's
+            checkout state. Option (b) needs multiprompt to first do
+            its own packaging work (per the now-also-resolved
+            mprmpkg4); that's not gitbulk's call to make.
+
+        (4) **Test simplicity.** A FakeClaudeClient already exists
+            (per ghclmp7n). The kernel layers Popen management around
+            it for the parallel path. Tests can inject fakes; no
+            subprocess is touched in the test suite.
+
+        Kernel surface:
+
+          - ``ExecTarget(key, working_directory, prompt, input_text)``
+            — one unit of work; ``key`` becomes the log-file stem
+            (e.g., ``owner__repo__pr42.stdout.log``).
+          - ``ExecResult(key, status, exit_code, stdout_path,
+            stderr_path, started_at, finished_at, duration_seconds)``
+            — terminal record per target. ``status`` is one of
+            ``completed`` / ``failed`` / ``timed-out`` / ``interrupted``.
+          - ``execute_targets(targets, *, claude, log_dir, concurrency,
+            timeout_per_target, model, on_progress)`` — runs the
+            bounded pool, returns one ``ExecResult`` per input target
+            in input order.
+
+        Subprocess-vs-ClaudeClient judgment call: ``execute_targets``
+        manages ``subprocess.Popen`` directly for the parallel path,
+        rather than calling ``ClaudeClient.run_prompt`` per target.
+        Reason: timeout escalation (SIGTERM→SIGKILL) and CTRL+C drain
+        both require holding a process handle that the protocol-level
+        ``run_prompt`` does not expose. Adding ``cancel()`` to the
+        protocol would couple every implementation to the
+        cancellation machinery, and the production ``run_prompt`` is
+        already a thin ``subprocess.run`` wrapper — so the kernel is
+        effectively the parallel sibling of ``run_prompt``, not its
+        consumer. Tests still inject a ``ClaudeClient``-shaped fake
+        so the seam exists; the production path uses the fake's
+        ``claude_path`` accessor (or default ``"claude"``) when
+        building argv. Documented at the top of ``exec.py``.
+
+        Resume semantics out of scope for Phase 4: the kernel is
+        single-shot. If interrupted, the user re-invokes ``gitbulk
+        dispatch`` and accepts that interrupted targets did not
+        complete. multiprompt has a resume; gitbulk dispatch does
+        not, because the candidate set is already filtered by
+        invariants on each run and re-running is cheap. Recorded as
+        a deferred enhancement (revisit if real cron-interrupt
+        incidents accumulate).
+      approved-by: daniel, 2026-05-28
+      # was: tension mp7kn4qz (Dispatch Execution Kernel, deferred at Phase 0)
+
+    Multiprompt Packaging Future = decision:  # resolves tension fw5kq6np
+      id: mprmpkg4
       why: >
-        multiprompt.py currently lives as a script inside
-        origin-platform/scripts/ with no this.i, no separate CI, and no
-        release artifact. gitbulk's dependency on it (if we choose option
-        (a) or (b) for tension mp7kn4qz) is risky in that configuration:
-        if origin-platform is restructured, multiprompt moves silently.
-        Whether to extract multiprompt into its own repo with proper
-        docs and CI is multiprompt's question to resolve; gitbulk's
-        relationship to it is just the forcing function that makes the
-        question visible.
+        Resolved by divergence. With ``execk7nm`` choosing in-tree
+        reimplementation, gitbulk no longer depends on multiprompt.py
+        in any form; the forcing function that made multiprompt's
+        packaging question gitbulk's concern is gone. Whether to
+        extract multiprompt into its own repo with proper CI and
+        release artifacts remains multiprompt's own question to
+        resolve, on multiprompt's own timeline, with no coupling
+        back to gitbulk. The shared-kernel path (option (b) of
+        ``execk7nm``) was considered and rejected on cost-vs-leverage
+        grounds; if a third consumer of the parallel-claude primitive
+        appears later, reopen this node and ``execk7nm`` together
+        rather than re-deriving the choice in isolation.
+      approved-by: daniel, 2026-05-28
+      # was: tension fw5kq6np (Multiprompt Packaging Future, deferred at Phase 0)
 
     Default Branch Rename Handling = tension:
       id: rj7p4kqn
@@ -1539,24 +1608,24 @@ Gitbulk Triage Tool = goal:
         gitbulk needs to discover work that should happen but hasn't
         — e.g., "this repo has no CI", "this README is six months
         out of date", "this repo should adopt the new auth library".
-        Likely mechanism: a `scan` subcommand orchestrates a multiprompt
-        run (per tension mp7kn4qz) against repos that pass an invariant
-        filter, using a user-supplied prompt; multiprompt leaves an
-        artifact per repo; gitbulk discovers those artifacts and
-        presents them via a `findings` subcommand, optionally feeding
-        them back into `dispatch` to actually do the work. Open
-        questions: (a) artifact format — structured YAML, free-form
-        markdown, or markdown with YAML frontmatter; (b) artifact
-        location — inside the repo at `.gitbulk/` (findings travel with
-        the clone, but writing inside a clone is in tension with the
-        local-git safety contract 7mxr4pql and would require a
-        deviation: node for that subdirectory) or outside at
-        `~/.cache/gitbulk/findings/<owner>__<repo>/` (preserves the
-        contract, but findings don't travel); (c) finding lifecycle —
-        when does a finding expire, who marks it resolved, can a later
-        scan re-raise a finding the user has dismissed; (d) whether
-        `scan` is a gitbulk subcommand that drives multiprompt, or
-        whether the user runs multiprompt directly and `findings` only
-        consumes. Resolution deferred to Phase 4 entry alongside
-        tension mp7kn4qz, since both depend on the same multiprompt
+        Likely mechanism: a `scan` subcommand orchestrates an
+        in-tree execute_targets run (per node execk7nm) against repos
+        that pass an invariant filter, using a user-supplied prompt;
+        each target's log file is the artifact; gitbulk discovers
+        those artifacts and presents them via a `findings` subcommand,
+        optionally feeding them back into `dispatch` to actually do
+        the work. Open questions: (a) artifact format — structured
+        YAML, free-form markdown, or markdown with YAML frontmatter;
+        (b) artifact location — inside the repo at `.gitbulk/`
+        (findings travel with the clone, but writing inside a clone
+        is in tension with the local-git safety contract 7mxr4pql and
+        would require a deviation: node for that subdirectory) or
+        outside at `~/.cache/gitbulk/findings/<owner>__<repo>/`
+        (preserves the contract, but findings don't travel); (c)
+        finding lifecycle — when does a finding expire, who marks it
+        resolved, can a later scan re-raise a finding the user has
+        dismissed; (d) whether `scan` is its own subcommand or whether
+        `dispatch --scan-only` covers the same need. Resolution
+        deferred to a later phase; the execk7nm kernel now exists, so
+        this tension is no longer blocked on the multiprompt
         integration decision.
