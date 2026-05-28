@@ -85,3 +85,110 @@ def test_subcommand_equality_by_value():
     a = Subcommand("x", "h", mutating=False, lock_mode="shared", needs_clone=False)
     b = Subcommand("x", "h", mutating=False, lock_mode="shared", needs_clone=False)
     assert a == b
+
+
+# ─── invariant_chain field (this.i node ``scinv4qm``) ──────────────────────
+
+
+def test_subcommand_has_invariant_chain_default_empty():
+    sc = Subcommand("x", "h", mutating=False, lock_mode="shared", needs_clone=False)
+    assert sc.invariant_chain == ()
+
+
+@pytest.mark.parametrize(
+    "name,expected_chain",
+    [
+        (
+            "report",
+            (
+                "gh.authenticated",
+                "config.parseable",
+                "org.members.fresh",
+                "github.reachable",
+                "pr.base_is_default",
+                "pr.author_known",
+            ),
+        ),
+        (
+            "summarize",
+            (
+                "gh.authenticated",
+                "config.parseable",
+                "org.members.fresh",
+                "github.reachable",
+                "pr.base_is_default",
+                "pr.author_known",
+            ),
+        ),
+        (
+            "merge",
+            (
+                "gh.authenticated",
+                "config.parseable",
+                "org.members.fresh",
+                "github.reachable",
+                "pr.base_is_default",
+                "pr.author_known",
+            ),
+        ),
+        (
+            "close-stale",
+            (
+                "gh.authenticated",
+                "config.parseable",
+                "org.members.fresh",
+                "github.reachable",
+                "pr.base_is_default",
+                "pr.author_known",
+            ),
+        ),
+        (
+            "dispatch",
+            (
+                "gh.authenticated",
+                "config.parseable",
+                "org.members.fresh",
+                "local.exists",
+                "local.remote_matches",
+                "local.default_branch_in_sync",
+                "github.reachable",
+                "pr.base_is_default",
+                "pr.author_known",
+            ),
+        ),
+        (
+            "rebase-onto-default",
+            (
+                "gh.authenticated",
+                "config.parseable",
+                "org.members.fresh",
+                "local.exists",
+                "local.remote_matches",
+                "local.default_branch_in_sync",
+                "github.reachable",
+                "pr.base_is_default",
+                "pr.author_known",
+            ),
+        ),
+        ("show", ()),
+        ("ack", ()),
+        ("invariants", ()),
+    ],
+)
+def test_subcommand_invariant_chain(name, expected_chain):
+    assert by_name(name).invariant_chain == expected_chain
+
+
+def test_clone_subcommands_have_local_invariants():
+    """Symmetric: needs_clone ↔ chain includes local.* invariants."""
+    for sc in KNOWN:
+        local_names = {n for n in sc.invariant_chain if n.startswith("local.")}
+        if sc.needs_clone:
+            assert local_names, (
+                f"{sc.name} has needs_clone=True but no local.* invariants"
+            )
+        else:
+            assert not local_names, (
+                f"{sc.name} has needs_clone=False but chain contains "
+                f"local.* invariants: {local_names}"
+            )

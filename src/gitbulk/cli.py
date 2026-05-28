@@ -114,10 +114,49 @@ def _invariants_handler(_args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def _report_handler(args: argparse.Namespace) -> int:
+    # Lazy import keeps cli.py import-light and avoids dragging in
+    # gh / runstate / invariants for every `gitbulk --help` invocation.
+    from gitbulk.commands.report import report_handler
+
+    return report_handler(args)
+
+
 _SPECIAL_HANDLERS = {
     "ack": _ack_handler,
     "invariants": _invariants_handler,
+    "report": _report_handler,
 }
+
+
+def _add_report_args(sp: argparse.ArgumentParser) -> None:
+    """Argparse flags specific to the ``report`` subcommand."""
+    sp.add_argument(
+        "--code-root",
+        metavar="PATH",
+        default=None,
+        help="Override default ~/code/ where local clones live.",
+    )
+    sp.add_argument(
+        "--skip-check",
+        metavar="NAME",
+        action="append",
+        default=None,
+        help=(
+            "Skip the named invariant for this run (may be passed more "
+            "than once). Logs a WARNING and triggers exit-code 4 if no "
+            "other concern fires."
+        ),
+    )
+    sp.add_argument(
+        "--refresh-org-members",
+        action="store_true",
+        default=False,
+        help=(
+            "Force a fresh fetch of the configured humans.org members "
+            "before running the report."
+        ),
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -126,11 +165,22 @@ def build_parser() -> argparse.ArgumentParser:
         description="Nightly PR triage and fleet maintenance across many GitHub repositories.",
     )
     parser.add_argument("--version", action="version", version=f"gitbulk {__version__}")
+    parser.add_argument(
+        "--config-root",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Override the default ~/.config/gitbulk/ location. Honored by "
+            "subcommands that read the user config."
+        ),
+    )
     subparsers = parser.add_subparsers(dest="subcommand", metavar="SUBCOMMAND")
     for sc in KNOWN:
         sp = subparsers.add_parser(sc.name, help=sc.help)
         handler = _SPECIAL_HANDLERS.get(sc.name, _not_implemented(sc.name))
         sp.set_defaults(handler=handler)
+        if sc.name == "report":
+            _add_report_args(sp)
     return parser
 
 
@@ -150,6 +200,21 @@ def _maybe_set_attention(exit_code: int, subcommand: str) -> None:
     )
 
 
+def _apply_config_root(config_root: str | None) -> None:
+    """If --config-root was passed, point XDG_CONFIG_HOME at its parent
+    so ``paths.config_dir()`` resolves to it.
+
+    The user's flag value MUST point at the ``gitbulk/`` directory
+    itself (mirroring ~/.config/gitbulk); the function sets the env
+    so the underlying ``paths`` helpers stay XDG-purist.
+    """
+    if config_root is None:
+        return
+    p = os.path.expanduser(config_root)
+    parent = os.path.dirname(os.path.abspath(p)) or "/"
+    os.environ["XDG_CONFIG_HOME"] = parent
+
+
 def main(argv: list[str] | None = None) -> int:
     _check_python_version()
     _configure_logging()
@@ -158,6 +223,7 @@ def main(argv: list[str] | None = None) -> int:
     if not args.subcommand:
         parser.print_help()
         return EXIT_OK
+    _apply_config_root(getattr(args, "config_root", None))
     exit_code = args.handler(args)
     _maybe_set_attention(exit_code, args.subcommand)
     return exit_code

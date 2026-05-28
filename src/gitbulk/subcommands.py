@@ -6,15 +6,41 @@ adversarial review (2026-05-27, finding P-F3): ``cli.py`` and
 ``dashboard.py`` both consumed the subcommand list, so its home is
 neither of them.
 
-See this.i node ``smodlpr3`` for the contract.
+See this.i node ``smodlpr3`` for the contract; ``scinv4qm`` for the
+``invariant_chain`` field (Phase 2).
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 LockMode = Literal["shared", "exclusive"]
+
+
+# Phase 2 invariant chains (this.i node ``ph2inv4n``). Ordering is
+# UNIVERSAL → PER_REPO → PER_PR per ``c4jzm5pn``; the chain runner
+# stops on first Fail and the subcommand handler partitions by kind.
+_GH_TOUCHING_CHAIN: tuple[str, ...] = (
+    "gh.authenticated",
+    "config.parseable",
+    "org.members.fresh",
+    "github.reachable",
+    "pr.base_is_default",
+    "pr.author_known",
+)
+
+_CLONE_TOUCHING_CHAIN: tuple[str, ...] = (
+    "gh.authenticated",
+    "config.parseable",
+    "org.members.fresh",
+    "local.exists",
+    "local.remote_matches",
+    "local.default_branch_in_sync",
+    "github.reachable",
+    "pr.base_is_default",
+    "pr.author_known",
+)
 
 
 @dataclass(frozen=True)
@@ -30,6 +56,12 @@ class Subcommand:
     Mutating subcommands take exclusive; read-only take shared."""
     needs_clone: bool
     """When True, the local.exists invariant (node 5xqp2nkr) applies."""
+    invariant_chain: tuple[str, ...] = field(default=())
+    """Registered invariant names this subcommand runs, in order.
+
+    Per this.i node ``scinv4qm``. Empty tuple is valid (e.g. ``ack``,
+    ``invariants``, ``show``).
+    """
 
 
 KNOWN: tuple[Subcommand, ...] = (
@@ -39,6 +71,7 @@ KNOWN: tuple[Subcommand, ...] = (
         mutating=False,
         lock_mode="shared",
         needs_clone=False,
+        invariant_chain=_GH_TOUCHING_CHAIN,
     ),
     Subcommand(
         name="summarize",
@@ -46,6 +79,7 @@ KNOWN: tuple[Subcommand, ...] = (
         mutating=False,
         lock_mode="shared",
         needs_clone=False,
+        invariant_chain=_GH_TOUCHING_CHAIN,
     ),
     Subcommand(
         name="dispatch",
@@ -53,6 +87,7 @@ KNOWN: tuple[Subcommand, ...] = (
         mutating=True,
         lock_mode="exclusive",
         needs_clone=True,
+        invariant_chain=_CLONE_TOUCHING_CHAIN,
     ),
     Subcommand(
         name="merge",
@@ -60,6 +95,7 @@ KNOWN: tuple[Subcommand, ...] = (
         mutating=True,
         lock_mode="exclusive",
         needs_clone=False,
+        invariant_chain=_GH_TOUCHING_CHAIN,
     ),
     Subcommand(
         name="rebase-onto-default",
@@ -67,6 +103,7 @@ KNOWN: tuple[Subcommand, ...] = (
         mutating=True,
         lock_mode="exclusive",
         needs_clone=True,
+        invariant_chain=_CLONE_TOUCHING_CHAIN,
     ),
     Subcommand(
         name="close-stale",
@@ -74,6 +111,7 @@ KNOWN: tuple[Subcommand, ...] = (
         mutating=True,
         lock_mode="exclusive",
         needs_clone=False,
+        invariant_chain=_GH_TOUCHING_CHAIN,
     ),
     Subcommand(
         name="show",
@@ -81,6 +119,7 @@ KNOWN: tuple[Subcommand, ...] = (
         mutating=False,
         lock_mode="shared",
         needs_clone=False,
+        invariant_chain=(),
     ),
     Subcommand(
         name="ack",
@@ -88,6 +127,7 @@ KNOWN: tuple[Subcommand, ...] = (
         mutating=False,
         lock_mode="shared",
         needs_clone=False,
+        invariant_chain=(),
     ),
     Subcommand(
         name="invariants",
@@ -95,6 +135,7 @@ KNOWN: tuple[Subcommand, ...] = (
         mutating=False,
         lock_mode="shared",
         needs_clone=False,
+        invariant_chain=(),
     ),
 )
 

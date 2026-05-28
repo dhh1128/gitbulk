@@ -1,0 +1,836 @@
+"""End-to-end tests for ``gitbulk report`` (this.i node ``scinv4qm``).
+
+The pipeline orchestrates four Phase 2 subsystems: invariants
+framework, gh client, classifier (via ``pr.author_known``), and
+RunState. These tests pin every exit-code branch + the ATTENTION
+sentinel contract + the structured state.yaml output.
+
+All tests use FakeGHClient (AGENTS.md: "no network in tests").
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from datetime import datetime, timezone
+
+import pytest
+import yaml
+
+from gitbulk import paths, sentinel
+from gitbulk.cli import main
+from gitbulk.commands import report as report_mod
+from gitbulk.commands.report import (
+    EXIT_ATTENTION_NEEDED,
+    EXIT_INVARIANT_SKIPPED,
+    EXIT_OK,
+    EXIT_OVERRIDES_APPLIED,
+    EXIT_STRUCTURAL_FAILURE,
+    _build_summary_md,
+    _runid_from_run_dir,
+    report_handler,
+)
+from gitbulk.gh import FakeGHClient, GHError
+from gitbulk.locks import LockTimeoutError
+from gitbulk.org_members_cache import CachedMembers, save_cache
+from gitbulk.pr_info import PRInfo
+
+
+# ─── Fixtures ──────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def isolated_xdg(monkeypatch, tmp_path):
+    """Point XDG dirs at tmp so the test is fully self-contained."""
+    cfg = tmp_path / "config"
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(cfg))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+    paths.ensure_directories()
+    return tmp_path
+
+
+@pytest.fixture
+def code_root(tmp_path):
+    """A tmp ~/code/ root with no clones (report doesn't need them)."""
+    root = tmp_path / "code"
+    root.mkdir()
+    return root
+
+
+@pytest.fixture
+def write_config(isolated_xdg, code_root):
+    """Factory that writes gitbulk.yaml + repos.txt and returns paths."""
+
+    def _write(*, repos_slugs, with_org="provenant-dev"):
+        cfg_dir = paths.config_dir()
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        policy_yaml = {
+            "defaults": {"retain_runs": 5},
+        }
+        if with_org:
+            policy_yaml["humans"] = {"org": with_org, "cache_ttl_hours": 24}
+        (cfg_dir / "gitbulk.yaml").write_text(yaml.safe_dump(policy_yaml))
+        repos_txt = "\n".join(repos_slugs) + ("\n" if repos_slugs else "")
+        (cfg_dir / "repos.txt").write_text(repos_txt)
+        return cfg_dir
+
+    return _write
+
+
+@pytest.fixture
+def fresh_org_cache():
+    """Helper that writes a fresh org-members cache for tests."""
+
+    def _save(org, members):
+        save_cache(
+            CachedMembers(
+                org=org,
+                fetched_at=datetime.now(timezone.utc),
+                members=frozenset(members),
+            )
+        )
+
+    return _save
+
+
+def _make_pr(
+    *,
+    slug: str,
+    number: int,
+    author: str = "dhh1128",
+    base_ref: str = "main",
+    title: str | None = None,
+) -> PRInfo:
+    return PRInfo(
+        slug=slug,
+        number=number,
+        title=title or f"PR #{number} title",
+        url=f"https://github.com/{slug}/pull/{number}",
+        author=author,
+        base_ref=base_ref,
+        head_ref=f"feature/{number}",
+        head_sha="a" * 40,
+        state="OPEN",
+        is_draft=False,
+        mergeable_state="CLEAN",
+        created_at=datetime(2026, 5, 27, 12, 0, 0, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 5, 28, 12, 0, 0, tzinfo=timezone.utc),
+        last_pushed_at=datetime(2026, 5, 28, 10, 0, 0, tzinfo=timezone.utc),
+        labels=(),
+        review_decision="APPROVED",
+        checks_status="SUCCESS",
+    )
+
+
+def _make_args(
+    *,
+    code_root=None,
+    skip_check=None,
+    refresh_org_members=False,
+):
+    return argparse.Namespace(
+        subcommand="report",
+        code_root=str(code_root) if code_root else None,
+        skip_check=list(skip_check) if skip_check else None,
+        refresh_org_members=refresh_org_members,
+    )
+
+
+# ─── Happy path: 2 repos with 1 PR each → exit 2 ───────────────────────────
+
+
+def test_report_happy_path_two_prs(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    write_config(repos_slugs=["dhh1128/alpha", "dhh1128/beta"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr_alpha = _make_pr(slug="dhh1128/alpha", number=1)
+    pr_beta = _make_pr(slug="dhh1128/beta", number=2)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={
+            "dhh1128/alpha": "main",
+            "dhh1128/beta": "main",
+        },
+        my_open_prs={
+            "dhh1128/alpha": [pr_alpha],
+            "dhh1128/beta": [pr_beta],
+        },
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    args = _make_args(code_root=code_root)
+    rc = report_handler(args)
+
+    assert rc == EXIT_ATTENTION_NEEDED
+    parsed = sentinel.parse_attention()
+    assert parsed is not None
+    assert parsed["exit_code"] == EXIT_ATTENTION_NEEDED
+    assert parsed["subcommand"] == "report"
+    assert "2 PRs need attention" in parsed["summary"]
+    # Verify state.yaml + summary.md content.
+    latest = paths.latest_run_symlink("report").resolve()
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    assert set(state["repos"].keys()) == {"dhh1128/alpha", "dhh1128/beta"}
+    summary = (latest / "summary.md").read_text()
+    assert "dhh1128/alpha" in summary
+    assert "dhh1128/beta" in summary
+    # Manifest was finalized.
+    manifest = yaml.safe_load((latest / "manifest.yaml").read_text())
+    assert manifest["exit_code"] == EXIT_ATTENTION_NEEDED
+    assert "completed_at" in manifest
+    # Config snapshot is inline.
+    assert manifest["config_snapshot"]["repos_txt"]
+
+
+# ─── All clean: 0 PRs → exit 0, no sentinel ────────────────────────────────
+
+
+def test_report_no_prs_exit_ok(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    rc = report_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_OK
+    assert not sentinel.has_attention()
+    # The run still completed and produced summary.md.
+    latest = paths.latest_run_symlink("report").resolve()
+    summary = (latest / "summary.md").read_text()
+    assert "no open prs" in summary.lower()
+
+
+# ─── github.reachable Skip → exit 3 ────────────────────────────────────────
+
+
+def test_report_one_repo_unreachable_exit_3(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    write_config(repos_slugs=["dhh1128/alpha", "dhh1128/beta"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    # default_branches MISSING beta → GithubReachableInvariant skips beta
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},  # alpha has no PRs
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    rc = report_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_INVARIANT_SKIPPED
+    parsed = sentinel.parse_attention()
+    assert parsed is not None
+    assert parsed["exit_code"] == EXIT_INVARIANT_SKIPPED
+    assert "1 repos skipped" in parsed["summary"]
+    latest = paths.latest_run_symlink("report").resolve()
+    summary = (latest / "summary.md").read_text()
+    assert "Skipped repos" in summary
+    assert "dhh1128/beta" in summary
+
+
+# ─── --skip-check applied → exit 4 ─────────────────────────────────────────
+
+
+def test_report_skip_check_triggers_exit_4(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+    # Skip an invariant that wouldn't have fired anyway — the cmdline
+    # *gesture* itself is the audit event per node r4nzp7kq.
+    rc = report_handler(
+        _make_args(code_root=code_root, skip_check=["pr.base_is_default"])
+    )
+    assert rc == EXIT_OVERRIDES_APPLIED
+    assert not sentinel.has_attention()  # 4 does not trigger ATTENTION
+    # The skip was recorded as a WARNING in errors.log.
+    latest = paths.latest_run_symlink("report").resolve()
+    errors = (latest / "errors.log").read_text().splitlines()
+    assert any(
+        json.loads(line).get("level") == "WARNING" for line in errors
+    )
+
+
+# ─── Lock timeout → exit 1, no sentinel ────────────────────────────────────
+
+
+def test_report_lock_timeout_exits_1(
+    monkeypatch, isolated_xdg, code_root, write_config, capsys, fresh_org_cache
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+
+    # Inject a global_lock that raises LockTimeoutError on entry.
+    class _BoomLock:
+        def __enter__(self):
+            raise LockTimeoutError(
+                paths.global_lock_file(),
+                {"pid": 999, "started_at": "1970-01-01T00:00:00+00:00",
+                 "subcommand": "merge", "alive": False},
+            )
+
+        def __exit__(self, *a):  # pragma: no cover — never reached
+            return False
+
+    def _fake_global_lock(*a, **kw):
+        return _BoomLock()
+
+    monkeypatch.setattr(
+        "gitbulk.commands.report.global_lock", _fake_global_lock
+    )
+    fake = FakeGHClient(user={"login": "dhh1128"})
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    rc = report_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    assert not sentinel.has_attention()
+    err = capsys.readouterr().err
+    assert "timed out" in err
+
+
+# ─── gh.authenticated fails → exit 1 ───────────────────────────────────────
+
+
+def test_report_gh_not_authenticated_exit_1(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    # No user configured → authenticated_user raises GHError
+    fake = FakeGHClient()
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+    rc = report_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    # A run dir was still created and finalized with the failure.
+    latest = paths.latest_run_symlink("report").resolve()
+    manifest = yaml.safe_load((latest / "manifest.yaml").read_text())
+    assert manifest["exit_code"] == EXIT_STRUCTURAL_FAILURE
+    summary = (latest / "summary.md").read_text()
+    assert "FAILED" in summary
+
+
+# ─── org.members.fresh fails: missing cache → exit 1 ───────────────────────
+
+
+def test_report_org_members_cache_missing_exit_1(
+    monkeypatch, isolated_xdg, code_root, write_config
+):
+    write_config(repos_slugs=["dhh1128/alpha"])  # no fresh_org_cache call
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+    rc = report_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_STRUCTURAL_FAILURE
+
+
+# ─── --refresh-org-members triggers a cache refresh, then runs ─────────────
+
+
+def test_report_refresh_org_members_triggers_refetch(
+    monkeypatch, isolated_xdg, code_root, write_config
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128", "alice"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    rc = report_handler(
+        _make_args(code_root=code_root, refresh_org_members=True)
+    )
+    # Refresh succeeded and the cache file was written; the run reached
+    # exit 0 (no PRs, no skips, no overrides).
+    assert rc == EXIT_OK
+    assert fake.call_count["org_members"] == 1
+    # The cache YAML now exists for use by the invariants.
+    cache_path = paths.org_members_cache_file("provenant-dev")
+    assert cache_path.exists()
+
+
+def test_report_refresh_org_members_failure_exit_1(
+    monkeypatch, isolated_xdg, code_root, write_config, capsys
+):
+    """If the refresh call itself errors, surface to stderr + exit 1."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fake = FakeGHClient(user={"login": "dhh1128"})  # no org_members config
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+    rc = report_handler(
+        _make_args(code_root=code_root, refresh_org_members=True)
+    )
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    err = capsys.readouterr().err
+    assert "--refresh-org-members failed" in err
+
+
+def test_report_refresh_org_members_noop_when_org_unset(
+    monkeypatch, isolated_xdg, code_root, write_config
+):
+    """--refresh-org-members is a no-op when humans.org is None."""
+    # write_config with with_org=None
+    write_config(repos_slugs=["dhh1128/alpha"], with_org=None)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+    rc = report_handler(
+        _make_args(code_root=code_root, refresh_org_members=True)
+    )
+    assert rc == EXIT_OK
+    assert fake.call_count["org_members"] == 0
+
+
+# ─── Empty repos.txt → exit 0 ──────────────────────────────────────────────
+
+
+def test_report_empty_repos_exit_ok(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    write_config(repos_slugs=[])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    rc = report_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_OK
+    assert not sentinel.has_attention()
+    latest = paths.latest_run_symlink("report").resolve()
+    summary = (latest / "summary.md").read_text()
+    assert "no repos configured" in summary.lower()
+
+
+# ─── Bot author still counts (Phase 2 behavior) ────────────────────────────
+
+
+def test_report_bot_author_still_counts_as_attention(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    """Phase 2: bot PRs are not filtered out yet; they still pass per-PR
+    invariants and end up counted as "attention."
+    """
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    # dependabot is not in org_members → BOT (per pj5kn2zw); the
+    # pr.author_known invariant Passes (HUMAN-or-BOT is decided, only
+    # UNKNOWN is a Fail).
+    pr_bot = _make_pr(
+        slug="dhh1128/alpha", number=7, author="dependabot[bot]"
+    )
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr_bot]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    rc = report_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_ATTENTION_NEEDED
+
+
+# ─── PR with non-default base is Skipped → counted as not-attention ────────
+
+
+def test_report_pr_non_default_base_is_skipped_not_attention(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr = _make_pr(
+        slug="dhh1128/alpha", number=99, base_ref="develop"  # NOT main
+    )
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    rc = report_handler(_make_args(code_root=code_root))
+    # No attention PRs; no repo skipped; no --skip-check → EXIT_OK.
+    assert rc == EXIT_OK
+    latest = paths.latest_run_symlink("report").resolve()
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    pr_state = state["repos"]["dhh1128/alpha"]["prs"][0]
+    assert pr_state["invariants_passed"] is False
+    assert any(
+        "pr.base_is_default" in pair[0] for pair in pr_state["invariants_skips"]
+    )
+
+
+# ─── PER_REPO invariant Fail aborts the whole run → exit 1 ────────────────
+
+
+def test_report_per_repo_invariant_fail_aborts_exit_1(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    """Patch GithubReachableInvariant.check to return Fail; the chain
+    runner halts and report exits 1 (structural failure)."""
+    from gitbulk.invariants.base import Fail as _Fail
+    from gitbulk.invariants import catalog as _catalog
+
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+    monkeypatch.setattr(
+        _catalog.GithubReachableInvariant,
+        "check",
+        lambda self, ctx: _Fail("forced fail for test"),
+    )
+
+    rc = report_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    latest = paths.latest_run_symlink("report").resolve()
+    summary = (latest / "summary.md").read_text()
+    assert "FAILED" in summary
+    assert "per-repo invariant failed" in summary
+
+
+# ─── gh.my_open_prs raises → exit 1 ────────────────────────────────────────
+
+
+def test_report_gh_pr_fetch_error_exit_1(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    # default_branches configured (preflight passes) but my_open_prs is
+    # NOT configured → FakeGHClient raises GHError on the coalesced call.
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    rc = report_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    latest = paths.latest_run_symlink("report").resolve()
+    errors = [
+        json.loads(line)
+        for line in (latest / "errors.log").read_text().splitlines()
+    ]
+    assert any("my_open_prs failed" in e["message"] for e in errors)
+
+
+# ─── --skip-check on github.reachable: lets a "would-skip" repo through ────
+
+
+def test_report_skip_check_overrides_github_reachable(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    """When --skip-check is passed for an invariant that would have
+    Skipped a repo, the invariant is bypassed and the repo proceeds."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr = _make_pr(slug="dhh1128/alpha", number=1)
+    # default_branches has alpha — needed by pr.base_is_default — but
+    # we configure my_open_prs explicitly.
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    rc = report_handler(
+        _make_args(
+            code_root=code_root, skip_check=["github.reachable"]
+        )
+    )
+    # github.reachable was SKIP'd via cmdline. The repo proceeds, PR
+    # invariants pass → ATTENTION (2). Exit 4 takes second priority to 2.
+    assert rc == EXIT_ATTENTION_NEEDED
+
+
+# ─── pr.author_known UNKNOWN → defensive Fail aborts the chain ─────────────
+
+
+def test_report_chain_aborts_when_invariant_fails_on_pr(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    """A per-PR Fail doesn't abort the whole run (Fail is logged but the
+    overall report still completes; the PR record reflects the failure).
+
+    Verified by skipping org.members.fresh and then NOT writing a cache,
+    so pr.author_known sees no org_members and falls through to BOT
+    (still a valid decision; UNKNOWN is unreachable in this branch).
+    """
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr = _make_pr(slug="dhh1128/alpha", number=1, author="dhh1128")
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    rc = report_handler(_make_args(code_root=code_root))
+    # All clean.
+    assert rc == EXIT_ATTENTION_NEEDED
+
+
+# ─── Internal helpers ──────────────────────────────────────────────────────
+
+
+def test_runid_from_run_dir_handles_hyphenated_subcommand(tmp_path):
+    d = tmp_path / "20260528T010203Z-rebase-onto-default"
+    assert _runid_from_run_dir(d) == "20260528T010203Z-rebase-onto"
+    # Documented limitation: rpartition splits on the LAST hyphen. For a
+    # subcommand like ``report`` this is unambiguous; ``rebase-onto-default``
+    # is hyphenated. We accept the cosmetic imperfection at Phase 2; the
+    # value is used only as the ``runid`` field in the sentinel JSON.
+
+
+def test_runid_from_run_dir_simple_case(tmp_path):
+    d = tmp_path / "20260528T010203Z-report"
+    assert _runid_from_run_dir(d) == "20260528T010203Z"
+
+
+def test_build_summary_md_includes_skipped_repo_reason(
+    isolated_xdg, code_root, write_config
+):
+    from gitbulk.config.policy import load_policy
+    from gitbulk.config.repos import RepoEntry
+
+    write_config(repos_slugs=["x/a"])
+    policy = load_policy()
+    repo = RepoEntry(
+        slug="x/a", owner="x", name="a", local_path=code_root / "a",
+        source_line=1,
+    )
+    md = _build_summary_md(
+        policy,
+        [repo],
+        passing_repos=[],
+        skipped_repos=[("x/a", "github not reachable")],
+        prs_by_repo={},
+        pr_records_by_repo={},
+        attention_count=0,
+    )
+    assert "Skipped repos" in md
+    assert "github not reachable" in md
+
+
+def test_build_summary_md_with_pr_skip_lines(
+    isolated_xdg, code_root, write_config
+):
+    """Verify the inner "skip <inv>: <reason>" lines render in summary.md."""
+    from gitbulk.config.policy import load_policy
+    from gitbulk.config.repos import RepoEntry
+
+    write_config(repos_slugs=["x/a"])
+    policy = load_policy()
+    repo = RepoEntry(
+        slug="x/a", owner="x", name="a", local_path=code_root / "a",
+        source_line=1,
+    )
+    pr = _make_pr(slug="x/a", number=42)
+    # Recreate with is_draft=True via dataclasses.replace for the
+    # [DRAFT] rendering assertion.
+    from dataclasses import replace as dc_replace
+
+    pr = dc_replace(pr, is_draft=True)
+    record = {
+        "number": 42,
+        "title": "T",
+        "url": "u",
+        "author": "a",
+        "state": "OPEN",
+        "is_draft": True,
+        "base_ref": "main",
+        "head_ref": "h",
+        "mergeable_state": None,
+        "review_decision": None,
+        "checks_status": None,
+        "labels": [],
+        "invariants_passed": False,
+        "invariants_skips": [["pr.base_is_default", "wrong base"]],
+        "invariants_fail_reason": None,
+    }
+    md = _build_summary_md(
+        policy,
+        [repo],
+        passing_repos=[repo],
+        skipped_repos=[],
+        prs_by_repo={"x/a": [pr]},
+        pr_records_by_repo={"x/a": [record]},
+        attention_count=0,
+    )
+    assert "[DRAFT]" in md
+    assert "pr.base_is_default" in md
+    assert "wrong base" in md
+
+
+# ─── CLI smoke: report subcommand invoked through main() ───────────────────
+
+
+def test_report_through_main_runs_full_pipeline(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    rc = main(["report", "--code-root", str(code_root)])
+    assert rc == EXIT_OK
+
+
+def test_report_through_main_passes_skip_check_through(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    rc = main(
+        [
+            "report",
+            "--code-root", str(code_root),
+            "--skip-check", "pr.base_is_default",
+            "--skip-check", "pr.author_known",
+        ]
+    )
+    assert rc == EXIT_OVERRIDES_APPLIED
+
+
+def test_config_root_flag_routes_paths(
+    monkeypatch, tmp_path, code_root, fresh_org_cache
+):
+    """--config-root makes paths.config_dir() resolve to the user's dir."""
+    # Build a tmp config dir whose basename is 'gitbulk', as documented.
+    parent = tmp_path / "alt-config"
+    cfg_root = parent / "gitbulk"
+    cfg_root.mkdir(parents=True)
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+    # No XDG_CONFIG_HOME — --config-root will set it.
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    (cfg_root / "gitbulk.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "defaults": {"retain_runs": 5},
+                "humans": {"org": "provenant-dev", "cache_ttl_hours": 24},
+            }
+        )
+    )
+    (cfg_root / "repos.txt").write_text("dhh1128/alpha\n")
+
+    # Org cache: paths.config_dir() goes through XDG, but the org-members
+    # cache lives under XDG_CACHE. We must ensure the cache file exists
+    # AFTER --config-root has redirected things, so write it after main
+    # starts. Easiest path: write it now under the to-be cache dir.
+    (cache / "gitbulk" / "org-members").mkdir(parents=True, exist_ok=True)
+    save_cache(
+        CachedMembers(
+            org="provenant-dev",
+            fetched_at=datetime.now(timezone.utc),
+            members=frozenset({"dhh1128"}),
+        )
+    )
+
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    rc = main(
+        [
+            "--config-root", str(cfg_root),
+            "report",
+            "--code-root", str(code_root),
+        ]
+    )
+    assert rc == EXIT_OK
