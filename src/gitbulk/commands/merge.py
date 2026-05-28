@@ -47,6 +47,7 @@ from gitbulk.invariants.base import Invariant, InvariantKind
 from gitbulk.locks import LockTimeoutError, global_lock
 from gitbulk.pr_info import PRInfo
 from gitbulk.runstate import RunState
+from gitbulk.util.progress import Progress
 from gitbulk import subcommands as subcommands_mod
 
 # Exit codes — duplicated here (instead of importing from cli.py) so
@@ -327,10 +328,13 @@ def _run_under_lock(
     # PER_REPO preflight.
     skipped_repos: list[tuple[str, str]] = []
     passing_repos: list[RepoEntry] = []
-    for repo in repos:
+    progress = Progress(len(repos), prefix="per-repo checks: ")
+    for i, repo in enumerate(repos, start=1):
+        progress.update(i, repo.slug)
         ctx_repo = replace(ctx_base, repo=repo)
         r = run_chain(per_repo, ctx_repo, skip_set=skip_set, target=repo.slug)
         if not r.passed:
+            progress.done()
             return _finish(
                 rs,
                 EXIT_STRUCTURAL_FAILURE,
@@ -356,6 +360,7 @@ def _run_under_lock(
             skipped_repos.append((repo.slug, reason))
         else:
             passing_repos.append(repo)
+    progress.done()
 
     # Coalesced PR fetch.
     if passing_repos:

@@ -55,6 +55,7 @@ from gitbulk.locks import LockTimeoutError, global_lock
 from gitbulk.org_members_cache import refresh_cache
 from gitbulk.pr_info import CheckRun, PRInfo
 from gitbulk.runstate import RunState
+from gitbulk.util.progress import Progress
 from gitbulk.watchdog_ack import load_acked, record_ack
 from gitbulk import subcommands as subcommands_mod
 
@@ -602,12 +603,19 @@ def _run_under_lock(
     # caller's skip_set.
     skipped_repos: list[tuple[str, str]] = []
     passing_repos: list[RepoEntry] = []
-    for repo in repos:
+    # The per-repo invariant chain runs ``github.reachable`` which makes
+    # one ``gh api repos/<slug>`` call per repo. For a 175-repo fleet
+    # that's a 60-90s silent wait. Progress indicator keeps the user
+    # informed; on a non-TTY (cron) it's a no-op.
+    progress = Progress(len(repos), prefix="per-repo checks: ")
+    for i, repo in enumerate(repos, start=1):
+        progress.update(i, repo.slug)
         ctx_repo = replace(ctx_base, repo=repo)
         r = run_chain(
             per_repo, ctx_repo, skip_set=skip_set, target=repo.slug
         )
         if not r.passed:
+            progress.done()
             return _finish(
                 rs,
                 EXIT_STRUCTURAL_FAILURE,
@@ -634,12 +642,25 @@ def _run_under_lock(
             skipped_repos.append((repo.slug, reason))
         else:
             passing_repos.append(repo)
+    progress.done()
 
-    # 7. Coalesced PR fetch.
+    # 7. Coalesced PR fetch. One GraphQL call regardless of repo count,
+    # but it can take a few seconds for a fleet — print a status line
+    # so the user knows we're waiting on the network, not stuck.
     if passing_repos:
+        if sys.stderr.isatty():
+            print(
+                f"Fetching open PRs across {len(passing_repos)} repos...",
+                file=sys.stderr,
+                end="",
+                flush=True,
+            )
         try:
             prs_by_repo = gh.my_open_prs([r.slug for r in passing_repos])
         except GHError as e:
+            if sys.stderr.isatty():
+                sys.stderr.write("\r" + " " * 80 + "\r")
+                sys.stderr.flush()
             rs.record_error(f"my_open_prs failed: {e}")
             return _finish(
                 rs,
@@ -655,6 +676,9 @@ def _run_under_lock(
                 attention_count=0,
                 skipped_entries=skipped_entries,
             )
+        if sys.stderr.isatty():
+            sys.stderr.write("\r" + " " * 80 + "\r")
+            sys.stderr.flush()
     else:
         prs_by_repo = {}
 

@@ -1336,3 +1336,58 @@ def test_report_skipped_entries_surface_in_summary(
     assert "line 2" in summary
     assert "/nonexistent/path/bad-entry" in summary
     assert "does not exist" in summary
+
+
+# ─── Progress output for long fleets ──────────────────────────────────────
+
+
+def test_report_progress_writes_to_tty(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, capsys,
+):
+    """When stderr is a TTY (interactive), gitbulk emits progress for
+    the per-repo loop AND a 'Fetching open PRs...' line. capsys
+    captures both stdout and stderr; we monkeypatch isatty to True."""
+    import sys as _sys
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+    # Force the TTY paths.
+    monkeypatch.setattr(_sys.stderr, "isatty", lambda: True)
+    report_handler(_make_args(code_root=code_root))
+    err = capsys.readouterr().err
+    assert "per-repo checks" in err
+    assert "Fetching open PRs" in err
+
+
+def test_report_progress_clears_fetching_on_error(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, capsys,
+):
+    """When my_open_prs raises, the 'Fetching...' line is still cleared."""
+    import sys as _sys
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        # No my_open_prs configured → raises GHError
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+    monkeypatch.setattr(_sys.stderr, "isatty", lambda: True)
+    rc = report_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    err = capsys.readouterr().err
+    # Fetching line was written
+    assert "Fetching open PRs" in err
+    # And cleared (the clearing sequence is \r + spaces + \r)
+    assert "\r" in err
