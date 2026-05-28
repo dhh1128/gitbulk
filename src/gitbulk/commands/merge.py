@@ -40,7 +40,7 @@ from typing import Iterable
 
 from gitbulk import paths, sentinel
 from gitbulk.config.policy import Policy, load_policy, policy_for
-from gitbulk.config.repos import RepoEntry, load_repos
+from gitbulk.config.repos import RepoEntry, SkippedEntry, load_repos
 from gitbulk.gh import GHError, ProductionGHClient
 from gitbulk.invariants import InvariantContext, get, run_chain
 from gitbulk.invariants.base import Invariant, InvariantKind
@@ -146,6 +146,7 @@ def _build_summary_md(
     merge_results: list[dict] | None,
     apply: bool,
     deferred_prs: list[tuple[str, PRInfo]] | None = None,
+    skipped_entries: list[SkippedEntry] | None = None,
 ) -> str:
     """Human-readable summary.md.
 
@@ -179,6 +180,14 @@ def _build_summary_md(
         lines.append("## Skipped repos")
         for slug, reason in skipped_repos:
             lines.append(f"- `{slug}` — {reason}")
+        lines.append("")
+
+    if skipped_entries:
+        lines.append("## Skipped repos.txt entries")
+        for entry in skipped_entries:
+            lines.append(
+                f"- line {entry.lineno} (`{entry.raw}`): {entry.reason}"
+            )
         lines.append("")
 
     if not eligible_prs and not deferred_prs:
@@ -242,7 +251,7 @@ def merge_handler(args: argparse.Namespace) -> int:
     code_root = (
         Path(args.code_root).expanduser() if args.code_root else None
     )
-    repos = load_repos(code_root=code_root)
+    repos, skipped_entries = load_repos(code_root=code_root)
     repos_text = _read_repos_text()
 
     try:
@@ -251,7 +260,9 @@ def merge_handler(args: argparse.Namespace) -> int:
             timeout=_LOCK_TIMEOUT_SECONDS,
             subcommand="merge",
         ):
-            return _run_under_lock(args, policy, repos, repos_text)
+            return _run_under_lock(
+                args, policy, repos, repos_text, skipped_entries
+            )
     except LockTimeoutError as e:
         print(
             f"gitbulk merge: timed out acquiring lock: {e}",
@@ -265,6 +276,7 @@ def _run_under_lock(
     policy: Policy,
     repos: list[RepoEntry],
     repos_text: str,
+    skipped_entries: list[SkippedEntry],
 ) -> int:
     """Pipeline body that runs while the global EXCLUSIVE lock is held."""
     config_snapshot = _config_snapshot(policy, repos_text, args)
@@ -309,6 +321,7 @@ def _run_under_lock(
             eligible_prs=[],
             merge_results=None,
             apply=bool(args.apply),
+            skipped_entries=skipped_entries,
         )
 
     # PER_REPO preflight.
@@ -333,6 +346,7 @@ def _run_under_lock(
                 eligible_prs=[],
                 merge_results=None,
                 apply=bool(args.apply),
+                skipped_entries=skipped_entries,
             )
         intrinsic_skips = [
             (n, reason) for n, reason in r.skips if n not in skip_set
@@ -355,6 +369,7 @@ def _run_under_lock(
                 summary=f"gh PR fetch failed: {e}",
                 policy=policy,
                 attention=False,
+                skipped_entries=skipped_entries,
                 all_repos=repos,
                 passing_repos=passing_repos,
                 skipped_repos=skipped_repos,
@@ -427,9 +442,10 @@ def _run_under_lock(
             merge_results=None,
             apply=False,
             deferred_prs=deferred_prs,
+            skipped_entries=skipped_entries,
         )
         rs.write_summary(summary_md)
-        if skipped_repos:
+        if skipped_repos or skipped_entries:
             exit_code = EXIT_INVARIANT_SKIPPED
             attention = True
         elif skip_list:
@@ -441,7 +457,8 @@ def _run_under_lock(
         summary_text = (
             f"dry-run: {len(primary_eligible_prs)} PRs would merge; "
             f"{len(deferred_prs)} deferred; "
-            f"{len(skipped_repos)} repos skipped"
+            f"{len(skipped_repos)} repos skipped; "
+            f"{len(skipped_entries)} entries skipped"
         )
         # Record per-repo summary state in state.yaml so `gitbulk show
         # merge --state` is informative on dry runs too. Include
@@ -471,6 +488,7 @@ def _run_under_lock(
             apply=False,
             skip_writing_summary=True,
             deferred_prs=deferred_prs,
+            skipped_entries=skipped_entries,
         )
 
     # ── --apply path ──
@@ -561,7 +579,7 @@ def _run_under_lock(
     if failure_count > 0:
         exit_code = EXIT_ATTENTION_NEEDED
         attention = True
-    elif skipped_repos:
+    elif skipped_repos or skipped_entries:
         exit_code = EXIT_INVARIANT_SKIPPED
         attention = True
     elif skip_list:
@@ -580,6 +598,7 @@ def _run_under_lock(
         merge_results=merge_results,
         apply=True,
         deferred_prs=deferred_prs,
+        skipped_entries=skipped_entries,
     )
     rs.write_summary(summary_md)
 
@@ -588,7 +607,8 @@ def _run_under_lock(
         f"{len(primary_eligible_prs)} primary-eligible PRs; "
         f"{failure_count} failed; "
         f"{len(deferred_prs)} deferred; "
-        f"{len(skipped_repos)} repos skipped"
+        f"{len(skipped_repos)} repos skipped; "
+        f"{len(skipped_entries)} entries skipped"
     )
     return _finish(
         rs,
@@ -604,6 +624,7 @@ def _run_under_lock(
         apply=True,
         skip_writing_summary=True,
         deferred_prs=deferred_prs,
+        skipped_entries=skipped_entries,
     )
 
 
@@ -686,6 +707,7 @@ def _finish(
     apply: bool,
     skip_writing_summary: bool = False,
     deferred_prs: list[tuple[str, PRInfo]] | None = None,
+    skipped_entries: list[SkippedEntry] | None = None,
 ) -> int:
     """Terminal-stage write: summary.md (if not already), sentinel,
     runstate.complete().
@@ -700,6 +722,7 @@ def _finish(
             merge_results=merge_results,
             apply=apply,
             deferred_prs=deferred_prs,
+            skipped_entries=skipped_entries,
         )
         rs.write_summary(f"# gitbulk merge (FAILED)\n\n{summary}\n\n{synth}")
 

@@ -23,7 +23,7 @@ def _write_repos(tmp_path: Path, content: str) -> Path:
 def test_basic_load(tmp_path):
     path = _write_repos(tmp_path, "dhh1128/gitbulk\nprovenant-dev/origin-platform\n")
     code_root = tmp_path / "code"
-    entries = load_repos(path, code_root=code_root)
+    entries, _skipped = load_repos(path, code_root=code_root)
     assert len(entries) == 2
     assert entries[0] == RepoEntry(
         slug="dhh1128/gitbulk",
@@ -48,7 +48,7 @@ provenant-dev/origin-platform   # trailing comment with whitespace
 
 """
     path = _write_repos(tmp_path, content)
-    entries = load_repos(path, code_root=tmp_path / "code")
+    entries, _skipped = load_repos(path, code_root=tmp_path / "code")
     assert [e.slug for e in entries] == [
         "dhh1128/gitbulk",
         "provenant-dev/origin-platform",
@@ -60,7 +60,7 @@ provenant-dev/origin-platform   # trailing comment with whitespace
 
 def test_inline_comment_stripped(tmp_path):
     path = _write_repos(tmp_path, "dhh1128/gitbulk # personal triage tool\n")
-    entries = load_repos(path, code_root=tmp_path / "code")
+    entries, _skipped = load_repos(path, code_root=tmp_path / "code")
     assert len(entries) == 1
     assert entries[0].slug == "dhh1128/gitbulk"
 
@@ -73,17 +73,17 @@ def test_path_default_uses_paths_module(monkeypatch, tmp_path):
     repos_file = tmp_path / "cfg" / "gitbulk" / "repos.txt"
     repos_file.parent.mkdir(parents=True)
     repos_file.write_text("dhh1128/gitbulk\n")
-    entries = load_repos(code_root=tmp_path / "code")
+    entries, _skipped = load_repos(code_root=tmp_path / "code")
     assert len(entries) == 1
 
 
 def test_code_root_default_is_home_code(tmp_path):
     path = _write_repos(tmp_path, "dhh1128/gitbulk\n")
-    entries = load_repos(path)  # no code_root → defaults to Path.home() / "code"
+    entries, _skipped = load_repos(path)  # no code_root → defaults to Path.home() / "code"
     assert entries[0].local_path == Path.home() / "code" / "gitbulk"
 
 
-# ─── Malformed slug → ConfigError ──────────────────────────────────────────
+# ─── Malformed slug → SkippedEntry (not raise) ─────────────────────────────
 
 
 @pytest.mark.parametrize(
@@ -96,41 +96,51 @@ def test_code_root_default_is_home_code(tmp_path):
         "owner/has spaces",
     ],
 )
-def test_malformed_slug_raises_configerror(tmp_path, bad_line):
+def test_malformed_slug_becomes_skipped_entry(tmp_path, bad_line):
     """Bare slug form: anything that doesn't match the GitHub regex
-    fails with a clear ConfigError naming the expected shape."""
+    becomes a SkippedEntry rather than aborting the load (one typo
+    shouldn't block a 175-line repos.txt)."""
     path = _write_repos(tmp_path, f"dhh1128/gitbulk\n{bad_line}\n")
-    with pytest.raises(ConfigError, match="does not match the expected GitHub form"):
-        load_repos(path, code_root=tmp_path / "code")
+    entries, skipped = load_repos(path, code_root=tmp_path / "code")
+    # Good line still loaded
+    assert len(entries) == 1
+    assert entries[0].slug == "dhh1128/gitbulk"
+    # Bad line surfaced as SkippedEntry
+    assert len(skipped) == 1
+    assert skipped[0].lineno == 2
+    assert skipped[0].raw == bad_line
+    assert "does not match the expected GitHub form" in skipped[0].reason
 
 
-def test_configerror_message_includes_file_and_line(tmp_path):
+def test_skipped_entry_includes_lineno_and_raw(tmp_path):
     path = _write_repos(tmp_path, "dhh1128/gitbulk\nbroken-line\n")
-    with pytest.raises(ConfigError) as exc:
-        load_repos(path, code_root=tmp_path / "code")
-    msg = str(exc.value)
-    assert str(path) in msg
-    assert ":2:" in msg
-    assert "broken-line" in msg
+    entries, skipped = load_repos(path, code_root=tmp_path / "code")
+    assert len(entries) == 1
+    assert len(skipped) == 1
+    assert skipped[0].lineno == 2
+    assert "broken-line" in skipped[0].raw
+    assert "does not match" in skipped[0].reason
 
 
-def test_double_dot_segment_in_repos_raises(tmp_path):
-    """Security-hawk F1 (2026-05-28): a malicious repos.txt entry with a
-    `..` segment is rejected with a clear ConfigError."""
-    # `aa/..` passes the regex (`..` matches the repo character class) but
-    # the forbidden-segments check rejects it.
+def test_double_dot_segment_becomes_skipped_entry(tmp_path):
+    """Security-hawk F1: a `..` segment is filtered (still rejected,
+    just non-fatally now)."""
     path = _write_repos(tmp_path, "aa/..\n")
-    with pytest.raises(ConfigError, match="forbidden path segment"):
-        load_repos(path, code_root=tmp_path / "code")
+    entries, skipped = load_repos(path, code_root=tmp_path / "code")
+    assert entries == []
+    assert len(skipped) == 1
+    assert "forbidden path segment" in skipped[0].reason
 
 
-def test_security_hardened_slug_regex_rejects_in_repos(tmp_path):
+def test_security_hardened_slug_regex_skips_in_repos(tmp_path):
     """Security-hawk F1: the tightened regex rejects shapes the original
     `[^/\\s]+/[^/\\s]+` accepted (leading hyphen owner, @ in owner)."""
     for bad in ("-leading/ok", "owner@bad/ok"):
         path = _write_repos(tmp_path, f"{bad}\n")
-        with pytest.raises(ConfigError, match="does not match the expected GitHub form"):
-            load_repos(path, code_root=tmp_path / "code")
+        entries, skipped = load_repos(path, code_root=tmp_path / "code")
+        assert entries == []
+        assert len(skipped) == 1
+        assert "does not match the expected GitHub form" in skipped[0].reason
 
 
 # ─── Duplicate slugs ───────────────────────────────────────────────────────
@@ -142,7 +152,7 @@ def test_duplicate_slug_keeps_first_silently(tmp_path, caplog):
     content = "dhh1128/gitbulk\nprovenant-dev/origin-platform\ndhh1128/gitbulk\n"
     path = _write_repos(tmp_path, content)
     with caplog.at_level(logging.WARNING, logger="gitbulk.config"):
-        entries = load_repos(path, code_root=tmp_path / "code")
+        entries, _skipped = load_repos(path, code_root=tmp_path / "code")
     assert len(entries) == 2
     assert entries[0].slug == "dhh1128/gitbulk"
     assert entries[0].source_line == 1
@@ -165,12 +175,12 @@ def test_duplicate_slug_records_debug_log(tmp_path, caplog):
 
 def test_empty_file_returns_empty_list(tmp_path):
     path = _write_repos(tmp_path, "")
-    assert load_repos(path, code_root=tmp_path / "code") == []
+    assert load_repos(path, code_root=tmp_path / "code") == ([], [])
 
 
 def test_only_comments_returns_empty_list(tmp_path):
     path = _write_repos(tmp_path, "# just a comment\n# another\n")
-    assert load_repos(path, code_root=tmp_path / "code") == []
+    assert load_repos(path, code_root=tmp_path / "code") == ([], [])
 
 
 # ─── Missing repos.txt → friendly ConfigError ──────────────────────────────
@@ -206,7 +216,7 @@ def test_url_form_canonicalizes_to_slug(tmp_path, url):
     default <code-root>/<repo-name> local path."""
     path = _write_repos(tmp_path, f"{url}\n")
     code_root = tmp_path / "code"
-    entries = load_repos(path, code_root=code_root)
+    entries, _skipped = load_repos(path, code_root=code_root)
     assert len(entries) == 1
     assert entries[0].slug == "dhh1128/gitbulk"
     assert entries[0].owner == "dhh1128"
@@ -214,22 +224,24 @@ def test_url_form_canonicalizes_to_slug(tmp_path, url):
     assert entries[0].local_path == code_root / "gitbulk"
 
 
-def test_url_form_non_github_raises(tmp_path):
-    """A URL pointing at a non-GitHub host is rejected with a friendly
-    message; gitbulk doesn't operate on non-github.com repos today."""
+def test_url_form_non_github_becomes_skipped_entry(tmp_path):
+    """A URL pointing at a non-GitHub host becomes a SkippedEntry —
+    the rest of the file still loads."""
     path = _write_repos(tmp_path, "https://gitlab.com/foo/bar\n")
-    with pytest.raises(ConfigError, match="not a recognized GitHub remote form"):
-        load_repos(path, code_root=tmp_path / "code")
+    entries, skipped = load_repos(path, code_root=tmp_path / "code")
+    assert entries == []
+    assert len(skipped) == 1
+    assert "not a recognized GitHub remote form" in skipped[0].reason
 
 
 def test_url_form_extracts_slug_with_security_validation(tmp_path):
     """A URL that decodes to a malformed slug (somehow) still trips
-    the security validation — defense in depth."""
-    # URL form with hyphen-leading owner — should be rejected by slug
-    # validation even though the URL parser accepts it as-is.
+    the security validation — defense in depth, becomes SkippedEntry."""
     path = _write_repos(tmp_path, "https://github.com/-bad/repo\n")
-    with pytest.raises(ConfigError, match="does not match the expected GitHub form"):
-        load_repos(path, code_root=tmp_path / "code")
+    entries, skipped = load_repos(path, code_root=tmp_path / "code")
+    assert entries == []
+    assert len(skipped) == 1
+    assert "does not match the expected GitHub form" in skipped[0].reason
 
 
 # ─── Path form: resolve via git remote ─────────────────────────────────────
@@ -256,7 +268,7 @@ def test_path_form_resolves_slug_from_origin_remote(tmp_path):
     )
     path = _write_repos(tmp_path, f"{repo}\n")
     code_root = tmp_path / "code"
-    entries = load_repos(path, code_root=code_root)
+    entries, _skipped = load_repos(path, code_root=code_root)
     assert len(entries) == 1
     assert entries[0].slug == "dhh1128/gitbulk"
     # local_path is the EXPLICIT path, not code_root/<basename>:
@@ -271,44 +283,74 @@ def test_path_form_handles_tilde_expansion(tmp_path, monkeypatch):
     )
     monkeypatch.setenv("HOME", str(tmp_path))
     path = _write_repos(tmp_path, "~/myrepo\n")
-    entries = load_repos(path, code_root=tmp_path / "code")
+    entries, _skipped = load_repos(path, code_root=tmp_path / "code")
     assert entries[0].slug == "dhh1128/gitbulk"
     assert entries[0].local_path == repo.resolve()
 
 
-def test_path_form_nonexistent_raises(tmp_path):
+def test_path_form_nonexistent_becomes_skipped(tmp_path):
     path = _write_repos(tmp_path, "/nonexistent/path/to/repo\n")
-    with pytest.raises(ConfigError, match="does not exist"):
-        load_repos(path, code_root=tmp_path / "code")
+    entries, skipped = load_repos(path, code_root=tmp_path / "code")
+    assert entries == []
+    assert len(skipped) == 1
+    assert "does not exist" in skipped[0].reason
 
 
-def test_path_form_not_a_git_repo_raises(tmp_path):
-    """Path exists but no .git directory → friendly error."""
+def test_path_form_not_a_git_repo_becomes_skipped(tmp_path):
     plain = tmp_path / "plain-dir"
     plain.mkdir()
     path = _write_repos(tmp_path, f"{plain}\n")
-    with pytest.raises(ConfigError, match="not a git repository"):
-        load_repos(path, code_root=tmp_path / "code")
+    entries, skipped = load_repos(path, code_root=tmp_path / "code")
+    assert entries == []
+    assert "not a git repository" in skipped[0].reason
 
 
-def test_path_form_no_origin_remote_raises(tmp_path):
-    """Git repo with no `origin` remote → friendly error."""
+def test_path_form_no_origin_remote_becomes_skipped(tmp_path):
     repo = tmp_path / "no-origin-repo"
     subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
-    # No `git remote add origin ...` — deliberately
     path = _write_repos(tmp_path, f"{repo}\n")
-    with pytest.raises(ConfigError, match="no 'origin' remote"):
-        load_repos(path, code_root=tmp_path / "code")
+    entries, skipped = load_repos(path, code_root=tmp_path / "code")
+    assert entries == []
+    assert "no 'origin' remote" in skipped[0].reason
 
 
-def test_path_form_non_github_origin_raises(tmp_path):
-    """Git repo whose origin points at gitlab/bitbucket/etc → friendly error."""
+def test_path_form_non_github_origin_becomes_skipped(tmp_path):
     repo = _make_fake_git_repo(
         tmp_path, "gitlab-repo", "https://gitlab.com/foo/bar.git"
     )
     path = _write_repos(tmp_path, f"{repo}\n")
-    with pytest.raises(ConfigError, match="not a recognized GitHub remote"):
-        load_repos(path, code_root=tmp_path / "code")
+    entries, skipped = load_repos(path, code_root=tmp_path / "code")
+    assert entries == []
+    assert "not a recognized GitHub remote" in skipped[0].reason
+
+
+def test_path_form_with_malformed_origin_slug_becomes_skipped(tmp_path):
+    """Defense in depth: a path whose origin URL parses but resolves to
+    a malformed slug (e.g. leading hyphen owner) still gets skipped."""
+    repo = _make_fake_git_repo(
+        tmp_path, "weirdorigin", "https://github.com/-bad/repo.git"
+    )
+    path = _write_repos(tmp_path, f"{repo}\n")
+    entries, skipped = load_repos(path, code_root=tmp_path / "code")
+    assert entries == []
+    assert len(skipped) == 1
+    assert "does not match the expected GitHub form" in skipped[0].reason
+
+
+def test_one_bad_entry_does_not_block_good_entries(tmp_path):
+    """Load-bearing test for the skip-with-reason design: a bad entry
+    among 175 good ones doesn't abort the whole load."""
+    content = (
+        "dhh1128/good-one\n"
+        "/nonexistent/bad-one\n"
+        "provenant-dev/another-good\n"
+    )
+    path = _write_repos(tmp_path, content)
+    entries, skipped = load_repos(path, code_root=tmp_path / "code")
+    # Both good entries loaded; bad one captured separately.
+    assert [e.slug for e in entries] == ["dhh1128/good-one", "provenant-dev/another-good"]
+    assert len(skipped) == 1
+    assert skipped[0].lineno == 2
 
 
 def test_mixed_forms_in_one_repos_txt(tmp_path):
@@ -323,7 +365,7 @@ def test_mixed_forms_in_one_repos_txt(tmp_path):
     )
     path = _write_repos(tmp_path, content)
     code_root = tmp_path / "code"
-    entries = load_repos(path, code_root=code_root)
+    entries, _skipped = load_repos(path, code_root=code_root)
     assert [e.slug for e in entries] == [
         "dhh1128/gitbulk",
         "provenant-dev/origin-platform",
@@ -343,6 +385,6 @@ def test_duplicate_slug_across_forms_keeps_first(tmp_path):
         "https://github.com/dhh1128/gitbulk\n"
     )
     path = _write_repos(tmp_path, content)
-    entries = load_repos(path, code_root=tmp_path / "code")
+    entries, _skipped = load_repos(path, code_root=tmp_path / "code")
     assert len(entries) == 1
     assert entries[0].source_line == 1

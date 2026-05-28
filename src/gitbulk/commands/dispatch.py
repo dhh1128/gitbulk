@@ -320,7 +320,10 @@ def dispatch_handler(args: argparse.Namespace) -> int:
     code_root = (
         Path(args.code_root).expanduser() if args.code_root else None
     )
-    repos = load_repos(code_root=code_root)
+    # TODO: surface skipped_entries in dispatch summary (mirror
+    # report/merge treatment). For now ignore them so a typo in
+    # repos.txt doesn't block the dispatch run.
+    repos, _ = load_repos(code_root=code_root)
     repos_text = _read_repos_text()
 
     # 1b. Validate --prompt BEFORE acquiring the lock. The error is

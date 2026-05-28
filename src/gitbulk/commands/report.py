@@ -43,7 +43,7 @@ import yaml
 
 from gitbulk import paths, sentinel
 from gitbulk.config.policy import Policy, load_policy
-from gitbulk.config.repos import RepoEntry, load_repos
+from gitbulk.config.repos import RepoEntry, SkippedEntry, load_repos
 from gitbulk.gh import GHClient, GHError, ProductionGHClient
 from gitbulk.invariants import (
     InvariantContext,
@@ -188,6 +188,7 @@ def _build_summary_md(
     pr_records_by_repo: dict[str, list[dict]],
     attention_count: int,
     watchdog_records: list[dict] | None = None,
+    skipped_entries: list[SkippedEntry] | None = None,
 ) -> str:
     """Human-readable summary.md (this.i tp4kq2nr layer 3)."""
     watchdog_records = watchdog_records or []
@@ -232,6 +233,12 @@ def _build_summary_md(
         lines.append("## Skipped repos")
         for slug, reason in skipped_repos:
             lines.append(f"- `{slug}` — {reason}")
+        lines.append("")
+
+    if skipped_entries:
+        lines.append("## Skipped repos.txt entries")
+        for entry in skipped_entries:
+            lines.append(f"- line {entry.lineno} (`{entry.raw}`): {entry.reason}")
         lines.append("")
 
     lines.append("## Open PRs")
@@ -462,10 +469,13 @@ def report_handler(args: argparse.Namespace) -> int:
     is intentionally redundant — this handler writes its own sentinel
     with richer content for exit codes 2 and 3.
     """
-    # 1. Load configuration
+    # 1. Load configuration. Per-entry parse failures in repos.txt are
+    # captured as SkippedEntry records (so one typo doesn't block the
+    # whole run) rather than raised; we surface them in summary.md and
+    # bump the exit code to 3 if anything else passes cleanly.
     policy = load_policy()
     code_root = Path(args.code_root).expanduser() if args.code_root else None
-    repos = load_repos(code_root=code_root)
+    repos, skipped_entries = load_repos(code_root=code_root)
     repos_text = _read_repos_text()
 
     # 2. Acquire global lock (shared, 300s timeout per tmlk5pq3). The
@@ -483,7 +493,9 @@ def report_handler(args: argparse.Namespace) -> int:
             timeout=_LOCK_TIMEOUT_SECONDS,
             subcommand="report",
         ):
-            return _run_under_lock(args, policy, repos, repos_text)
+            return _run_under_lock(
+                args, policy, repos, repos_text, skipped_entries
+            )
     except LockTimeoutError as e:
         print(
             f"gitbulk report: timed out acquiring lock: {e}",
@@ -497,6 +509,7 @@ def _run_under_lock(
     policy: Policy,
     repos: list[RepoEntry],
     repos_text: str,
+    skipped_entries: list[SkippedEntry],
 ) -> int:
     """The portion of the pipeline that runs while the lock is held.
 
@@ -537,6 +550,7 @@ def _run_under_lock(
                 prs_by_repo={},
                 pr_records_by_repo={},
                 attention_count=0,
+            skipped_entries=skipped_entries,
             )
 
     # 5/6/8. Partition the report chain.
@@ -573,6 +587,7 @@ def _run_under_lock(
             prs_by_repo={},
             pr_records_by_repo={},
             attention_count=0,
+            skipped_entries=skipped_entries,
         )
 
     # 6. PER_REPO preflight. Each repo gets its own context.
@@ -608,6 +623,7 @@ def _run_under_lock(
                 prs_by_repo={},
                 pr_records_by_repo={},
                 attention_count=0,
+                skipped_entries=skipped_entries,
             )
         # Filter out cmdline-driven skips when deciding repo disposition.
         intrinsic_skips = [
@@ -637,6 +653,7 @@ def _run_under_lock(
                 prs_by_repo={},
                 pr_records_by_repo={},
                 attention_count=0,
+                skipped_entries=skipped_entries,
             )
     else:
         prs_by_repo = {}
@@ -717,13 +734,16 @@ def _run_under_lock(
         pr_records_by_repo,
         attention_count,
         watchdog_records=watchdog_records,
+        skipped_entries=skipped_entries,
     )
     rs.write_summary(summary_md)
 
-    # 10. Compute exit code.
+    # 10. Compute exit code. Skipped repos.txt entries count toward
+    # EXIT_INVARIANT_SKIPPED (3) — they're things the user can fix that
+    # gitbulk routed around rather than acted on.
     if attention_count > 0 or any_watchdog_failure:
         exit_code = EXIT_ATTENTION_NEEDED
-    elif skipped_repos:
+    elif skipped_repos or skipped_entries:
         exit_code = EXIT_INVARIANT_SKIPPED
     elif skip_list:
         exit_code = EXIT_OVERRIDES_APPLIED
@@ -734,6 +754,7 @@ def _run_under_lock(
     summary_text = (
         f"{attention_count} PRs need attention; "
         f"{len(skipped_repos)} repos skipped; "
+        f"{len(skipped_entries)} entries skipped; "
         f"{wd_failed} recent-merge CD failure(s)"
     )
     return _finish(
@@ -748,6 +769,7 @@ def _run_under_lock(
         prs_by_repo=prs_by_repo,
         pr_records_by_repo=pr_records_by_repo,
         attention_count=attention_count,
+        skipped_entries=skipped_entries,
     )
 
 
@@ -764,6 +786,7 @@ def _finish(
     prs_by_repo: dict[str, list[PRInfo]],
     pr_records_by_repo: dict[str, list[dict]],
     attention_count: int,
+    skipped_entries: list[SkippedEntry] | None = None,
 ) -> int:
     """Final-stage write: summary.md (if not already written), sentinel,
     and runstate.complete().
@@ -784,6 +807,7 @@ def _finish(
             prs_by_repo,
             pr_records_by_repo,
             attention_count,
+            skipped_entries=skipped_entries,
         )
         # Append the failure summary so the operator sees the failure first.
         rs.write_summary(f"# gitbulk report (FAILED)\n\n{summary}\n\n{synth}")

@@ -927,3 +927,37 @@ def test_main_close_stale_default_is_dry_run(
     assert rc == EXIT_ATTENTION_NEEDED  # would act → ATTENTION
     assert fake.call_count["post_comment"] == 0
     assert fake.call_count["close_pr"] == 0
+
+
+# ─── Skipped repos.txt entries surfaced in close-stale ────────────────────
+
+
+def test_close_stale_skipped_entries_surface_in_summary(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """A bad entry in repos.txt appears in close-stale summary.md."""
+    cfg_dir = paths.config_dir()
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "gitbulk.yaml").write_text(yaml.safe_dump({
+        "defaults": {"retain_runs": 5, "stale_age_days": 30, "stale_cooloff_days": 7},
+        "humans": {"org": "provenant-dev", "cache_ttl_hours": 24},
+    }))
+    (cfg_dir / "repos.txt").write_text(
+        "dhh1128/alpha\n"
+        "/nonexistent/bad-entry\n"
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+        pr_comments={},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.close_stale.ProductionGHClient", lambda: fake
+    )
+    rc = close_stale_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_INVARIANT_SKIPPED
+    summary = (paths.latest_run_symlink("close-stale").resolve() / "summary.md").read_text()
+    assert "Skipped repos.txt entries" in summary

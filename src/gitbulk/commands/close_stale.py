@@ -42,7 +42,7 @@ from typing import Iterable
 
 from gitbulk import paths, sentinel
 from gitbulk.config.policy import Policy, load_policy, policy_for
-from gitbulk.config.repos import RepoEntry, load_repos
+from gitbulk.config.repos import RepoEntry, SkippedEntry, load_repos
 from gitbulk.gh import GHError, ProductionGHClient
 from gitbulk.invariants import InvariantContext, get, run_chain
 from gitbulk.invariants.base import Invariant, InvariantKind
@@ -236,7 +236,7 @@ def close_stale_handler(args: argparse.Namespace) -> int:
     code_root = (
         Path(args.code_root).expanduser() if args.code_root else None
     )
-    repos = load_repos(code_root=code_root)
+    repos, skipped_entries = load_repos(code_root=code_root)
     repos_text = _read_repos_text()
 
     try:
@@ -245,7 +245,9 @@ def close_stale_handler(args: argparse.Namespace) -> int:
             timeout=_LOCK_TIMEOUT_SECONDS,
             subcommand="close-stale",
         ):
-            return _run_under_lock(args, policy, repos, repos_text)
+            return _run_under_lock(
+                args, policy, repos, repos_text, skipped_entries
+            )
     except LockTimeoutError as e:
         print(
             f"gitbulk close-stale: timed out acquiring lock: {e}",
@@ -259,6 +261,7 @@ def _run_under_lock(
     policy: Policy,
     repos: list[RepoEntry],
     repos_text: str,
+    skipped_entries: list[SkippedEntry],
 ) -> int:
     config_snapshot = _config_snapshot(policy, repos_text, args)
     rs = RunState.begin(
@@ -301,6 +304,7 @@ def _run_under_lock(
             skipped_repos=[],
             actions=[],
             apply=bool(args.apply),
+            skipped_entries=skipped_entries,
         )
 
     # PER_REPO preflight.
@@ -324,6 +328,7 @@ def _run_under_lock(
                 skipped_repos=skipped_repos,
                 actions=[],
                 apply=bool(args.apply),
+                skipped_entries=skipped_entries,
             )
         intrinsic_skips = [
             (n, reason) for n, reason in r.skips if n not in skip_set
@@ -351,6 +356,7 @@ def _run_under_lock(
                 skipped_repos=skipped_repos,
                 actions=[],
                 apply=bool(args.apply),
+                skipped_entries=skipped_entries,
             )
     else:
         prs_by_repo = {}
@@ -438,12 +444,13 @@ def _run_under_lock(
             skipped_repos=skipped_repos,
             actions=actions,
             apply=False,
+            skipped_entries=skipped_entries,
         )
         rs.write_summary(summary_md)
         warn_or_close = sum(
             1 for a in actions if a["decision"] in ("warn", "close")
         )
-        if skipped_repos:
+        if skipped_repos or skipped_entries:
             exit_code = EXIT_INVARIANT_SKIPPED
             attention = True
         elif skip_list:
@@ -459,7 +466,8 @@ def _run_under_lock(
             attention = False
         summary_text = (
             f"dry-run: {warn_or_close} PR(s) would be warned or closed; "
-            f"{len(skipped_repos)} repos skipped"
+            f"{len(skipped_repos)} repos skipped; "
+            f"{len(skipped_entries)} entries skipped"
         )
         for repo in passing_repos:
             rs.record_repo_state(
@@ -478,6 +486,7 @@ def _run_under_lock(
             actions=actions,
             apply=False,
             skip_writing_summary=True,
+            skipped_entries=skipped_entries,
         )
 
     # ── --apply path: execute each decision ──
@@ -535,7 +544,7 @@ def _run_under_lock(
     if failure_count > 0:
         exit_code = EXIT_ATTENTION_NEEDED
         attention = True
-    elif skipped_repos:
+    elif skipped_repos or skipped_entries:
         exit_code = EXIT_INVARIANT_SKIPPED
         attention = True
     elif skip_list:
@@ -557,12 +566,14 @@ def _run_under_lock(
         skipped_repos=skipped_repos,
         actions=actions,
         apply=True,
+        skipped_entries=skipped_entries,
     )
     rs.write_summary(summary_md)
 
     summary_text = (
         f"warned {warn_count}, closed {close_count}, "
-        f"{failure_count} failed; {len(skipped_repos)} repos skipped"
+        f"{failure_count} failed; {len(skipped_repos)} repos skipped; "
+        f"{len(skipped_entries)} entries skipped"
     )
     return _finish(
         rs,
@@ -576,6 +587,7 @@ def _run_under_lock(
         actions=actions,
         apply=True,
         skip_writing_summary=True,
+        skipped_entries=skipped_entries,
     )
 
 
@@ -587,6 +599,7 @@ def _build_summary_md(
     skipped_repos: list[tuple[str, str]],
     actions: list[dict],
     apply: bool,
+    skipped_entries: list[SkippedEntry] | None = None,
 ) -> str:
     lines: list[str] = ["# gitbulk close-stale", ""]
     mode = "APPLY" if apply else "DRY-RUN"
@@ -604,6 +617,14 @@ def _build_summary_md(
         lines.append("## Skipped repos")
         for slug, reason in skipped_repos:
             lines.append(f"- `{slug}` — {reason}")
+        lines.append("")
+
+    if skipped_entries:
+        lines.append("## Skipped repos.txt entries")
+        for entry in skipped_entries:
+            lines.append(
+                f"- line {entry.lineno} (`{entry.raw}`): {entry.reason}"
+            )
         lines.append("")
 
     if not actions:
@@ -694,6 +715,7 @@ def _finish(
     actions: list[dict],
     apply: bool,
     skip_writing_summary: bool = False,
+    skipped_entries: list[SkippedEntry] | None = None,
 ) -> int:
     if not skip_writing_summary:
         synth = _build_summary_md(
@@ -703,6 +725,7 @@ def _finish(
             skipped_repos=skipped_repos,
             actions=actions,
             apply=apply,
+            skipped_entries=skipped_entries,
         )
         rs.write_summary(f"# gitbulk close-stale (FAILED)\n\n{summary}\n\n{synth}")
 

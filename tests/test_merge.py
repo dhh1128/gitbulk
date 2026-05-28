@@ -1103,3 +1103,37 @@ def test_build_summary_md_lists_skipped_repos(isolated_xdg, code_root, write_con
     assert "Skipped repos" in md
     assert "x/a" in md
     assert "github not reachable" in md
+
+
+# ─── Skipped repos.txt entries surfaced in merge ──────────────────────────
+
+
+def test_merge_skipped_entries_surface_in_summary(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """A bad entry in repos.txt appears in merge summary.md."""
+    cfg_dir = paths.config_dir()
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "gitbulk.yaml").write_text(yaml.safe_dump({
+        "defaults": {"retain_runs": 5, "min_business_days": 0},
+        "humans": {"org": "provenant-dev", "cache_ttl_hours": 24},
+    }))
+    (cfg_dir / "repos.txt").write_text(
+        "dhh1128/alpha\n"
+        "/nonexistent/bad-entry\n"
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_INVARIANT_SKIPPED
+    summary = (paths.latest_run_symlink("merge").resolve() / "summary.md").read_text()
+    assert "Skipped repos.txt entries" in summary
+    assert "line 2" in summary
