@@ -1277,6 +1277,61 @@ Gitbulk Triage Tool = goal:
         canned cached members. No mocking required.
       approved-by: daniel, 2026-05-28
 
+    Security Hawk Findings Disposition = decision:
+      id: shawk7nq
+      why: >
+        End-of-Phase-2 security-hawk adversarial review (2026-05-28)
+        produced 5 findings against the "bad software on the user's
+        dev box maliciously damages 150 GitHub repos" threat model.
+        Report at reviews/security-hawk-2026-05-28.md. Dispositions
+        applied in Phase 2D (the next code commit after this node):
+
+        F1 CRITICAL — slug regex accepts `..` segments → path-
+        traversal primitive. **ACCEPT.** Tighten _SLUG_PATTERN in
+        paths.py to require alphanumeric-leading owner and an
+        explicit forbidden-segment list rejecting `.` and `..`.
+        Apply the same tightening (with ConfigError) in
+        config/repos.py so the two layers stay aligned. Phase 5
+        worktree code would have weaponized this; closing now
+        eliminates the surface entirely.
+
+        F2 HIGH — ProductionGHClient gh_path="gh" → silent PATH
+        hijack. **ACCEPT.** Resolve gh_path via shutil.which() at
+        construction; store the absolute path; raise GHError
+        immediately if not found. A PATH-prepend attacker cannot
+        substitute `gh` after the client is constructed because
+        the client carries the absolute path for every subsequent
+        invocation.
+
+        F3 HIGH — no os.umask(0o077) → cache files world-readable.
+        **ACCEPT.** Set os.umask(0o077) inside cli.main() at
+        startup so every file gitbulk creates from then on is
+        owner-only. Existing files are unaffected; the security
+        improvement applies from the next run forward.
+
+        F4 MEDIUM — refresh_org_members runs BEFORE global_lock
+        acquire in report_handler. **ACCEPT.** Move the refresh
+        inside the lock so the network call and cache write are
+        within the audit envelope.
+
+        F5 MEDIUM — AGENTPREP_NO_AI=1 bypass + no branch
+        protection / CODEOWNERS / required reviews. **NOTE FOR
+        USER.** Procedural: when the user pushes to a public
+        remote, branch protection should be applied (the
+        protect-main-branch.sh script is already in
+        ~/code/devenv/). 100% branch coverage does not prove
+        invariant chain composition is intact; a malicious change
+        to subcommands.py could pass all tests. The right
+        backstop is human PR review on changes touching
+        subcommands.py / catalog.py / cli.py. No code change
+        possible from gitbulk side.
+
+        Sub-threshold items (no LICENSE, no actions pinned by SHA,
+        no secret-scanning hook, gh round-trip slug filtering) are
+        deferred and known.
+      approved-by: orchestrator-claude on user's behalf, 2026-05-28
+      stage-status: in-progress
+
     Phase 2 Invariant Catalog = decision:
       id: ph2inv4n
       why: >
