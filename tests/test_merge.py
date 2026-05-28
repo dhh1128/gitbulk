@@ -1,0 +1,918 @@
+"""End-to-end tests for ``gitbulk merge`` (Phase 5).
+
+Pipeline: invariants → eligible-PR filtering → (dry-run gate) →
+``gh.merge_pr`` calls → result recording → exit code. Every gh call
+goes through :class:`FakeGHClient`; no network in tests.
+
+The merge handler does NOT touch local clones, so we don't need the
+fake-clones machinery dispatch tests use. We DO need a fresh org cache
+(consumed by ``org.members.fresh``) and a fresh local policy / repos
+config — same as the dispatch fixtures.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+import yaml
+
+from gitbulk import paths, sentinel
+from gitbulk.cli import main
+from gitbulk.commands import merge as merge_mod
+from gitbulk.commands.merge import (
+    EXIT_ATTENTION_NEEDED,
+    EXIT_INVARIANT_SKIPPED,
+    EXIT_OK,
+    EXIT_OVERRIDES_APPLIED,
+    EXIT_STRUCTURAL_FAILURE,
+    _build_summary_md,
+    _runid_from_run_dir,
+    merge_handler,
+)
+from gitbulk.gh import FakeGHClient, GHError
+from gitbulk.invariants import catalog as _catalog
+from gitbulk.locks import LockTimeoutError
+from gitbulk.org_members_cache import CachedMembers, save_cache
+from gitbulk.pr_info import PRInfo
+
+
+# ─── Fixtures ──────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def isolated_xdg(monkeypatch, tmp_path):
+    cfg = tmp_path / "config"
+    cache = tmp_path / "cache"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(cfg))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
+    paths.ensure_directories()
+    return tmp_path
+
+
+@pytest.fixture
+def code_root(tmp_path):
+    root = tmp_path / "code"
+    root.mkdir()
+    return root
+
+
+@pytest.fixture
+def write_config(isolated_xdg, code_root):
+    """Write gitbulk.yaml + repos.txt. min_business_days=0 by default so
+    the age_threshold invariant doesn't require a freeze-time monkeypatch
+    in every test."""
+
+    def _write(*, repos_slugs, defaults_extra=None, repo_overrides=None):
+        cfg_dir = paths.config_dir()
+        cfg_dir.mkdir(parents=True, exist_ok=True)
+        defaults = {
+            "retain_runs": 5,
+            "min_business_days": 0,
+        }
+        if defaults_extra:
+            defaults.update(defaults_extra)
+        policy_yaml: dict = {"defaults": defaults}
+        policy_yaml["humans"] = {"org": "provenant-dev", "cache_ttl_hours": 24}
+        if repo_overrides:
+            policy_yaml["repos"] = repo_overrides
+        (cfg_dir / "gitbulk.yaml").write_text(yaml.safe_dump(policy_yaml))
+        repos_txt = "\n".join(repos_slugs) + ("\n" if repos_slugs else "")
+        (cfg_dir / "repos.txt").write_text(repos_txt)
+        # Materialize the clone directories so RepoEntry validation passes
+        # (load_repos checks local_path existence). These directories are
+        # EMPTY — merge never touches them, so that's enough.
+        for slug in repos_slugs:
+            _, name = slug.split("/", 1)
+            (code_root / name).mkdir(parents=True, exist_ok=True)
+        return cfg_dir
+
+    return _write
+
+
+@pytest.fixture
+def fresh_org_cache():
+    def _save(org, members):
+        save_cache(
+            CachedMembers(
+                org=org,
+                fetched_at=datetime.now(timezone.utc),
+                members=frozenset(members),
+            )
+        )
+
+    return _save
+
+
+def _make_pr(
+    *,
+    slug: str,
+    number: int,
+    author: str = "dhh1128",
+    base_ref: str = "main",
+    title: str | None = None,
+    head_sha: str = "a" * 40,
+    mergeable_state: str | None = "CLEAN",
+    checks_status: str | None = "SUCCESS",
+    review_decision: str | None = "APPROVED",
+    last_pushed_at: datetime | None = None,
+) -> PRInfo:
+    if last_pushed_at is None:
+        last_pushed_at = datetime.now(timezone.utc) - timedelta(days=14)
+    return PRInfo(
+        slug=slug,
+        number=number,
+        title=title or f"PR #{number}",
+        url=f"https://github.com/{slug}/pull/{number}",
+        author=author,
+        base_ref=base_ref,
+        head_ref=f"feature/{number}",
+        head_sha=head_sha,
+        state="OPEN",
+        is_draft=False,
+        mergeable_state=mergeable_state,
+        created_at=datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 5, 28, 12, 0, 0, tzinfo=timezone.utc),
+        last_pushed_at=last_pushed_at,
+        labels=(),
+        review_decision=review_decision,
+        checks_status=checks_status,
+    )
+
+
+def _make_args(*, apply=False, code_root=None, skip_check=None, refresh_org_members=False):
+    return argparse.Namespace(
+        subcommand="merge",
+        apply=apply,
+        code_root=str(code_root) if code_root else None,
+        skip_check=list(skip_check) if skip_check else None,
+        refresh_org_members=refresh_org_members,
+    )
+
+
+# ─── Dry-run path ──────────────────────────────────────────────────────────
+
+
+def test_dry_run_two_eligible_prs_lists_them_no_merge_calls(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha", "dhh1128/beta"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr1 = _make_pr(slug="dhh1128/alpha", number=1)
+    pr2 = _make_pr(slug="dhh1128/beta", number=2)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={
+            "dhh1128/alpha": "main",
+            "dhh1128/beta": "main",
+        },
+        my_open_prs={
+            "dhh1128/alpha": [pr1],
+            "dhh1128/beta": [pr2],
+        },
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+
+    rc = merge_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_OK
+    assert fake.call_count["merge_pr"] == 0
+    assert not sentinel.has_attention()
+    latest = paths.latest_run_symlink("merge").resolve()
+    summary = (latest / "summary.md").read_text()
+    assert "DRY-RUN" in summary
+    assert "Would merge" in summary
+    assert "dhh1128/alpha" in summary
+    assert "dhh1128/beta" in summary
+    manifest = yaml.safe_load((latest / "manifest.yaml").read_text())
+    assert manifest["config_snapshot"]["apply"] is False
+    assert manifest["config_snapshot"]["merge_method"] == "squash"
+
+
+def test_dry_run_no_eligible_prs_exit_ok(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_OK
+    summary = (paths.latest_run_symlink("merge").resolve() / "summary.md").read_text()
+    assert "no eligible PRs" in summary
+
+
+# ─── --apply happy path ────────────────────────────────────────────────────
+
+
+def test_apply_two_eligible_prs_both_merged(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha", "dhh1128/beta"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr1 = _make_pr(slug="dhh1128/alpha", number=1)
+    pr2 = _make_pr(slug="dhh1128/beta", number=2)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={
+            "dhh1128/alpha": "main",
+            "dhh1128/beta": "main",
+        },
+        my_open_prs={
+            "dhh1128/alpha": [pr1],
+            "dhh1128/beta": [pr2],
+        },
+        merge_responses={
+            ("dhh1128/alpha", 1): {"merged": True},
+            ("dhh1128/beta", 2): {"merged": True},
+        },
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+
+    rc = merge_handler(_make_args(apply=True, code_root=code_root))
+    assert rc == EXIT_OK
+    assert fake.call_count["merge_pr"] == 2
+    assert not sentinel.has_attention()
+    # Both calls used squash + delete_branch=True per Phase 5 defaults.
+    for call in fake.merge_calls:
+        assert call["method"] == "squash"
+        assert call["delete_branch"] is True
+    latest = paths.latest_run_symlink("merge").resolve()
+    summary = (latest / "summary.md").read_text()
+    assert "APPLY" in summary
+    assert "merged" in summary
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    assert set(state["repos"].keys()) == {"dhh1128/alpha", "dhh1128/beta"}
+    for slug in state["repos"]:
+        pr_states = state["repos"][slug]["prs"]
+        assert len(pr_states) == 1
+        assert pr_states[0]["merged"] is True
+
+
+# ─── --apply with one not-ready PR → skipped by invariants ─────────────────
+
+
+def test_apply_one_not_ready_skipped_by_invariants(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """A PR with mergeable_state=DIRTY is filtered out by the
+    pr.mergeable_state_clean invariant; the other ready PR is merged."""
+    write_config(repos_slugs=["dhh1128/alpha", "dhh1128/beta"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr_ready = _make_pr(slug="dhh1128/alpha", number=1)
+    pr_dirty = _make_pr(
+        slug="dhh1128/beta", number=2, mergeable_state="DIRTY"
+    )
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={
+            "dhh1128/alpha": "main",
+            "dhh1128/beta": "main",
+        },
+        my_open_prs={
+            "dhh1128/alpha": [pr_ready],
+            "dhh1128/beta": [pr_dirty],
+        },
+        merge_responses={("dhh1128/alpha", 1): {"merged": True}},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(_make_args(apply=True, code_root=code_root))
+    assert rc == EXIT_OK
+    assert fake.call_count["merge_pr"] == 1
+    assert fake.merge_calls[0]["slug"] == "dhh1128/alpha"
+    state = yaml.safe_load(
+        (paths.latest_run_symlink("merge").resolve() / "state.yaml").read_text()
+    )
+    beta_prs = state["repos"]["dhh1128/beta"]["prs"]
+    assert beta_prs[0]["eligible"] is False
+
+
+# ─── --apply with one merge_pr failure → exit 2 ────────────────────────────
+
+
+def test_apply_one_merge_failure_exit_attention(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """When one merge_pr raises GHError, the other PR still attempts to
+    merge and the run exits 2 (attention)."""
+    write_config(repos_slugs=["dhh1128/alpha", "dhh1128/beta"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr1 = _make_pr(slug="dhh1128/alpha", number=1)
+    pr2 = _make_pr(slug="dhh1128/beta", number=2)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={
+            "dhh1128/alpha": "main",
+            "dhh1128/beta": "main",
+        },
+        my_open_prs={
+            "dhh1128/alpha": [pr1],
+            "dhh1128/beta": [pr2],
+        },
+        merge_responses={
+            ("dhh1128/alpha", 1): GHError("branch protection blocked merge"),
+            ("dhh1128/beta", 2): {"merged": True},
+        },
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(_make_args(apply=True, code_root=code_root))
+    assert rc == EXIT_ATTENTION_NEEDED
+    # Both PRs were attempted (the failure didn't short-circuit beta).
+    assert fake.call_count["merge_pr"] == 2
+    parsed = sentinel.parse_attention()
+    assert parsed is not None
+    assert parsed["exit_code"] == EXIT_ATTENTION_NEEDED
+    latest = paths.latest_run_symlink("merge").resolve()
+    summary = (latest / "summary.md").read_text()
+    assert "FAILED" in summary
+    # errors.log captured the failure.
+    errors = [
+        json.loads(line)
+        for line in (latest / "errors.log").read_text().splitlines()
+        if line.strip()
+    ]
+    assert any("merge_pr failed" in e["message"] for e in errors)
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    alpha_prs = state["repos"]["dhh1128/alpha"]["prs"]
+    assert alpha_prs[0]["merged"] is False
+    assert "branch protection" in alpha_prs[0]["error"]
+
+
+# ─── Lock timeout → exit 1, no sentinel ────────────────────────────────────
+
+
+def test_lock_timeout_exit_structural(
+    monkeypatch, isolated_xdg, code_root, write_config, capsys, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+
+    class _BoomLock:
+        def __enter__(self):
+            raise LockTimeoutError(
+                paths.global_lock_file(),
+                {
+                    "pid": 999,
+                    "started_at": "1970-01-01T00:00:00+00:00",
+                    "subcommand": "merge",
+                    "alive": False,
+                },
+            )
+
+        def __exit__(self, *a):  # pragma: no cover — never reached
+            return False
+
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.global_lock", lambda *a, **kw: _BoomLock()
+    )
+    fake = FakeGHClient(user={"login": "dhh1128"})
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    assert not sentinel.has_attention()
+    err = capsys.readouterr().err
+    assert "timed out" in err
+
+
+# ─── merge_policy=never → no PR merges ─────────────────────────────────────
+
+
+def test_merge_policy_never_drops_all_prs(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """When defaults.merge_policy=never, the pr.approved_per_policy
+    invariant Skips every PR; nothing enters eligible_prs."""
+    write_config(
+        repos_slugs=["dhh1128/alpha"],
+        defaults_extra={"merge_policy": "never"},
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr = _make_pr(slug="dhh1128/alpha", number=1)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(_make_args(apply=True, code_root=code_root))
+    assert rc == EXIT_OK
+    assert fake.call_count["merge_pr"] == 0
+    state = yaml.safe_load(
+        (paths.latest_run_symlink("merge").resolve() / "state.yaml").read_text()
+    )
+    pr_state = state["repos"]["dhh1128/alpha"]["prs"][0]
+    assert pr_state["eligible"] is False
+
+
+# ─── Universal Fail (gh not authenticated) → exit 1 ────────────────────────
+
+
+def test_universal_fail_exit_structural(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient()  # no user → authenticated_user raises
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    latest = paths.latest_run_symlink("merge").resolve()
+    summary = (latest / "summary.md").read_text()
+    assert "FAILED" in summary
+
+
+# ─── Per-repo Skip (github.reachable) drops repo → exit 3 ─────────────────
+
+
+def test_per_repo_skip_drops_repo_exit_skipped(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha", "dhh1128/beta"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        # default_branches missing beta → github.reachable Skip
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_INVARIANT_SKIPPED
+    parsed = sentinel.parse_attention()
+    assert parsed is not None
+    assert parsed["exit_code"] == EXIT_INVARIANT_SKIPPED
+
+
+# ─── --skip-check applied, no failures, no skips → exit 4 ─────────────────
+
+
+def test_skip_check_audit_signal_exit_overrides(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(
+        _make_args(code_root=code_root, skip_check=["pr.age_threshold"])
+    )
+    assert rc == EXIT_OVERRIDES_APPLIED
+    assert not sentinel.has_attention()
+    latest = paths.latest_run_symlink("merge").resolve()
+    errors = (latest / "errors.log").read_text().splitlines()
+    assert any(
+        json.loads(line).get("level") == "WARNING" for line in errors
+    )
+
+
+# ─── gh.my_open_prs raises → exit 1 ────────────────────────────────────────
+
+
+def test_gh_pr_fetch_error_exit_structural(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        # my_open_prs NOT configured → raises GHError
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_STRUCTURAL_FAILURE
+
+
+# ─── Per-repo Fail (forced) → exit 1 ───────────────────────────────────────
+
+
+def test_per_repo_fail_aborts(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    from gitbulk.invariants.base import Fail as _Fail
+
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    monkeypatch.setattr(
+        _catalog.GithubReachableInvariant,
+        "check",
+        lambda self, ctx: _Fail("forced fail"),
+    )
+    rc = merge_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_STRUCTURAL_FAILURE
+
+
+# ─── --apply with skipped repos & no failures → exit 3 ─────────────────────
+
+
+def test_apply_with_skipped_repo_no_failures_exit_skipped(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha", "dhh1128/beta"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr = _make_pr(slug="dhh1128/alpha", number=1)
+    # default_branches missing beta → skip.
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+        merge_responses={("dhh1128/alpha", 1): {"merged": True}},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(_make_args(apply=True, code_root=code_root))
+    assert rc == EXIT_INVARIANT_SKIPPED
+    assert sentinel.has_attention()
+
+
+# ─── Dry-run with skipped repo → exit 3 ────────────────────────────────────
+
+
+def test_dry_run_skipped_repo_exit_skipped(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha", "dhh1128/beta"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_INVARIANT_SKIPPED
+
+
+# ─── PR not eligible due to age_threshold → not in eligible_prs ───────────
+
+
+def test_age_threshold_filters_recent_pr(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """A PR pushed today with min_business_days=3 is not eligible."""
+    write_config(
+        repos_slugs=["dhh1128/alpha"],
+        defaults_extra={"min_business_days": 3},
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    # Pin "now" so the age check is deterministic.
+    now = datetime(2026, 5, 25, 12, 0, 0, tzinfo=timezone.utc)
+    pushed = datetime(2026, 5, 25, 9, 0, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(_catalog, "_utc_now", lambda: now)
+    pr = _make_pr(slug="dhh1128/alpha", number=1, last_pushed_at=pushed)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(_make_args(apply=True, code_root=code_root))
+    assert rc == EXIT_OK
+    assert fake.call_count["merge_pr"] == 0
+
+
+# ─── CLI smoke through main() ──────────────────────────────────────────────
+
+
+def test_main_merge_default_is_dry_run(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """``gitbulk merge`` without --apply must default to dry-run."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = main(["merge", "--code-root", str(code_root)])
+    assert rc == EXIT_OK
+    latest = paths.latest_run_symlink("merge").resolve()
+    manifest = yaml.safe_load((latest / "manifest.yaml").read_text())
+    assert manifest["config_snapshot"]["apply"] is False
+
+
+def test_main_merge_apply_flag_passes_through(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr = _make_pr(slug="dhh1128/alpha", number=1)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+        merge_responses={("dhh1128/alpha", 1): {"merged": True}},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = main(["merge", "--apply", "--code-root", str(code_root)])
+    assert rc == EXIT_OK
+    assert fake.call_count["merge_pr"] == 1
+
+
+# ─── Helper unit tests ─────────────────────────────────────────────────────
+
+
+def test_runid_from_run_dir_simple(tmp_path):
+    d = tmp_path / "20260528T010203Z-merge"
+    assert _runid_from_run_dir(d) == "20260528T010203Z"
+
+
+def test_runid_from_run_dir_fallback(tmp_path):
+    d = tmp_path / "20260528T010203Z-something-else"
+    assert _runid_from_run_dir(d) == "20260528T010203Z-something"
+
+
+def test_build_summary_md_dry_run_eligible(isolated_xdg, code_root, write_config):
+    from gitbulk.config.policy import load_policy
+    from gitbulk.config.repos import RepoEntry
+
+    write_config(repos_slugs=["x/a"])
+    policy = load_policy()
+    repo = RepoEntry(
+        slug="x/a", owner="x", name="a", local_path=code_root / "a",
+        source_line=1,
+    )
+    pr = _make_pr(slug="x/a", number=3)
+    md = _build_summary_md(
+        policy,
+        all_repos=[repo],
+        passing_repos=[repo],
+        skipped_repos=[],
+        eligible_prs=[("x/a", pr)],
+        merge_results=None,
+        apply=False,
+    )
+    assert "DRY-RUN" in md
+    assert "Would merge" in md
+    assert "#3" in md
+
+
+def test_build_summary_md_apply_with_results(isolated_xdg, code_root, write_config):
+    from gitbulk.config.policy import load_policy
+    from gitbulk.config.repos import RepoEntry
+
+    write_config(repos_slugs=["x/a"])
+    policy = load_policy()
+    repo = RepoEntry(
+        slug="x/a", owner="x", name="a", local_path=code_root / "a",
+        source_line=1,
+    )
+    pr = _make_pr(slug="x/a", number=3)
+    md = _build_summary_md(
+        policy,
+        all_repos=[repo],
+        passing_repos=[repo],
+        skipped_repos=[],
+        eligible_prs=[("x/a", pr)],
+        merge_results=[
+            {"slug": "x/a", "number": 3, "merged": True}
+        ],
+        apply=True,
+    )
+    assert "APPLY" in md
+    assert "Merge results" in md
+    assert "merged" in md
+
+
+def test_build_summary_md_apply_with_failure(isolated_xdg, code_root, write_config):
+    from gitbulk.config.policy import load_policy
+    from gitbulk.config.repos import RepoEntry
+
+    write_config(repos_slugs=["x/a"])
+    policy = load_policy()
+    repo = RepoEntry(
+        slug="x/a", owner="x", name="a", local_path=code_root / "a",
+        source_line=1,
+    )
+    pr = _make_pr(slug="x/a", number=3)
+    md = _build_summary_md(
+        policy,
+        all_repos=[repo],
+        passing_repos=[repo],
+        skipped_repos=[],
+        eligible_prs=[("x/a", pr)],
+        merge_results=[
+            {"slug": "x/a", "number": 3, "merged": False, "error": "boom"}
+        ],
+        apply=True,
+    )
+    assert "FAILED" in md
+    assert "boom" in md
+
+
+def test_build_summary_md_apply_missing_result(isolated_xdg, code_root, write_config):
+    """Eligible PR with no matching result → 'no result recorded' line."""
+    from gitbulk.config.policy import load_policy
+    from gitbulk.config.repos import RepoEntry
+
+    write_config(repos_slugs=["x/a"])
+    policy = load_policy()
+    repo = RepoEntry(
+        slug="x/a", owner="x", name="a", local_path=code_root / "a",
+        source_line=1,
+    )
+    pr = _make_pr(slug="x/a", number=3)
+    md = _build_summary_md(
+        policy,
+        all_repos=[repo],
+        passing_repos=[repo],
+        skipped_repos=[],
+        eligible_prs=[("x/a", pr)],
+        merge_results=[],
+        apply=True,
+    )
+    assert "no result recorded" in md
+
+
+def test_state_for_repo_apply_with_missing_match_branch():
+    """Exercise the ``match is None`` branch of _state_for_repo.
+
+    In normal apply-mode execution every eligible PR yields a merge
+    result; this defensive branch only fires if a caller mismatches
+    the eligible/result lists. We exercise it directly so coverage
+    sees both arms of the conditional.
+    """
+    from gitbulk.commands.merge import _state_for_repo
+    from gitbulk.pr_info import PRInfo
+
+    pr = PRInfo(
+        slug="x/a", number=99, title="t",
+        url="u", author="a", base_ref="main", head_ref="h",
+        head_sha="s", state="OPEN", is_draft=False,
+        mergeable_state="CLEAN",
+        created_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        updated_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        last_pushed_at=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        labels=(), review_decision="APPROVED",
+        checks_status="SUCCESS",
+    )
+    out = _state_for_repo(
+        "x/a",
+        eligible_prs=[("x/a", pr)],
+        pr_skips_by_repo={},
+        repo_merge_results=[],  # no match for pr.number=99
+        apply=True,
+    )
+    # pr appears as eligible but without a merged key (defensive branch).
+    assert out["prs"][0]["eligible"] is True
+    assert "merged" not in out["prs"][0]
+
+
+def test_apply_all_repos_skipped_no_pr_fetch(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """Every repo skipped → passing_repos empty → prs_by_repo = {} branch."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    # default_branches missing alpha → github.reachable Skip
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(_make_args(apply=True, code_root=code_root))
+    assert rc == EXIT_INVARIANT_SKIPPED
+    # my_open_prs was NEVER called.
+    assert fake.call_count["my_open_prs"] == 0
+
+
+def test_apply_skip_check_no_failures_no_skips_exit_overrides(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """--apply with --skip-check used, no failures, no skipped repos →
+    exit 4. Exercises the apply-mode skip_list exit-code branch."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr = _make_pr(slug="dhh1128/alpha", number=1)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+        merge_responses={("dhh1128/alpha", 1): {"merged": True}},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(
+        _make_args(
+            apply=True,
+            code_root=code_root,
+            skip_check=["pr.author_known"],
+        )
+    )
+    assert rc == EXIT_OVERRIDES_APPLIED
+    assert not sentinel.has_attention()
+
+
+def test_apply_passing_repo_with_no_prs_skips_state_record(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """--apply with a passing repo that has no PRs at all → state.yaml
+    does NOT record an entry for that repo (no eligible, no skipped).
+    Covers the ``if repo_results or repo_skips`` False branch."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(_make_args(apply=True, code_root=code_root))
+    assert rc == EXIT_OK
+    state = yaml.safe_load(
+        (paths.latest_run_symlink("merge").resolve() / "state.yaml").read_text()
+    )
+    assert state.get("repos", {}) == {}
+
+
+def test_build_summary_md_lists_skipped_repos(isolated_xdg, code_root, write_config):
+    from gitbulk.config.policy import load_policy
+
+    write_config(repos_slugs=["x/a"])
+    policy = load_policy()
+    md = _build_summary_md(
+        policy,
+        all_repos=[],
+        passing_repos=[],
+        skipped_repos=[("x/a", "github not reachable")],
+        eligible_prs=[],
+        merge_results=None,
+        apply=False,
+    )
+    assert "Skipped repos" in md
+    assert "x/a" in md
+    assert "github not reachable" in md

@@ -28,7 +28,7 @@ from gitbulk.cli import (
     main,
 )
 
-_IMPLEMENTED_SUBCOMMANDS = {"ack", "invariants", "report", "summarize", "dispatch", "show"}
+_IMPLEMENTED_SUBCOMMANDS = {"ack", "invariants", "report", "summarize", "dispatch", "merge", "show"}
 _STUB_SUBCOMMANDS = [n for n, _ in SUBCOMMANDS if n not in _IMPLEMENTED_SUBCOMMANDS]
 
 

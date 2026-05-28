@@ -29,7 +29,7 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Protocol, runtime_checkable
+from typing import Any, Iterable, Literal, Mapping, Protocol, runtime_checkable
 
 from gitbulk.pr_info import PRInfo
 
@@ -86,6 +86,38 @@ class GHClient(Protocol):
         """
         ...
 
+    def merge_pr(
+        self,
+        slug: str,
+        number: int,
+        *,
+        method: Literal["merge", "squash", "rebase"] = "squash",
+        delete_branch: bool = True,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Merge the PR via ``gh pr merge``.
+
+        Phase 5 mutating method. The only legitimate caller is the
+        ``merge`` subcommand handler, and only on its ``--apply`` path
+        per node ``2vqp4nk6``. Raises :class:`GHError` on non-clean
+        mergeable state, auth failure, or any other refusal from gh.
+
+        ``method`` selects squash / merge / rebase; ``delete_branch``
+        toggles ``--delete-branch``. Both are pinned at the call site
+        in the merge handler (squash + delete-branch as Phase-5 default
+        per the task spec; per-repo override deferred).
+
+        NOTE: the ``.agent-bin/gh`` shim BLOCKS ``gh pr merge`` for AI
+        agents. Production code constructs the right argv anyway; the
+        shim catches at process boundary. Tests use FakeGHClient so the
+        shim is not involved.
+
+        Returns the gh response payload as a dict (gh emits an empty
+        body on success in some versions; we return ``{}`` in that case
+        rather than raising).
+        """
+        ...
+
 
 class GHError(RuntimeError):
     """Raised when a gh invocation fails in a way the caller is expected
@@ -138,6 +170,9 @@ class FakeGHClient:
         org_members: Mapping[str, list[str]] | None = None,
         default_branches: Mapping[str, str] | None = None,
         my_open_prs: Mapping[str, list[PRInfo]] | None = None,
+        merge_responses: Mapping[
+            tuple[str, int], "dict[str, Any] | Exception"
+        ] | None = None,
     ) -> None:
         self._user = user
         self._org_members = dict(org_members) if org_members is not None else None
@@ -149,12 +184,19 @@ class FakeGHClient:
             if my_open_prs is not None
             else None
         )
+        self._merge_responses = (
+            dict(merge_responses) if merge_responses is not None else None
+        )
+        # Per-call argument records so tests can assert merge_pr was
+        # invoked with the right method / delete_branch flags.
+        self.merge_calls: list[dict[str, Any]] = []
         # Track call counts so tests can assert on coalescing
         self.call_count: dict[str, int] = {
             "authenticated_user": 0,
             "org_members": 0,
             "default_branch": 0,
             "my_open_prs": 0,
+            "merge_pr": 0,
         }
 
     def authenticated_user(self, *, timeout: float | None = None) -> dict[str, Any]:
@@ -195,6 +237,39 @@ class FakeGHClient:
             slug: list(self._my_open_prs.get(slug, []))
             for slug in slugs_set
         }
+
+    def merge_pr(
+        self,
+        slug: str,
+        number: int,
+        *,
+        method: Literal["merge", "squash", "rebase"] = "squash",
+        delete_branch: bool = True,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        self.call_count["merge_pr"] += 1
+        self.merge_calls.append(
+            {
+                "slug": slug,
+                "number": number,
+                "method": method,
+                "delete_branch": delete_branch,
+                "timeout": timeout,
+            }
+        )
+        if self._merge_responses is None:
+            raise GHError(
+                f"FakeGHClient: merge_pr({slug!r}, {number}) not configured"
+            )
+        key = (slug, number)
+        if key not in self._merge_responses:
+            raise GHError(
+                f"FakeGHClient: merge_pr({slug!r}, {number}) not configured"
+            )
+        outcome = self._merge_responses[key]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return dict(outcome)
 
 
 # ─── ProductionGHClient ─────────────────────────────────────────────────────
@@ -459,6 +534,48 @@ class ProductionGHClient:
             grouped.setdefault(pr.slug, []).append(pr)
 
         return grouped
+
+
+    def merge_pr(
+        self,
+        slug: str,
+        number: int,
+        *,
+        method: Literal["merge", "squash", "rebase"] = "squash",
+        delete_branch: bool = True,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        # verified non-deprecated against gh CLI 2026-05-28
+        # (`gh pr merge --help` shows -s/-m/-r and -d/--delete-branch,
+        # no deprecation warnings; the .agent-bin shim blocks this call
+        # when run from an AI-agent shell — production code constructs
+        # the right argv regardless.)
+        method_flag = {
+            "merge": "--merge",
+            "squash": "--squash",
+            "rebase": "--rebase",
+        }[method]
+        args: list[str] = [
+            "pr",
+            "merge",
+            str(number),
+            "--repo",
+            slug,
+            method_flag,
+        ]
+        if delete_branch:
+            args.append("--delete-branch")
+        stdout = self._run(tuple(args), timeout=timeout)
+        # gh pr merge prints a human line on success and emits no JSON.
+        # Tolerate empty stdout (most common) by returning {}; if a future
+        # gh version emits JSON, parse it.
+        stripped = stdout.strip()
+        if not stripped:
+            return {}
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            return {"stdout": stripped}
 
 
 def _pr_info_from_graphql_node(node: dict[str, Any]) -> PRInfo:

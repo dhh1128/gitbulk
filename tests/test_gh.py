@@ -167,6 +167,88 @@ def test_my_open_prs_call_count_tracks_coalescing():
     assert fake.call_count["my_open_prs"] == 1
 
 
+# ─── FakeGHClient.merge_pr ─────────────────────────────────────────────────
+
+
+def test_merge_pr_returns_configured_response():
+    fake = FakeGHClient(
+        merge_responses={("dhh1128/gitbulk", 42): {"merged": True}}
+    )
+    result = fake.merge_pr("dhh1128/gitbulk", 42)
+    assert result == {"merged": True}
+    assert fake.call_count["merge_pr"] == 1
+
+
+def test_merge_pr_records_call_arguments():
+    fake = FakeGHClient(
+        merge_responses={("dhh1128/gitbulk", 7): {}}
+    )
+    fake.merge_pr(
+        "dhh1128/gitbulk", 7, method="merge", delete_branch=False, timeout=12.0
+    )
+    assert fake.merge_calls == [
+        {
+            "slug": "dhh1128/gitbulk",
+            "number": 7,
+            "method": "merge",
+            "delete_branch": False,
+            "timeout": 12.0,
+        }
+    ]
+
+
+def test_merge_pr_default_squash_and_delete_branch():
+    fake = FakeGHClient(
+        merge_responses={("a/b", 1): {}}
+    )
+    fake.merge_pr("a/b", 1)
+    assert fake.merge_calls[0]["method"] == "squash"
+    assert fake.merge_calls[0]["delete_branch"] is True
+
+
+def test_merge_pr_raises_when_unconfigured_pair():
+    fake = FakeGHClient(merge_responses={("x/y", 1): {}})
+    with pytest.raises(GHError, match="merge_pr.*not configured"):
+        fake.merge_pr("other/repo", 99)
+
+
+def test_merge_pr_raises_when_no_responses_dict():
+    fake = FakeGHClient()
+    with pytest.raises(GHError, match="merge_pr.*not configured"):
+        fake.merge_pr("a/b", 1)
+
+
+def test_merge_pr_propagates_configured_exception():
+    fake = FakeGHClient(
+        merge_responses={("a/b", 1): GHError("not mergeable: DIRTY")}
+    )
+    with pytest.raises(GHError, match="not mergeable"):
+        fake.merge_pr("a/b", 1)
+
+
+def test_merge_pr_response_is_a_copy():
+    """Mutating the returned dict must not affect later calls (defense-in-depth)."""
+    fake = FakeGHClient(
+        merge_responses={("a/b", 1): {"merged": True, "extra": "x"}}
+    )
+    a = fake.merge_pr("a/b", 1)
+    a["merged"] = "MUTATED"
+    b = fake.merge_pr("a/b", 1)
+    assert b == {"merged": True, "extra": "x"}
+
+
+def test_merge_pr_increments_counter_even_on_failure():
+    """call_count tracks invocations regardless of whether the response
+    was an exception — useful for assertions in tests that exercise
+    failure handling."""
+    fake = FakeGHClient(
+        merge_responses={("a/b", 1): GHError("nope")}
+    )
+    with pytest.raises(GHError):
+        fake.merge_pr("a/b", 1)
+    assert fake.call_count["merge_pr"] == 1
+
+
 # ─── Exception hierarchy ───────────────────────────────────────────────────
 
 

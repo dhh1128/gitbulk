@@ -22,7 +22,7 @@ import pytest
 
 from gitbulk import paths
 from gitbulk.classifier import Classification
-from gitbulk.config.policy import HumansConfig, Policy
+from gitbulk.config.policy import Defaults, HumansConfig, Policy, RepoOverride
 from gitbulk.config.repos import RepoEntry
 from gitbulk.gh import FakeGHClient, GHError
 from gitbulk.invariants import (
@@ -42,10 +42,15 @@ from gitbulk.invariants.catalog import (
     LocalExistsInvariant,
     LocalRemoteMatchesInvariant,
     OrgMembersFreshInvariant,
+    PrAgeThresholdInvariant,
+    PrApprovedPerPolicyInvariant,
     PrAuthorKnownInvariant,
     PrBaseIsDefaultInvariant,
+    PrMergeableStateCleanInvariant,
+    PrRequiredChecksGreenInvariant,
     _extract_slug_from_remote_url,
 )
+from gitbulk.pr_info import PRInfo
 from gitbulk.org_members_cache import CachedMembers, save_cache
 from gitbulk.runstate import RunState
 
@@ -155,6 +160,10 @@ def test_all_phase2_invariants_registered():
         "github.reachable",
         "pr.base_is_default",
         "pr.author_known",
+        "pr.mergeable_state_clean",
+        "pr.required_checks_green",
+        "pr.approved_per_policy",
+        "pr.age_threshold",
     }
     registered = set(all_invariants().keys())
     missing = expected - registered
@@ -171,6 +180,21 @@ def test_kinds_are_set_correctly():
     assert GithubReachableInvariant.kind == InvariantKind.PER_REPO
     assert PrBaseIsDefaultInvariant.kind == InvariantKind.PER_PR
     assert PrAuthorKnownInvariant.kind == InvariantKind.PER_PR
+    assert PrMergeableStateCleanInvariant.kind == InvariantKind.PER_PR
+    assert PrRequiredChecksGreenInvariant.kind == InvariantKind.PER_PR
+    assert PrApprovedPerPolicyInvariant.kind == InvariantKind.PER_PR
+    assert PrAgeThresholdInvariant.kind == InvariantKind.PER_PR
+
+
+def test_merge_only_invariants_subcommand_membership():
+    """The four Phase-5 invariants apply only to ``merge``."""
+    for cls in (
+        PrMergeableStateCleanInvariant,
+        PrRequiredChecksGreenInvariant,
+        PrApprovedPerPolicyInvariant,
+        PrAgeThresholdInvariant,
+    ):
+        assert cls.subcommands == frozenset({"merge"})
 
 
 def test_clone_subcommand_membership():
@@ -712,3 +736,255 @@ def test_pr_author_known_fail_when_classifier_returns_unknown(
     assert isinstance(result, Fail)
     assert "UNKNOWN" in result.reason
     assert "ghost" in result.reason
+
+
+# ─── Phase 5 merge-only invariants ────────────────────────────────────────
+
+
+def _real_pr(
+    *,
+    mergeable_state: str | None = "CLEAN",
+    checks_status: str | None = "SUCCESS",
+    review_decision: str | None = "APPROVED",
+    last_pushed_at: datetime | None = None,
+    base_ref: str = "main",
+    slug: str = "dhh1128/gitbulk",
+    number: int = 7,
+) -> PRInfo:
+    """A real PRInfo (not the SimpleNamespace stand-in) because the
+    merge invariants consult ``mergeable_state`` / ``checks_status`` /
+    ``review_decision`` / ``last_pushed_at`` fields that the lightweight
+    stand-in doesn't carry."""
+    if last_pushed_at is None:
+        # Default: pushed 10 business days ago so age_threshold passes
+        # in tests that don't override min_business_days.
+        last_pushed_at = datetime.now(timezone.utc) - timedelta(days=20)
+    return PRInfo(
+        slug=slug,
+        number=number,
+        title="t",
+        url=f"https://github.com/{slug}/pull/{number}",
+        author="dhh1128",
+        base_ref=base_ref,
+        head_ref="f",
+        head_sha="a" * 40,
+        state="OPEN",
+        is_draft=False,
+        mergeable_state=mergeable_state,
+        created_at=datetime.now(timezone.utc) - timedelta(days=30),
+        updated_at=datetime.now(timezone.utc),
+        last_pushed_at=last_pushed_at,
+        labels=(),
+        review_decision=review_decision,
+        checks_status=checks_status,
+    )
+
+
+# ─── pr.mergeable_state_clean ─────────────────────────────────────────────
+
+
+def test_pr_mergeable_state_clean_pass(runstate, repo):
+    pr = _real_pr(mergeable_state="CLEAN")
+    ctx = _ctx(runstate, repo=repo, pr=pr)
+    assert PrMergeableStateCleanInvariant().check(ctx) == Pass()
+
+
+def test_pr_mergeable_state_clean_skip_when_dirty(runstate, repo):
+    pr = _real_pr(mergeable_state="DIRTY")
+    ctx = _ctx(runstate, repo=repo, pr=pr)
+    result = PrMergeableStateCleanInvariant().check(ctx)
+    assert isinstance(result, Skip)
+    assert "DIRTY" in result.reason
+
+
+def test_pr_mergeable_state_clean_skip_when_none(runstate, repo):
+    pr = _real_pr(mergeable_state=None)
+    ctx = _ctx(runstate, repo=repo, pr=pr)
+    result = PrMergeableStateCleanInvariant().check(ctx)
+    assert isinstance(result, Skip)
+
+
+def test_pr_mergeable_state_clean_fail_no_pr(runstate, repo):
+    ctx = _ctx(runstate, repo=repo, pr=None)
+    result = PrMergeableStateCleanInvariant().check(ctx)
+    assert isinstance(result, Fail)
+    assert "without ctx.pr" in result.reason
+
+
+# ─── pr.required_checks_green ─────────────────────────────────────────────
+
+
+def test_pr_required_checks_green_pass(runstate, repo):
+    pr = _real_pr(checks_status="SUCCESS")
+    ctx = _ctx(runstate, repo=repo, pr=pr)
+    assert PrRequiredChecksGreenInvariant().check(ctx) == Pass()
+
+
+def test_pr_required_checks_green_skip_on_failure(runstate, repo):
+    pr = _real_pr(checks_status="FAILURE")
+    ctx = _ctx(runstate, repo=repo, pr=pr)
+    result = PrRequiredChecksGreenInvariant().check(ctx)
+    assert isinstance(result, Skip)
+    assert "FAILURE" in result.reason
+
+
+def test_pr_required_checks_green_skip_on_pending(runstate, repo):
+    pr = _real_pr(checks_status="PENDING")
+    ctx = _ctx(runstate, repo=repo, pr=pr)
+    result = PrRequiredChecksGreenInvariant().check(ctx)
+    assert isinstance(result, Skip)
+
+
+def test_pr_required_checks_green_skip_on_none(runstate, repo):
+    pr = _real_pr(checks_status=None)
+    ctx = _ctx(runstate, repo=repo, pr=pr)
+    result = PrRequiredChecksGreenInvariant().check(ctx)
+    assert isinstance(result, Skip)
+
+
+def test_pr_required_checks_green_fail_no_pr(runstate, repo):
+    ctx = _ctx(runstate, repo=repo, pr=None)
+    result = PrRequiredChecksGreenInvariant().check(ctx)
+    assert isinstance(result, Fail)
+
+
+# ─── pr.approved_per_policy ───────────────────────────────────────────────
+
+
+def test_pr_approved_per_policy_strict_pass(runstate, repo):
+    policy = Policy(defaults=Defaults(merge_policy="strict"))
+    pr = _real_pr(review_decision="APPROVED")
+    ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
+    assert PrApprovedPerPolicyInvariant().check(ctx) == Pass()
+
+
+def test_pr_approved_per_policy_strict_skip_when_unreviewed(runstate, repo):
+    policy = Policy(defaults=Defaults(merge_policy="strict"))
+    pr = _real_pr(review_decision="REVIEW_REQUIRED")
+    ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
+    result = PrApprovedPerPolicyInvariant().check(ctx)
+    assert isinstance(result, Skip)
+    assert "APPROVED" in result.reason
+    assert "REVIEW_REQUIRED" in result.reason
+
+
+def test_pr_approved_per_policy_ci_only_pass_regardless(runstate, repo):
+    policy = Policy(defaults=Defaults(merge_policy="ci-only"))
+    pr = _real_pr(review_decision="REVIEW_REQUIRED")
+    ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
+    assert PrApprovedPerPolicyInvariant().check(ctx) == Pass()
+
+
+def test_pr_approved_per_policy_never_always_skip(runstate, repo):
+    policy = Policy(defaults=Defaults(merge_policy="never"))
+    pr = _real_pr(review_decision="APPROVED")
+    ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
+    result = PrApprovedPerPolicyInvariant().check(ctx)
+    assert isinstance(result, Skip)
+    assert "never" in result.reason
+
+
+def test_pr_approved_per_policy_per_repo_override_wins(runstate, repo):
+    """A per-repo merge_policy='never' override beats defaults.strict."""
+    policy = Policy(
+        defaults=Defaults(merge_policy="strict"),
+        repos={"dhh1128/gitbulk": RepoOverride(merge_policy="never")},
+    )
+    pr = _real_pr(review_decision="APPROVED")
+    ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
+    result = PrApprovedPerPolicyInvariant().check(ctx)
+    assert isinstance(result, Skip)
+
+
+def test_pr_approved_per_policy_fail_no_pr(runstate, repo):
+    ctx = _ctx(runstate, repo=repo, pr=None)
+    result = PrApprovedPerPolicyInvariant().check(ctx)
+    assert isinstance(result, Fail)
+
+
+def test_pr_approved_per_policy_fail_no_repo(runstate):
+    pr = _real_pr()
+    ctx = _ctx(runstate, repo=None, pr=pr)
+    result = PrApprovedPerPolicyInvariant().check(ctx)
+    assert isinstance(result, Fail)
+
+
+# ─── pr.age_threshold ─────────────────────────────────────────────────────
+
+
+def _freeze_now(monkeypatch, when: datetime) -> None:
+    monkeypatch.setattr(catalog, "_utc_now", lambda: when)
+
+
+def test_pr_age_threshold_pass_when_old_enough(monkeypatch, runstate, repo):
+    """min_business_days=3, ready_since=10 days ago → eligible."""
+    policy = Policy(defaults=Defaults(min_business_days=3))
+    pushed = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
+    pr = _real_pr(last_pushed_at=pushed)
+    _freeze_now(monkeypatch, datetime(2026, 5, 28, 12, 0, 0, tzinfo=timezone.utc))
+    ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
+    assert PrAgeThresholdInvariant().check(ctx) == Pass()
+
+
+def test_pr_age_threshold_skip_when_too_recent(monkeypatch, runstate, repo):
+    """ready_since = today, min_business_days=3 → not yet eligible."""
+    policy = Policy(defaults=Defaults(min_business_days=3))
+    # Friday 2026-05-22 push; "now" 2026-05-25 Monday → only 1 business day
+    pushed = datetime(2026, 5, 22, 12, 0, 0, tzinfo=timezone.utc)
+    pr = _real_pr(last_pushed_at=pushed)
+    _freeze_now(monkeypatch, datetime(2026, 5, 25, 12, 0, 0, tzinfo=timezone.utc))
+    ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
+    result = PrAgeThresholdInvariant().check(ctx)
+    assert isinstance(result, Skip)
+    assert "eligible at" in result.reason
+
+
+def test_pr_age_threshold_skip_when_zero_days_still_now(
+    monkeypatch, runstate, repo
+):
+    """min_business_days=0 → eligible immediately, even on the day of push."""
+    policy = Policy(defaults=Defaults(min_business_days=0))
+    pushed = datetime(2026, 5, 25, 12, 0, 0, tzinfo=timezone.utc)
+    pr = _real_pr(last_pushed_at=pushed)
+    _freeze_now(monkeypatch, pushed)
+    ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
+    assert PrAgeThresholdInvariant().check(ctx) == Pass()
+
+
+def test_pr_age_threshold_skip_when_not_ready(runstate, repo):
+    """If compute_ready_since returns None (e.g. mergeable_state DIRTY),
+    Skip with a clear reason."""
+    pr = _real_pr(mergeable_state="DIRTY")
+    ctx = _ctx(runstate, repo=repo, pr=pr)
+    result = PrAgeThresholdInvariant().check(ctx)
+    assert isinstance(result, Skip)
+    assert "not currently ready" in result.reason
+
+
+def test_pr_age_threshold_ci_only_ignores_review(monkeypatch, runstate, repo):
+    """ci-only policy → review_decision irrelevant for ready_since."""
+    policy = Policy(defaults=Defaults(merge_policy="ci-only", min_business_days=0))
+    pushed = datetime(2026, 5, 25, 12, 0, 0, tzinfo=timezone.utc)
+    pr = _real_pr(review_decision=None, last_pushed_at=pushed)
+    _freeze_now(monkeypatch, pushed)
+    ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
+    assert PrAgeThresholdInvariant().check(ctx) == Pass()
+
+
+def test_pr_age_threshold_fail_no_pr(runstate, repo):
+    ctx = _ctx(runstate, repo=repo, pr=None)
+    result = PrAgeThresholdInvariant().check(ctx)
+    assert isinstance(result, Fail)
+
+
+def test_pr_age_threshold_fail_no_repo(runstate):
+    pr = _real_pr()
+    ctx = _ctx(runstate, repo=None, pr=pr)
+    result = PrAgeThresholdInvariant().check(ctx)
+    assert isinstance(result, Fail)
+
+
+def test_utc_now_helper_returns_aware_datetime():
+    """The clock indirection used by pr.age_threshold."""
+    now = catalog._utc_now()
+    assert now.tzinfo is not None

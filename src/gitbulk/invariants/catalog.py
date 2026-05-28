@@ -40,8 +40,10 @@ from __future__ import annotations
 
 import re
 import subprocess
+from datetime import datetime, timezone
 
 from gitbulk.classifier import Classification, classify_login
+from gitbulk.config.policy import policy_for
 from gitbulk.gh import GHError
 from gitbulk.invariants.base import (
     Fail,
@@ -54,6 +56,8 @@ from gitbulk.invariants.base import (
 )
 from gitbulk.invariants.registry import register
 from gitbulk.org_members_cache import is_fresh, load_cache
+from gitbulk.ready import compute_ready_since
+from gitbulk.util.businessdays import add_business_days
 
 # Subcommand sets reused across invariants. Defined once so a typo
 # would be caught (and so refactors only touch one place).
@@ -68,6 +72,7 @@ _ALL_SUBS: frozenset[str] = frozenset(
     }
 )
 _CLONE_SUBS: frozenset[str] = frozenset({"dispatch", "rebase-onto-default"})
+_MERGE_ONLY: frozenset[str] = frozenset({"merge"})
 
 
 # ─── UNIVERSAL ────────────────────────────────────────────────────────────
@@ -355,6 +360,132 @@ class PrBaseIsDefaultInvariant(Invariant):
                 f"repo default is {default!r}"
             )
         return Pass()
+
+
+# ─── PER_PR (merge-only) ──────────────────────────────────────────────────
+
+
+@register
+class PrMergeableStateCleanInvariant(Invariant):
+    """Skip the PR unless ``mergeable_state == "CLEAN"``.
+
+    The merge subcommand will not call ``gh pr merge`` on a non-CLEAN
+    PR; gh would refuse anyway and a Skip here surfaces the reason in
+    the run summary rather than as a downstream gh error.
+    """
+
+    name = "pr.mergeable_state_clean"
+    kind = InvariantKind.PER_PR
+    subcommands = _MERGE_ONLY
+
+    def check(self, ctx: InvariantContext) -> Result:
+        if ctx.pr is None:
+            return Fail("per-PR invariant called without ctx.pr")
+        if ctx.pr.mergeable_state != "CLEAN":
+            return Skip(
+                f"mergeable_state is {ctx.pr.mergeable_state!r}, not 'CLEAN'"
+            )
+        return Pass()
+
+
+@register
+class PrRequiredChecksGreenInvariant(Invariant):
+    """Skip unless ``checks_status == "SUCCESS"``."""
+
+    name = "pr.required_checks_green"
+    kind = InvariantKind.PER_PR
+    subcommands = _MERGE_ONLY
+
+    def check(self, ctx: InvariantContext) -> Result:
+        if ctx.pr is None:
+            return Fail("per-PR invariant called without ctx.pr")
+        if ctx.pr.checks_status != "SUCCESS":
+            return Skip(
+                f"checks_status is {ctx.pr.checks_status!r}, not 'SUCCESS'"
+            )
+        return Pass()
+
+
+@register
+class PrApprovedPerPolicyInvariant(Invariant):
+    """Apply the per-repo merge_policy gate.
+
+    Three branches:
+      - ``strict``: Skip unless ``review_decision == "APPROVED"``.
+      - ``ci-only``: always Pass (CI is sufficient evidence).
+      - ``never``: always Skip — the user has opted this repo out of
+        gitbulk-driven merges entirely.
+    """
+
+    name = "pr.approved_per_policy"
+    kind = InvariantKind.PER_PR
+    subcommands = _MERGE_ONLY
+
+    def check(self, ctx: InvariantContext) -> Result:
+        if ctx.pr is None or ctx.repo is None:
+            return Fail("per-PR invariant called without ctx.pr/ctx.repo")
+        effective = policy_for(ctx.policy, ctx.repo.slug)
+        if effective.merge_policy == "never":
+            return Skip(
+                f"merge_policy is 'never' for {ctx.repo.slug!r}; "
+                "gitbulk will not merge this repo's PRs"
+            )
+        if effective.merge_policy == "ci-only":
+            return Pass()
+        # strict
+        if ctx.pr.review_decision != "APPROVED":
+            return Skip(
+                f"merge_policy=strict requires APPROVED review_decision; "
+                f"got {ctx.pr.review_decision!r}"
+            )
+        return Pass()
+
+
+@register
+class PrAgeThresholdInvariant(Invariant):
+    """Skip unless the PR has been continuously ready long enough.
+
+    "Long enough" = at least ``policy.defaults.min_business_days`` business
+    days have elapsed between the conservative ``ready_since`` anchor and
+    "now". See ``bg4pqn7m`` (Three Business Days From Continuously Ready)
+    and the ``compute_ready_since`` docstring for the MVP simplification.
+
+    Implementation detail: ``add_business_days(ready_since, n)`` gives the
+    moment at which the PR becomes age-eligible. We compare ``now`` to
+    that moment; if ``now`` is earlier, Skip with the remaining duration.
+    """
+
+    name = "pr.age_threshold"
+    kind = InvariantKind.PER_PR
+    subcommands = _MERGE_ONLY
+
+    def check(self, ctx: InvariantContext) -> Result:
+        if ctx.pr is None or ctx.repo is None:
+            return Fail("per-PR invariant called without ctx.pr/ctx.repo")
+        effective = policy_for(ctx.policy, ctx.repo.slug)
+        require_approval = effective.merge_policy != "ci-only"
+        ready_since = compute_ready_since(
+            ctx.pr, require_approval=require_approval
+        )
+        if ready_since is None:
+            return Skip(
+                "PR is not currently ready (mergeable_state/checks/review "
+                "do not all qualify)"
+            )
+        eligible_at = add_business_days(ready_since, effective.min_business_days)
+        now = _utc_now()
+        if now < eligible_at:
+            return Skip(
+                f"ready_since={ready_since.isoformat()} but needs "
+                f"{effective.min_business_days} business days; "
+                f"eligible at {eligible_at.isoformat()}"
+            )
+        return Pass()
+
+
+def _utc_now() -> datetime:
+    """Indirection so tests can monkeypatch the clock on this module."""
+    return datetime.now(timezone.utc)
 
 
 @register

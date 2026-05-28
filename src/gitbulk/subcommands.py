@@ -42,6 +42,24 @@ _CLONE_TOUCHING_CHAIN: tuple[str, ...] = (
     "pr.author_known",
 )
 
+# Phase 5 chain for ``merge``. Layers the four merge-only PER_PR
+# invariants (mergeable_state, checks green, approval policy, age
+# threshold) onto the standard gh-touching baseline. Ordering matters:
+# the gh-touching baseline (PER_PR) runs first so a wrong-base PR is
+# Skipped before the merge-specific checks even consider the PR.
+_MERGE_CHAIN: tuple[str, ...] = (
+    "gh.authenticated",
+    "config.parseable",
+    "org.members.fresh",
+    "github.reachable",
+    "pr.base_is_default",
+    "pr.author_known",
+    "pr.mergeable_state_clean",
+    "pr.required_checks_green",
+    "pr.approved_per_policy",
+    "pr.age_threshold",
+)
+
 
 @dataclass(frozen=True)
 class Subcommand:
@@ -95,7 +113,7 @@ KNOWN: tuple[Subcommand, ...] = (
         mutating=True,
         lock_mode="exclusive",
         needs_clone=False,
-        invariant_chain=_GH_TOUCHING_CHAIN,
+        invariant_chain=_MERGE_CHAIN,
     ),
     Subcommand(
         name="rebase-onto-default",

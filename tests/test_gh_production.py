@@ -649,6 +649,107 @@ def test_my_open_prs_handles_missing_data_key_gracefully():
     assert result == {}
 
 
+# ─── merge_pr ──────────────────────────────────────────────────────────────
+
+
+def test_merge_pr_default_argv_squash_delete_branch():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=""))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        result = client.merge_pr("dhh1128/gitbulk", 42)
+
+    assert result == {}
+    args, _ = mock_run.call_args
+    assert args[0] == [
+        "gh",
+        "pr",
+        "merge",
+        "42",
+        "--repo",
+        "dhh1128/gitbulk",
+        "--squash",
+        "--delete-branch",
+    ]
+
+
+def test_merge_pr_method_merge_uses_merge_flag():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=""))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.merge_pr("a/b", 1, method="merge")
+    args, _ = mock_run.call_args
+    assert "--merge" in args[0]
+    assert "--squash" not in args[0]
+
+
+def test_merge_pr_method_rebase_uses_rebase_flag():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=""))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.merge_pr("a/b", 1, method="rebase")
+    args, _ = mock_run.call_args
+    assert "--rebase" in args[0]
+
+
+def test_merge_pr_no_delete_branch_omits_flag():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=""))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.merge_pr("a/b", 1, delete_branch=False)
+    args, _ = mock_run.call_args
+    assert "--delete-branch" not in args[0]
+
+
+def test_merge_pr_parses_json_stdout_when_present():
+    """Future-compat: a gh version that emits JSON on stdout should be
+    parsed and returned as a dict."""
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout='{"merged": true, "sha": "abc"}')
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        result = client.merge_pr("a/b", 1)
+    assert result == {"merged": True, "sha": "abc"}
+
+
+def test_merge_pr_non_json_stdout_wrapped_in_stdout_key():
+    """Current gh prints human text on success; we tolerate that and
+    return it under a stable key rather than raising."""
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout="Pull request #42 merged.\n")
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        result = client.merge_pr("a/b", 42)
+    assert result == {"stdout": "Pull request #42 merged."}
+
+
+def test_merge_pr_raises_on_non_clean_state():
+    """Non-retryable stderr (e.g. 'Pull request is not mergeable') →
+    immediate GHError without retries."""
+    side_effect = _make_run_mock(
+        _CompletedFake(1, stderr="Pull request is not mergeable: dirty branch")
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        with patch("gitbulk.gh.time.sleep") as mock_sleep:
+            client = ProductionGHClient()
+            with pytest.raises(GHError) as exc_info:
+                client.merge_pr("a/b", 1)
+
+    assert mock_run.call_count == 1
+    mock_sleep.assert_not_called()
+    assert "not mergeable" in str(exc_info.value)
+
+
+def test_merge_pr_respects_timeout_kwarg():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=""))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.merge_pr("a/b", 1, timeout=7.5)
+    _, kwargs = mock_run.call_args
+    assert kwargs["timeout"] == 7.5
+
+
 # ─── stateless guarantee ───────────────────────────────────────────────────
 
 
