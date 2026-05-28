@@ -77,6 +77,16 @@ def test_runs_dir_and_locks_dir(isolated_paths):
     assert paths.runs_dir() == gcache / "runs"
     assert paths.locks_dir() == gcache / "locks"
     assert paths.default_worktree_root() == gcache / "worktrees"
+    assert paths.org_members_cache_dir() == gcache / "org-members"
+
+
+def test_org_members_cache_file_path(isolated_paths):
+    _, cache_root = isolated_paths
+    gcache = cache_root / "gitbulk"
+    assert (
+        paths.org_members_cache_file("provenant-dev")
+        == gcache / "org-members" / "provenant-dev.yaml"
+    )
 
 
 def test_run_dir_composition(isolated_paths):
@@ -128,6 +138,7 @@ def test_ensure_directories_creates_all(isolated_paths):
     assert paths.runs_dir().is_dir()
     assert paths.locks_dir().is_dir()
     assert paths.default_worktree_root().is_dir()
+    assert paths.org_members_cache_dir().is_dir()
 
 
 def test_ensure_directories_idempotent(isolated_paths):

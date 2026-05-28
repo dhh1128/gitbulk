@@ -91,9 +91,31 @@ def dashboard_file() -> Path:
     return cache_dir() / "dashboard.md"
 
 
+def org_members_cache_dir() -> Path:
+    return cache_dir() / "org-members"
+
+
+def org_members_cache_file(org: str) -> Path:
+    """Path to the org-members cache YAML for ``org``.
+
+    The classifier and the ``org.members.fresh`` invariant both read this
+    file; ``org_members_cache.save_cache`` writes it. See this.i node
+    ``hbcls4pq`` for the contract and ``schv4nrm`` for the schema-version
+    discipline applied to the file's contents.
+    """
+    return org_members_cache_dir() / f"{org}.yaml"
+
+
 def ensure_directories() -> None:
     """Create every directory gitbulk writes to. Idempotent."""
-    for d in (config_dir(), cache_dir(), runs_dir(), locks_dir(), default_worktree_root()):
+    for d in (
+        config_dir(),
+        cache_dir(),
+        runs_dir(),
+        locks_dir(),
+        default_worktree_root(),
+        org_members_cache_dir(),
+    ):
         d.mkdir(parents=True, exist_ok=True)
 
 
