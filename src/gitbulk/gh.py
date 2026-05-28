@@ -24,6 +24,9 @@ and the feedback memory ``feedback-gh-cli-deprecation-verification``).
 
 from __future__ import annotations
 
+import json
+import subprocess
+import time
 from datetime import datetime
 from typing import Any, Iterable, Mapping, Protocol, runtime_checkable
 
@@ -191,3 +194,298 @@ class FakeGHClient:
             slug: list(self._my_open_prs.get(slug, []))
             for slug in slugs_set
         }
+
+
+# ─── ProductionGHClient ─────────────────────────────────────────────────────
+
+
+#: Substrings (case-insensitive) in gh stderr that mark a transient failure
+#: worth retrying. See node ``ghclmp7n.d`` — the retry policy is hardcoded
+#: conservative and not configurable at call sites.
+_RETRYABLE_STDERR_MARKERS: tuple[str, ...] = (
+    "rate limit",
+    "5xx",
+    "timeout",
+    "could not resolve",
+    "eof",
+)
+
+
+def _is_retryable_stderr(stderr: str) -> bool:
+    """True if ``stderr`` matches one of the retryable patterns."""
+    low = stderr.lower()
+    return any(marker in low for marker in _RETRYABLE_STDERR_MARKERS)
+
+
+#: GraphQL document used by ``my_open_prs``. Lives at module scope so the
+#: test suite can assert on the exact wire shape and so the verification
+#: comment at the call site stays close to the call, not the literal.
+_MY_OPEN_PRS_GRAPHQL = """\
+query($q: String!) {
+  search(query: $q, type: ISSUE, first: 100) {
+    nodes {
+      ... on PullRequest {
+        number
+        title
+        url
+        author { login }
+        isDraft
+        state
+        baseRefName
+        headRefName
+        headRefOid
+        createdAt
+        updatedAt
+        mergeStateStatus
+        reviewDecision
+        labels(first: 20) { nodes { name } }
+        commits(last: 1) {
+          nodes {
+            commit {
+              committedDate
+              statusCheckRollup { state }
+            }
+          }
+        }
+        repository { nameWithOwner }
+      }
+    }
+  }
+}
+"""
+
+
+def _parse_iso8601(value: str) -> datetime:
+    """Parse a GitHub ISO-8601 timestamp (always ends in ``Z``) into an
+    aware UTC ``datetime``. Kept local to gh.py because the rest of
+    gitbulk has no need for ISO parsing yet."""
+    # GitHub always emits a trailing 'Z'; fromisoformat doesn't accept
+    # 'Z' until 3.11, so normalize to '+00:00' for the 3.10 baseline.
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    return datetime.fromisoformat(value)
+
+
+class ProductionGHClient:
+    """Real :class:`GHClient` implementation that subprocesses to ``gh``.
+
+    Stateless per node ``ghclmp7n.e``: no per-client cache of auth,
+    rate-limit headers, or org membership. Each call shells out fresh.
+
+    Constructor knobs (all keyword-only):
+      - ``gh_path``: path to the ``gh`` executable. Default ``"gh"`` so
+        we pick it up from PATH (which includes ``.agent-bin`` when an
+        agent shim is configured).
+      - ``default_timeout``: per-call timeout in seconds when the caller
+        passes ``timeout=None``. Default 30s, matching node ghclmp7n.d.
+      - ``max_retries``: max attempts (including the initial try) for
+        transient failures. Default 3.
+    """
+
+    def __init__(
+        self,
+        *,
+        gh_path: str = "gh",
+        default_timeout: float = 30.0,
+        max_retries: int = 3,
+    ) -> None:
+        self._gh_path = gh_path
+        self._default_timeout = default_timeout
+        self._max_retries = max_retries
+
+    # ─── private helpers ───────────────────────────────────────────────
+
+    def _run(
+        self,
+        args: tuple[str, ...],
+        *,
+        timeout: float | None,
+    ) -> str:
+        """Run ``gh <args>`` with retry + timeout discipline.
+
+        Returns captured stdout on success. Raises:
+          - :class:`GHTimeoutError` if the final attempt timed out.
+          - :class:`GHError` for non-zero exits (immediate raise on
+            non-retryable stderr; raise after exhaustion on retryable).
+        """
+        effective_timeout = (
+            timeout if timeout is not None else self._default_timeout
+        )
+        command: tuple[str, ...] = (self._gh_path,) + args
+        last_stderr = ""
+        last_was_timeout = False
+
+        for attempt in range(self._max_retries):
+            try:
+                completed = subprocess.run(
+                    list(command),
+                    capture_output=True,
+                    text=True,
+                    timeout=effective_timeout,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired as exc:
+                last_stderr = (
+                    f"timeout after {effective_timeout}s: {exc}"
+                )
+                last_was_timeout = True
+            else:
+                if completed.returncode == 0:
+                    return completed.stdout
+                last_stderr = completed.stderr or ""
+                last_was_timeout = False
+                if not _is_retryable_stderr(last_stderr):
+                    raise GHError(
+                        f"gh failed: {last_stderr.strip()}",
+                        command=command,
+                    )
+
+            # Retryable path: sleep with exponential backoff before next
+            # attempt, but not after the final attempt.
+            if attempt < self._max_retries - 1:
+                time.sleep(2 ** attempt)
+
+        # Exhausted all attempts on retryable / timeout failures.
+        message = (
+            f"gh exhausted {self._max_retries} attempts: "
+            f"{last_stderr.strip()}"
+        )
+        if last_was_timeout:
+            raise GHTimeoutError(message, command=command)
+        raise GHError(message, command=command)
+
+    # ─── Protocol methods ──────────────────────────────────────────────
+
+    def authenticated_user(
+        self, *, timeout: float | None = None
+    ) -> dict[str, Any]:
+        # verified non-deprecated against gh CLI 2026-05-28
+        stdout = self._run(("api", "user"), timeout=timeout)
+        return json.loads(stdout)
+
+    def org_members(
+        self, org: str, *, timeout: float | None = None
+    ) -> list[str]:
+        # verified non-deprecated against gh CLI 2026-05-28
+        stdout = self._run(
+            (
+                "api",
+                f"orgs/{org}/members",
+                "--paginate",
+                "--jq",
+                ".[].login",
+            ),
+            timeout=timeout,
+        )
+        return [line.strip() for line in stdout.splitlines() if line.strip()]
+
+    def default_branch(
+        self, slug: str, *, timeout: float | None = None
+    ) -> str:
+        # verified non-deprecated against gh CLI 2026-05-28
+        stdout = self._run(
+            ("api", f"repos/{slug}", "--jq", ".default_branch"),
+            timeout=timeout,
+        )
+        return stdout.strip()
+
+    def my_open_prs(
+        self,
+        slugs: Iterable[str] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, list[PRInfo]]:
+        # verified non-deprecated against gh CLI 2026-05-28
+        # Build the search string per node ghclmp7n.c (coalescing): one
+        # GraphQL call regardless of how many slugs are requested.
+        slug_list: list[str] | None
+        if slugs is None:
+            slug_list = None
+            search_terms = ["author:@me", "is:open", "is:pr"]
+        else:
+            slug_list = list(slugs)
+            search_terms = ["author:@me", "is:open", "is:pr"]
+            search_terms.extend(f"repo:{s}" for s in slug_list)
+        search_string = " ".join(search_terms)
+
+        stdout = self._run(
+            (
+                "api",
+                "graphql",
+                "-F",
+                f"q={search_string}",
+                "-f",
+                f"query={_MY_OPEN_PRS_GRAPHQL}",
+            ),
+            timeout=timeout,
+        )
+        payload = json.loads(stdout)
+        nodes = payload.get("data", {}).get("search", {}).get("nodes", [])
+
+        grouped: dict[str, list[PRInfo]] = {}
+        if slug_list is not None:
+            # Ensure every requested slug appears, even when no PRs exist,
+            # matching FakeGHClient.my_open_prs semantics.
+            for slug in slug_list:
+                grouped.setdefault(slug, [])
+
+        for node in nodes:
+            if not node:
+                # GraphQL returns nulls for non-PullRequest items in the
+                # search results (defensive — our query filters with is:pr,
+                # but the field is still nullable).
+                continue
+            pr = _pr_info_from_graphql_node(node)
+            grouped.setdefault(pr.slug, []).append(pr)
+
+        return grouped
+
+
+def _pr_info_from_graphql_node(node: dict[str, Any]) -> PRInfo:
+    """Translate one GraphQL ``PullRequest`` node into a :class:`PRInfo`.
+
+    Pulled out of :class:`ProductionGHClient` so it can be unit-tested in
+    isolation against fixture JSON. Tolerates missing optional fields
+    (``statusCheckRollup`` is null when no checks have run; ``author`` is
+    null for deleted users) by mapping them to ``None``.
+    """
+    slug = node["repository"]["nameWithOwner"]
+    author_obj = node.get("author") or {}
+    author = author_obj.get("login", "")
+
+    labels_obj = node.get("labels") or {}
+    label_nodes = labels_obj.get("nodes") or []
+    labels = tuple(n["name"] for n in label_nodes if n and n.get("name"))
+
+    last_pushed_at: datetime | None = None
+    checks_status: str | None = None
+    commits_obj = node.get("commits") or {}
+    commit_nodes = commits_obj.get("nodes") or []
+    if commit_nodes:
+        commit = commit_nodes[0].get("commit") or {}
+        committed_date = commit.get("committedDate")
+        if committed_date:
+            last_pushed_at = _parse_iso8601(committed_date)
+        rollup = commit.get("statusCheckRollup")
+        if rollup:
+            checks_status = rollup.get("state")
+
+    return PRInfo(
+        slug=slug,
+        number=node["number"],
+        title=node["title"],
+        url=node["url"],
+        author=author,
+        base_ref=node["baseRefName"],
+        head_ref=node["headRefName"],
+        head_sha=node["headRefOid"],
+        state=node["state"],
+        is_draft=node["isDraft"],
+        mergeable_state=node.get("mergeStateStatus"),
+        created_at=_parse_iso8601(node["createdAt"]),
+        updated_at=_parse_iso8601(node["updatedAt"]),
+        last_pushed_at=last_pushed_at,
+        labels=labels,
+        review_decision=node.get("reviewDecision"),
+        checks_status=checks_status,
+    )
