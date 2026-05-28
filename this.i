@@ -720,15 +720,29 @@ Gitbulk Triage Tool = goal:
         extensible if upgrade patterns appear later.
         repo_lock takes no mode — always exclusive (per lj5pqn4kr).
 
-        (c) Acquisition blocks forever by default; an optional
-        timeout kwarg (float seconds) lets interactive callers fail
-        fast with a LockTimeoutError. Cron is the primary target —
-        overlapping nightly runs should serialize, not fail
-        spuriously. Stuck processes are surfaced via metadata
-        (see (e)), not via aggressive default timeouts. Timeout
+        (c) Acquisition blocks forever by default AT THE LIBRARY
+        LEVEL; an optional timeout kwarg (float seconds) lets
+        callers fail fast with a LockTimeoutError. Timeout
         implementation: poll with LOCK_NB + sleep(min(0.1,
         remaining)); raises LockTimeoutError including the holder's
         metadata when the deadline elapses.
+
+        **However, the library default is NOT the right default
+        for CLI subcommands.** Every CLI subcommand handler MUST
+        pass an explicit bounded timeout (per Phase 2 CLI Lock
+        Timeout Policy, node tmlk5pq3). Rationale for the layered
+        split: in-process tests and ad-hoc scripts may legitimately
+        want indefinite waits; the CLI is the layer that knows the
+        cron-overlap failure mode, so the CLI owns the bounded-
+        timeout responsibility. The platform-architect adversarial
+        review (2026-05-27) identified that without explicit CLI
+        timeouts a stuck process holding the global exclusive lock
+        silently parks successive cron invocations — the new
+        process never reaches the ATTENTION-setting code path, so
+        the user discovers the situation only when the third or
+        fifth nightly run has failed to produce expected artifacts.
+        The two-layer split (permissive library default, mandatory
+        CLI bound) prevents this without restricting non-CLI use.
 
         (d) Lock files persist empty after release rather than being
         deleted. Their purpose is to be a stable fcntl target;
@@ -888,7 +902,221 @@ Gitbulk Triage Tool = goal:
         tmux-statusline integration consumes the ATTENTION sentinel for
         live visibility without an external service.
 
+    # ─── PHASE 1D FOLLOWUPS (adversarial review 2026-05-27) ─────────────────
+
+    Phase 2 CLI Lock Timeout Policy = decision:
+      id: tmlk5pq3
+      why: >
+        Phase 2's CLI subcommand handlers MUST pass an explicit
+        bounded timeout to every call into global_lock / repo_lock
+        (per the split codified in node hk5pq3nm.c). Concrete
+        defaults:
+
+          Read-only subcommands (report, summarize, show, ack,
+          invariants):                                 timeout = 300s
+          Mutating subcommands (merge, rebase-onto-default,
+          close-stale, dispatch):                      timeout = 1800s
+
+        Rationale for these numbers:
+          - 300s (5 min) for read-only: generous enough that a
+            concurrent long-running report doesn't trip a quick
+            `gitbulk show`; short enough that a hung process surfaces
+            within one cron cycle.
+          - 1800s (30 min) for mutating: long enough for legitimate
+            dispatch / rebase runs across many repos; short enough
+            that stuck mutators are noticed within one nightly cron
+            cadence.
+
+        LockTimeoutError handling:
+          - Caught at the subcommand entry point.
+          - Surfaced as exit code 1 (structural failure).
+          - Holder metadata (pid, started_at, subcommand, alive
+            status — see node hk5pq3nm.e + the pid-liveness fix in
+            Phase 1D) written to errors.log and to stderr so cron's
+            MAILTO captures it.
+          - ATTENTION sentinel is NOT set on timeout. Reasoning:
+            attention is for "PRs need a human"; a stuck lock is a
+            structural issue surfaced via cron's failure channel, not
+            via the daily attention glyph.
+
+        These numbers and the no-ATTENTION-on-timeout rule are
+        revisitable as Phase 2 lands and real timing data accumulates.
+      approved-by: daniel, 2026-05-27
+
+    Cache Artifact Schema Versioning = decision:
+      id: schv4nrm
+      why: >
+        Every file gitbulk writes into ~/.cache/gitbulk/ carries an
+        explicit schema_version field. Established by the platform-
+        architect adversarial review (2026-05-27) which flagged the
+        cache directory as a de-facto cross-version API: future
+        readers (gitbulk show, dashboard re-rendering, the user's
+        tmux integration, external notifier adapters) need to know
+        what shape they're looking at.
+
+        Conventions:
+          - YAML files (manifest.yaml, state.yaml) carry
+            `schema_version: <int>` at the top level. Initial value
+            = 1 for every file.
+          - JSONL events (invariants.log, errors.log) carry
+            `"v": <int>` as the first key of each event.
+          - ATTENTION sentinel migrates from the whitespace-
+            delimited 4-field format defined in node snk7p4qm to a
+            ONE-LINE JSON OBJECT with the same fields plus "v": 1.
+            Clean break, not a silent corruption — any external
+            consumer parsing the old whitespace format will fail
+            loudly, which is the intended migration signal. This
+            supersedes the format conventions in snk7p4qm; that
+            node remains the API surface, only the wire format
+            changes.
+          - Reader strictness: gitbulk reads only artifacts whose
+            schema_version is in {N-1, N} where N is the current
+            version. Older versions: refuse with a clear message,
+            log to errors.log, continue. Forward-compatible (the
+            current gitbulk reads both v_curr and v_curr-1 during
+            transitions); backward-safe (old gitbulk seeing v_new
+            fails loudly).
+          - Initial state (Phase 1D): all schemas are at v=1.
+            Future bumps document the breaking change in this.i as
+            their own decision nodes.
+      approved-by: daniel, 2026-05-27
+
+    Subcommands Module And Dataclass = decision:
+      id: smodlpr3
+      why: >
+        SUBCOMMANDS in cli.py was a list[tuple[str, str]] of
+        (name, help). dashboard.py imported it across the CLI/
+        rendering boundary, which the platform-architect
+        adversarial review (2026-05-27) flagged as a layering
+        inversion.
+
+        Resolution: promote SUBCOMMANDS to its own module
+        src/gitbulk/subcommands.py exporting a typed frozen
+        dataclass:
+
+            @dataclass(frozen=True)
+            class Subcommand:
+                name: str
+                help: str
+                mutating: bool                  # 2vqp4nk6 dry-run default applies
+                lock_mode: Literal["shared", "exclusive"]
+                                                # per lj5pqn4kr
+                needs_clone: bool               # per 5xqp2nkr — invariant
+                                                # local.exists is in this
+                                                # subcommand's chain only if True
+
+            KNOWN: tuple[Subcommand, ...] = (...)
+
+        cli.py and dashboard.py both import from subcommands.py.
+        The dataclass becomes the single declarative answer to
+        "is this mutating? does it need a clone? what lock mode?"
+        — replacing knowledge previously scattered across cli.py,
+        AGENTS.md, and docs/architecture.md.
+
+        Per-subcommand initial values:
+          report               mutating=F lock=shared    clone=F
+          summarize            mutating=F lock=shared    clone=F
+          dispatch             mutating=T lock=exclusive clone=T
+          merge                mutating=T lock=exclusive clone=F
+          rebase-onto-default  mutating=T lock=exclusive clone=T
+          close-stale          mutating=T lock=exclusive clone=F
+          show                 mutating=F lock=shared    clone=F
+          ack                  mutating=F lock=shared    clone=F
+          invariants           mutating=F lock=shared    clone=F
+      approved-by: daniel, 2026-05-27
+
+    POSIX Only Runtime = constraint:
+      id: posqx2nm
+      why: >
+        gitbulk uses fcntl.flock (POSIX advisory locks) in locks.py
+        and POSIX symlink semantics (os.replace on symlinks) in
+        runstate.py. Neither is portable to Windows. The tool's
+        documented runtime is Linux (and any POSIX-compatible OS
+        such as macOS); Windows is explicitly NOT supported.
+
+        This was implicit in the codebase but was not previously
+        stated as a constraint — the platform-architect adversarial
+        review (2026-05-27) noted the gap. A future contributor
+        attempting Windows compatibility would either need to
+        abandon fcntl (changing the locking model entirely) or wrap
+        with msvcrt.locking, which has different semantics
+        (mandatory rather than advisory; per-region rather than
+        whole-file).
+
+        Accepted cost: gitbulk doesn't run on Windows. The user's
+        development setup is WSL2/Ubuntu, so this is consistent
+        with actual use. macOS support is preserved by virtue of
+        macOS being POSIX-compliant.
+      approved-by: daniel, 2026-05-27
+
+    CI Python Matrix Policy = decision:
+      id: cipym4kr
+      why: >
+        CI workflow at .github/workflows/ci.yml runs the test suite
+        across Python 3.10, 3.12, and 3.13. The devops adversarial
+        review (2026-05-27) argued this is over-matrixed for a
+        single-user CLI deployed to one machine. Counter-rationale
+        for keeping the matrix:
+
+          - CI cost is zero on free public-repo runners (which is
+            where this lives per node 6xp4kq2n); no resource
+            pressure to economize.
+          - Test signal value of "new Python release broke
+            something" is genuinely useful for a strict-TDD repo
+            whose blast radius (real production repos) makes silent
+            regressions costly.
+          - The matrix is the user's only mechanism to discover
+            language-level regressions before they bite cron.
+
+        Mitigation accepted: add .python-version at repo root
+        pinning the deployment version (3.12 as of Phase 1D).
+        Contributors know which Python is "the real one"; the
+        matrix is "additionally, we want to know about
+        newer/older Python regressions."
+
+        Revisit if the matrix begins producing flaky failures that
+        are not actionable; drop the older/newer tier first.
+      approved-by: daniel, 2026-05-27
+
     # ─── TENSIONS (deferred, do not resolve silently) ────────────────────────
+
+    gh Client Interface Shape = tension:
+      id: ghc7npqk
+      why: >
+        Phase 2 will introduce src/gitbulk/gh.py (or similar) as
+        the exclusive channel for GitHub network traffic
+        (constraint hp4nck2v). The shape is not yet designed; the
+        platform-architect adversarial review (2026-05-27)
+        identified that without this design recorded, whichever
+        invariant lands first in Phase 2 will set the shape by
+        accident.
+
+        Forks the speculative interview must resolve before any
+        Phase 2 invariant calls into gh:
+
+          (a) Protocol class with FakeGHClient test double, OR
+              concrete class with subprocess injection?
+          (b) Per-method API (gh.list_open_prs(slug) →
+              list[PRInfo]) OR command-style with a typed result
+              (gh.run(["pr", "list", ...]) → Response)?
+          (c) Where does GraphQL coalescing live — inside the
+              client, or above it as a caching layer? (Decision
+              gd4kp7nz says "serial + coalescing"; the layer
+              question is still open.)
+          (d) Where do timeouts and retries live — inside the
+              client, in the invariant, or at the CLI?
+          (e) Does the client carry state (rate-limit headers,
+              auth-status cache) or is it stateless?
+          (f) Test seam: how do invariants get a mock gh in tests
+              that respect AGENTS.md's "no network in tests"?
+
+        Resolution timing: speculative interview AT Phase 2 entry,
+        with all forks surfaced in one batch (per user preference,
+        memory feedback-front-load-questions). The decision node
+        replacing this tension will be required before any gh-
+        touching code lands.
+      approved-by: daniel, 2026-05-27
+
 
     Summarize Prompt Design = tension:
       id: kw2pn7qz
@@ -946,23 +1174,40 @@ Gitbulk Triage Tool = goal:
     Repo Cleanup Subcommand Scope = tension:
       id: jw3kpn4q
       why: >
-        A repo-level cleanup subcommand (working name: tidy, but the
-        name is open) needs to address at least: (a) orphaned worktrees
-        under the worktree root (node mw6kp2nq) whose creating run
-        terminated and which are not in a conflict state per node
-        vp7n2krq, (b) post-merge remote branches that gh shows as merged
-        but still present on the remote, (c) stale local branches that
-        correspond to merged or closed PRs. Open questions: which
-        cleanups default to --apply vs --dry-run (decision 2vqp4nk6
-        suggests dry-run for everything mutating, but post-merge
-        branch deletion is arguably so safe that --apply by default
-        could be justified); what age threshold for orphan worktrees;
-        whether to integrate with `git worktree prune` or do gitbulk's
-        own walk; which invariants gate each cleanup (probably variants
-        of pr.merged_or_closed and worktree.belongs_to_us). Deferred to
-        Phase 5/6 — comes after merge and close-stale ship, since
-        cleanup's correctness depends on the same PR-state data those
-        subcommands consume.
+        Split into two tracks after the devops adversarial review
+        (2026-05-27) flagged that "no GC" is operationally risky the
+        moment Phase 2's report subcommand starts creating a run dir
+        nightly:
+
+        TRACK A — minimum-viable retention sweep — lands in PHASE 1D
+        (before Phase 2 ships). Three pieces, all small:
+          1. RunState.complete() prunes runs/<old>-<sub>/ directories
+             beyond `defaults.retain_runs` (policy schema; default 30).
+             Same-subcommand only; never deletes the "latest" target.
+          2. bin/gitbulk-cron prunes ~/.cache/gitbulk/cron/*.log older
+             than `defaults.retain_cron_log_days` (default 30).
+          3. Worktree-orphan sweep at run start: defined as a
+             function but not wired into a CLI handler until Phase 4
+             when dispatch actually creates worktrees. TODO comment
+             in the code references this tension node.
+
+        TRACK B — full `gitbulk gc` subcommand — remains DEFERRED to
+        PHASE 5/6. Original scope below still stands for that track:
+        (a) orphaned worktrees under the worktree root (node
+        mw6kp2nq) whose creating run terminated and which are not in
+        a conflict state per node vp7n2krq, (b) post-merge remote
+        branches that gh shows as merged but still present on the
+        remote, (c) stale local branches that correspond to
+        merged/closed PRs. Open questions for the full subcommand:
+        which cleanups default to --apply vs --dry-run (decision
+        2vqp4nk6 suggests dry-run for everything mutating, but
+        post-merge branch deletion is arguably so safe that --apply
+        by default could be justified); whether to integrate with
+        `git worktree prune` or do gitbulk's own walk; which
+        invariants gate each cleanup (variants of pr.merged_or_closed
+        and worktree.belongs_to_us). Track B comes after merge and
+        close-stale ship because its correctness depends on the same
+        PR-state data those subcommands consume.
 
     Scan And Findings Artifact Convention = tension:
       id: ck7n4pqr
