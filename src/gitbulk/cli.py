@@ -443,18 +443,23 @@ def _maybe_set_attention(exit_code: int, subcommand: str) -> None:
 
 
 def _apply_config_root(config_root: str | None) -> None:
-    """If --config-root was passed, point XDG_CONFIG_HOME at its parent
-    so ``paths.config_dir()`` resolves to it.
+    """If --config-root was passed, pin ``paths.config_dir()`` to it.
 
-    The user's flag value MUST point at the ``gitbulk/`` directory
-    itself (mirroring ~/.config/gitbulk); the function sets the env
-    so the underlying ``paths`` helpers stay XDG-purist.
+    The user's flag value points at the ``gitbulk/`` directory itself
+    (mirroring ~/.config/gitbulk). The override is held inside the
+    ``paths`` module rather than via ``os.environ["XDG_CONFIG_HOME"]``
+    so that child processes — ``gh``, ``claude`` — DO NOT inherit the
+    override. Both tools also respect XDG_CONFIG_HOME for their own
+    credential / config lookups; mutating that env var would cause
+    them to lose their auth (smoke-test finding 2026-05-28).
     """
     if config_root is None:
         return
-    p = os.path.expanduser(config_root)
-    parent = os.path.dirname(os.path.abspath(p)) or "/"
-    os.environ["XDG_CONFIG_HOME"] = parent
+    from pathlib import Path
+
+    from gitbulk import paths
+
+    paths.set_config_dir_override(Path(os.path.expanduser(config_root)).resolve())
 
 
 def _set_private_umask() -> None:

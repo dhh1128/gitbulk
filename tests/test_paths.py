@@ -222,3 +222,33 @@ def test_no_memoization(monkeypatch, tmp_path):
     assert paths.config_dir() == first / "gitbulk"
     monkeypatch.setenv("XDG_CONFIG_HOME", str(second))
     assert paths.config_dir() == second / "gitbulk"
+
+
+# ─── set_config_dir_override (2026-05-28 smoke-test bug fix) ───────────────
+
+
+def test_config_dir_override_takes_precedence_over_xdg(monkeypatch, tmp_path):
+    """`set_config_dir_override` was added so the CLI's --config-root flag
+    can redirect gitbulk's config without mutating XDG_CONFIG_HOME (which
+    would mis-redirect gh/claude credential lookup too). Verifies the
+    override wins over the env var."""
+    xdg_dir = tmp_path / "xdg-cfg"
+    override_dir = tmp_path / "override-cfg"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_dir))
+    try:
+        paths.set_config_dir_override(override_dir)
+        assert paths.config_dir() == override_dir
+    finally:
+        paths.set_config_dir_override(None)
+
+
+def test_config_dir_override_none_restores_xdg(monkeypatch, tmp_path):
+    """Setting the override back to None restores standard XDG lookup."""
+    xdg_dir = tmp_path / "xdg-cfg"
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(xdg_dir))
+    paths.set_config_dir_override(tmp_path / "override")
+    try:
+        assert paths.config_dir() == tmp_path / "override"
+    finally:
+        paths.set_config_dir_override(None)
+    assert paths.config_dir() == xdg_dir / "gitbulk"

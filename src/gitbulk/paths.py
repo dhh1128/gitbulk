@@ -33,7 +33,30 @@ def _xdg_or_default(env_var: str, fallback: Path) -> Path:
     return fallback
 
 
+# CLI --config-root override (per cli._apply_config_root). Held in this module
+# rather than mutated into XDG_CONFIG_HOME so that subprocess children — gh,
+# claude — DO NOT inherit it. (Otherwise gh and claude, both of which respect
+# XDG_CONFIG_HOME for their own credential / config lookups, would lose their
+# auth when gitbulk relocates its own config dir.) Set via ``set_config_dir_override``;
+# consulted in ``config_dir()`` before the XDG env-var check.
+_CONFIG_DIR_OVERRIDE: Path | None = None
+
+
+def set_config_dir_override(path: Path | None) -> None:
+    """Pin :func:`config_dir` to ``path``, bypassing ``XDG_CONFIG_HOME``.
+
+    Used by the CLI's ``--config-root`` flag to redirect gitbulk's config
+    lookup WITHOUT mutating ``os.environ`` (which would mis-redirect child
+    processes like ``gh`` that also respect XDG). Passing ``None`` restores
+    the standard XDG-then-default resolution.
+    """
+    global _CONFIG_DIR_OVERRIDE
+    _CONFIG_DIR_OVERRIDE = path
+
+
 def config_dir() -> Path:
+    if _CONFIG_DIR_OVERRIDE is not None:
+        return _CONFIG_DIR_OVERRIDE
     return _xdg_or_default("XDG_CONFIG_HOME", Path.home() / ".config" / "gitbulk")
 
 
