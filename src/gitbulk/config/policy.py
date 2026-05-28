@@ -21,6 +21,7 @@ from gitbulk.config.repos import ConfigError
 _VALID_MERGE_POLICIES = {"strict", "ci-only", "never"}
 _VALID_UNRESOLVED_BURDENS = {"me", "other", "either"}
 _VALID_MERGE_METHODS = {"merge", "squash", "rebase"}
+_VALID_STALE_POLICIES = {"warn-and-close", "warn-only", "never"}
 
 _TOP_LEVEL_KEYS = {
     "defaults",
@@ -39,6 +40,7 @@ _DEFAULTS_KEYS = {
     "bot_threads_block",
     "stale_age_days",
     "stale_cooloff_days",
+    "stale_policy",
     "retain_runs",
     "skip_checks",
     "extra_checks",
@@ -61,6 +63,11 @@ class Defaults:
     bot_threads_block: bool = True
     stale_age_days: int = 60
     stale_cooloff_days: int = 7
+    #: How close-stale handles inactive PRs. ``warn-and-close`` (default)
+    #: posts a heads-up comment, waits stale_cooloff_days, then closes.
+    #: ``warn-only`` only ever posts the comment (useful while tuning
+    #: thresholds). ``never`` disables close-stale for this repo.
+    stale_policy: str = "warn-and-close"
     retain_runs: int = 30
     skip_checks: tuple[str, ...] = ()
     extra_checks: tuple[str, ...] = ()
@@ -83,6 +90,7 @@ class RepoOverride:
     bot_threads_block: bool | None = None
     stale_age_days: int | None = None
     stale_cooloff_days: int | None = None
+    stale_policy: str | None = None
     retain_runs: int | None = None
     skip_checks: tuple[str, ...] = ()  # appended to defaults
     extra_checks: tuple[str, ...] = ()  # appended to defaults
@@ -183,6 +191,10 @@ def _parse_defaults(raw: dict[str, Any], where: str) -> Defaults:
         kwargs["stale_cooloff_days"] = _ensure_int(
             raw["stale_cooloff_days"], f"{where}.stale_cooloff_days", minimum=0
         )
+    if "stale_policy" in raw:
+        kwargs["stale_policy"] = _ensure_str(
+            raw["stale_policy"], f"{where}.stale_policy", allowed=_VALID_STALE_POLICIES
+        )
     if "retain_runs" in raw:
         kwargs["retain_runs"] = _ensure_int(
             raw["retain_runs"], f"{where}.retain_runs", minimum=1
@@ -255,6 +267,10 @@ def _parse_repo_override(raw: dict[str, Any], where: str) -> RepoOverride:
     if "stale_cooloff_days" in raw:
         kwargs["stale_cooloff_days"] = _ensure_int(
             raw["stale_cooloff_days"], f"{where}.stale_cooloff_days", minimum=0
+        )
+    if "stale_policy" in raw:
+        kwargs["stale_policy"] = _ensure_str(
+            raw["stale_policy"], f"{where}.stale_policy", allowed=_VALID_STALE_POLICIES
         )
     if "retain_runs" in raw:
         kwargs["retain_runs"] = _ensure_int(
@@ -339,6 +355,7 @@ def policy_for(policy: Policy, slug: str) -> Defaults:
         "bot_threads_block",
         "stale_age_days",
         "stale_cooloff_days",
+        "stale_policy",
         "retain_runs",
     ):
         v = getattr(override, key)

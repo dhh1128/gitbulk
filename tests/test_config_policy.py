@@ -135,6 +135,59 @@ repos:
     assert policy_for(policy, "owner/other").merge_method == "merge"
 
 
+# ─── stale_policy ─────────────────────────────────────────────────────────
+
+
+def test_stale_policy_default_is_warn_and_close():
+    from gitbulk.config.policy import Defaults
+    assert Defaults().stale_policy == "warn-and-close"
+
+
+def test_stale_policy_explicit_warn_only(tmp_path):
+    content = "defaults:\n  stale_policy: warn-only\n"
+    policy = load_policy(_write_policy(tmp_path, content))
+    assert policy.defaults.stale_policy == "warn-only"
+
+
+def test_stale_policy_explicit_never(tmp_path):
+    content = "defaults:\n  stale_policy: never\n"
+    policy = load_policy(_write_policy(tmp_path, content))
+    assert policy.defaults.stale_policy == "never"
+
+
+def test_stale_policy_rejects_invalid_value(tmp_path):
+    content = "defaults:\n  stale_policy: aggressive\n"
+    with pytest.raises(ConfigError, match="stale_policy"):
+        load_policy(_write_policy(tmp_path, content))
+
+
+def test_stale_policy_per_repo_override(tmp_path):
+    content = """
+defaults:
+  stale_policy: warn-and-close
+repos:
+  owner/archive:
+    stale_policy: never
+  owner/sandbox:
+    stale_policy: warn-only
+"""
+    policy = load_policy(_write_policy(tmp_path, content))
+    assert policy.defaults.stale_policy == "warn-and-close"
+    assert policy_for(policy, "owner/archive").stale_policy == "never"
+    assert policy_for(policy, "owner/sandbox").stale_policy == "warn-only"
+    assert policy_for(policy, "owner/other").stale_policy == "warn-and-close"
+
+
+def test_stale_policy_per_repo_override_rejects_invalid(tmp_path):
+    content = """
+repos:
+  owner/repo:
+    stale_policy: ruthless
+"""
+    with pytest.raises(ConfigError, match="stale_policy"):
+        load_policy(_write_policy(tmp_path, content))
+
+
 def test_merge_method_per_repo_override_rejects_invalid(tmp_path):
     content = """
 repos:

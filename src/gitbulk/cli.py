@@ -146,6 +146,13 @@ def _merge_handler(args: argparse.Namespace) -> int:
     return merge_handler(args)
 
 
+def _close_stale_handler(args: argparse.Namespace) -> int:
+    # Lazy import for the same reason as the other handlers.
+    from gitbulk.commands.close_stale import close_stale_handler
+
+    return close_stale_handler(args)
+
+
 def _show_handler(args: argparse.Namespace) -> int:
     # Lazy import for the same reason as the other handlers — keeps the
     # locks / paths / runstate-reading machinery out of the --help path.
@@ -161,6 +168,7 @@ _SPECIAL_HANDLERS = {
     "summarize": _summarize_handler,
     "dispatch": _dispatch_handler,
     "merge": _merge_handler,
+    "close-stale": _close_stale_handler,
     "show": _show_handler,
 }
 
@@ -346,6 +354,48 @@ def _add_dispatch_args(sp: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_close_stale_args(sp: argparse.ArgumentParser) -> None:
+    """Argparse flags for ``close-stale``. Mirrors merge: --apply opt-in,
+    --code-root, --skip-check, --refresh-org-members."""
+    sp.add_argument(
+        "--apply",
+        action="store_true",
+        default=False,
+        help=(
+            "Actually post stale warnings and close PRs whose cooloff "
+            "has elapsed. Without this flag, close-stale is a dry run "
+            "and prints what it WOULD do (per AGENTS.md 'Mutating "
+            "subcommands default to dry-run')."
+        ),
+    )
+    sp.add_argument(
+        "--code-root",
+        metavar="PATH",
+        default=None,
+        help="Override default ~/code/ where local clones live.",
+    )
+    sp.add_argument(
+        "--skip-check",
+        metavar="NAME",
+        action="append",
+        default=None,
+        help=(
+            "Skip the named invariant for this run (may be passed more "
+            "than once). Logs a WARNING and triggers exit-code 4 if no "
+            "other concern fires."
+        ),
+    )
+    sp.add_argument(
+        "--refresh-org-members",
+        action="store_true",
+        default=False,
+        help=(
+            "Force a fresh fetch of the configured humans.org members "
+            "before running close-stale."
+        ),
+    )
+
+
 def _add_merge_args(sp: argparse.ArgumentParser) -> None:
     """Argparse flags specific to the ``merge`` subcommand.
 
@@ -421,6 +471,8 @@ def build_parser() -> argparse.ArgumentParser:
             _add_dispatch_args(sp)
         elif sc.name == "merge":
             _add_merge_args(sp)
+        elif sc.name == "close-stale":
+            _add_close_stale_args(sp)
         elif sc.name == "show":
             _add_show_args(sp)
     return parser

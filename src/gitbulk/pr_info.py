@@ -67,6 +67,21 @@ KNOWN_CHECKS_STATUSES: frozenset[str] = frozenset(
 
 
 @dataclass(frozen=True)
+class PRComment:
+    """One PR issue-comment, fetched by close-stale to find prior warnings.
+
+    Not stored on :class:`PRInfo` because comments are close-stale-only
+    payload: fetching them for every PR in every subcommand would be
+    wasteful. The close-stale handler fetches comments per-PR via
+    :meth:`gitbulk.gh.GHClient.fetch_pr_comments`.
+    """
+
+    author_login: str
+    body: str
+    at: datetime
+
+
+@dataclass(frozen=True)
 class TimelineEvent:
     """One PR-timeline event relevant to the continuously-ready window.
 

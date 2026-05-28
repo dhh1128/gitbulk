@@ -73,6 +73,7 @@ _ALL_SUBS: frozenset[str] = frozenset(
 )
 _CLONE_SUBS: frozenset[str] = frozenset({"dispatch", "rebase-onto-default"})
 _MERGE_ONLY: frozenset[str] = frozenset({"merge"})
+_CLOSE_STALE_ONLY: frozenset[str] = frozenset({"close-stale"})
 
 
 # ─── UNIVERSAL ────────────────────────────────────────────────────────────
@@ -556,5 +557,53 @@ class PrAuthorKnownInvariant(Invariant):
         if result == Classification.UNKNOWN:
             return Fail(
                 f"classifier returned UNKNOWN for {ctx.pr.author!r}"
+            )
+        return Pass()
+
+
+# ─── PER_PR (close-stale-only) ────────────────────────────────────────────
+
+
+@register
+class PrInactiveInvariant(Invariant):
+    """Pass unless the PR was touched too recently to plausibly be a
+    close-stale candidate.
+
+    Threshold is ``stale_cooloff_days``, NOT ``stale_age_days``. Reason:
+    after gitbulk posts its own stale-warning comment, GitHub bumps
+    ``updated_at`` to the comment time. If this invariant used
+    ``stale_age_days`` (e.g. 60), a warned PR in its 7-day cooloff
+    window would now appear "active" (updated 7 days ago, threshold 60),
+    skip the chain, and never close. Using ``stale_cooloff_days``
+    catches both the first-pass stale PRs and the warned-in-cooloff
+    PRs, with the handler refining via ``stale_age_days`` for warn
+    decisions specifically.
+
+    A repo with effective ``stale_policy == "never"`` is Skipped
+    regardless of inactivity (the per-repo opt-out).
+
+    The two-phase warn-then-close decision happens in the close-stale
+    handler, not here.
+    """
+
+    name = "pr.inactive"
+    kind = InvariantKind.PER_PR
+    subcommands = _CLOSE_STALE_ONLY
+
+    def check(self, ctx: InvariantContext) -> Result:
+        if ctx.pr is None or ctx.repo is None:
+            return Fail("per-PR invariant called without ctx.pr/ctx.repo")
+        effective = policy_for(ctx.policy, ctx.repo.slug)
+        if effective.stale_policy == "never":
+            return Skip(
+                f"stale_policy=never for {ctx.repo.slug!r}; "
+                "close-stale will not consider this repo's PRs"
+            )
+        threshold_days = effective.stale_cooloff_days
+        age = _utc_now() - ctx.pr.updated_at
+        if age.days < threshold_days:
+            return Skip(
+                f"PR active within stale_cooloff_days={threshold_days} "
+                f"(updated {age.days} days ago)"
             )
         return Pass()

@@ -145,6 +145,7 @@ def test_subcommand_has_invariant_chain_default_empty():
                 "github.reachable",
                 "pr.base_is_default",
                 "pr.author_known",
+                "pr.inactive",
             ),
         ),
         (

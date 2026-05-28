@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping, Protocol, runtime_checkable
 
-from gitbulk.pr_info import PRInfo, TimelineEvent
+from gitbulk.pr_info import PRComment, PRInfo, TimelineEvent
 
 
 @runtime_checkable
@@ -123,6 +123,56 @@ class GHClient(Protocol):
         """
         ...
 
+    def fetch_pr_comments(
+        self,
+        slug: str,
+        number: int,
+        *,
+        timeout: float | None = None,
+    ) -> list[PRComment]:
+        """Return the PR's issue-comments (oldest first).
+
+        Read-only. Used by ``close-stale`` to find prior gitbulk warning
+        markers without paying the cost on every subcommand: the comment
+        slice is NOT part of :func:`my_open_prs`. Walks the last 50
+        comments via GraphQL.
+        """
+        ...
+
+    def post_comment(
+        self,
+        slug: str,
+        number: int,
+        body: str,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Post an issue-comment on the PR via ``gh pr comment``.
+
+        Mutating method used by ``close-stale --apply`` to drop the
+        stale-warning comment. Body should include the gitbulk marker
+        (HTML comment ``<!-- gitbulk: stale-warning v1 -->``) so future
+        runs can find it via :meth:`fetch_pr_comments`.
+        """
+        ...
+
+    def close_pr(
+        self,
+        slug: str,
+        number: int,
+        *,
+        delete_branch: bool = False,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Close the PR via ``gh pr close``.
+
+        Mutating method used by ``close-stale --apply``. ``delete_branch``
+        defaults to False (the stale-close path keeps the branch so the
+        author can revisit and reopen — per the design decision recorded
+        in this.i; contrast with merge_pr which defaults True).
+        """
+        ...
+
 
 class GHError(RuntimeError):
     """Raised when a gh invocation fails in a way the caller is expected
@@ -178,6 +228,13 @@ class FakeGHClient:
         merge_responses: Mapping[
             tuple[str, int], "dict[str, Any] | Exception"
         ] | None = None,
+        pr_comments: Mapping[tuple[str, int], list[PRComment]] | None = None,
+        post_comment_responses: Mapping[
+            tuple[str, int], "dict[str, Any] | Exception"
+        ] | None = None,
+        close_responses: Mapping[
+            tuple[str, int], "dict[str, Any] | Exception"
+        ] | None = None,
     ) -> None:
         self._user = user
         self._org_members = dict(org_members) if org_members is not None else None
@@ -192,9 +249,24 @@ class FakeGHClient:
         self._merge_responses = (
             dict(merge_responses) if merge_responses is not None else None
         )
+        self._pr_comments = (
+            {k: list(v) for k, v in pr_comments.items()}
+            if pr_comments is not None
+            else None
+        )
+        self._post_comment_responses = (
+            dict(post_comment_responses)
+            if post_comment_responses is not None
+            else None
+        )
+        self._close_responses = (
+            dict(close_responses) if close_responses is not None else None
+        )
         # Per-call argument records so tests can assert merge_pr was
         # invoked with the right method / delete_branch flags.
         self.merge_calls: list[dict[str, Any]] = []
+        self.post_comment_calls: list[dict[str, Any]] = []
+        self.close_calls: list[dict[str, Any]] = []
         # Track call counts so tests can assert on coalescing
         self.call_count: dict[str, int] = {
             "authenticated_user": 0,
@@ -202,6 +274,9 @@ class FakeGHClient:
             "default_branch": 0,
             "my_open_prs": 0,
             "merge_pr": 0,
+            "fetch_pr_comments": 0,
+            "post_comment": 0,
+            "close_pr": 0,
         }
 
     def authenticated_user(self, *, timeout: float | None = None) -> dict[str, Any]:
@@ -272,6 +347,85 @@ class FakeGHClient:
                 f"FakeGHClient: merge_pr({slug!r}, {number}) not configured"
             )
         outcome = self._merge_responses[key]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return dict(outcome)
+
+    def fetch_pr_comments(
+        self,
+        slug: str,
+        number: int,
+        *,
+        timeout: float | None = None,
+    ) -> list[PRComment]:
+        self.call_count["fetch_pr_comments"] += 1
+        if self._pr_comments is None:
+            raise GHError(
+                f"FakeGHClient: fetch_pr_comments({slug!r}, {number}) not configured"
+            )
+        # Missing keys default to empty list — distinct from "not configured"
+        # at all (which is the bare-FakeGHClient case). Lets a test set
+        # pr_comments={} to mean "no PR has any comments."
+        return list(self._pr_comments.get((slug, number), []))
+
+    def post_comment(
+        self,
+        slug: str,
+        number: int,
+        body: str,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        self.call_count["post_comment"] += 1
+        self.post_comment_calls.append(
+            {
+                "slug": slug,
+                "number": number,
+                "body": body,
+                "timeout": timeout,
+            }
+        )
+        if self._post_comment_responses is None:
+            raise GHError(
+                f"FakeGHClient: post_comment({slug!r}, {number}) not configured"
+            )
+        key = (slug, number)
+        if key not in self._post_comment_responses:
+            raise GHError(
+                f"FakeGHClient: post_comment({slug!r}, {number}) not configured"
+            )
+        outcome = self._post_comment_responses[key]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return dict(outcome)
+
+    def close_pr(
+        self,
+        slug: str,
+        number: int,
+        *,
+        delete_branch: bool = False,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        self.call_count["close_pr"] += 1
+        self.close_calls.append(
+            {
+                "slug": slug,
+                "number": number,
+                "delete_branch": delete_branch,
+                "timeout": timeout,
+            }
+        )
+        if self._close_responses is None:
+            raise GHError(
+                f"FakeGHClient: close_pr({slug!r}, {number}) not configured"
+            )
+        key = (slug, number)
+        if key not in self._close_responses:
+            raise GHError(
+                f"FakeGHClient: close_pr({slug!r}, {number}) not configured"
+            )
+        outcome = self._close_responses[key]
         if isinstance(outcome, Exception):
             raise outcome
         return dict(outcome)
@@ -612,6 +766,126 @@ class ProductionGHClient:
             return json.loads(stripped)
         except json.JSONDecodeError:
             return {"stdout": stripped}
+
+    def fetch_pr_comments(
+        self,
+        slug: str,
+        number: int,
+        *,
+        timeout: float | None = None,
+    ) -> list[PRComment]:
+        # verified non-deprecated against gh CLI 2026-05-28
+        owner, name = slug.split("/", 1)
+        stdout = self._run(
+            (
+                "api",
+                "graphql",
+                "-F",
+                f"owner={owner}",
+                "-F",
+                f"name={name}",
+                "-F",
+                f"number={number}",
+                "-f",
+                f"query={_PR_COMMENTS_GRAPHQL}",
+            ),
+            timeout=timeout,
+        )
+        payload = json.loads(stdout)
+        repo_obj = (payload.get("data") or {}).get("repository") or {}
+        pr_obj = repo_obj.get("pullRequest") or {}
+        comments_obj = pr_obj.get("comments") or {}
+        nodes = comments_obj.get("nodes") or []
+        out: list[PRComment] = []
+        for n in nodes:
+            if not n:
+                continue
+            author = (n.get("author") or {}).get("login") or ""
+            body = n.get("body") or ""
+            created = n.get("createdAt")
+            if not created:
+                continue
+            out.append(
+                PRComment(author_login=author, body=body, at=_parse_iso8601(created))
+            )
+        return out
+
+    def post_comment(
+        self,
+        slug: str,
+        number: int,
+        body: str,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        # verified non-deprecated against gh CLI 2026-05-28
+        # (`gh pr comment --help` shows -b/--body, no deprecation warnings)
+        stdout = self._run(
+            (
+                "pr",
+                "comment",
+                str(number),
+                "--repo",
+                slug,
+                "--body",
+                body,
+            ),
+            timeout=timeout,
+        )
+        stripped = stdout.strip()
+        if not stripped:
+            return {}
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            return {"stdout": stripped}
+
+    def close_pr(
+        self,
+        slug: str,
+        number: int,
+        *,
+        delete_branch: bool = False,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        # verified non-deprecated against gh CLI 2026-05-28
+        # (`gh pr close --help` shows --delete-branch, no deprecation warnings)
+        args: list[str] = [
+            "pr",
+            "close",
+            str(number),
+            "--repo",
+            slug,
+        ]
+        if delete_branch:
+            args.append("--delete-branch")
+        stdout = self._run(tuple(args), timeout=timeout)
+        stripped = stdout.strip()
+        if not stripped:
+            return {}
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            return {"stdout": stripped}
+
+
+#: GraphQL document used by :meth:`ProductionGHClient.fetch_pr_comments`.
+#: Returns the last 50 issue-comments on a PR (oldest first within the slice).
+_PR_COMMENTS_GRAPHQL = """\
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      comments(last: 50) {
+        nodes {
+          author { login }
+          body
+          createdAt
+        }
+      }
+    }
+  }
+}
+"""
 
 
 def _pr_info_from_graphql_node(node: dict[str, Any]) -> PRInfo:

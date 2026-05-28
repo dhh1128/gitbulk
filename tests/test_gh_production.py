@@ -958,6 +958,197 @@ def test_merge_pr_respects_timeout_kwarg():
     assert kwargs["timeout"] == 7.5
 
 
+# ─── fetch_pr_comments ─────────────────────────────────────────────────────
+
+
+_PR_COMMENTS_FIXTURE = {
+    "data": {
+        "repository": {
+            "pullRequest": {
+                "comments": {
+                    "nodes": [
+                        {
+                            "author": {"login": "alice"},
+                            "body": "early review note",
+                            "createdAt": "2026-05-20T12:00:00Z",
+                        },
+                        {
+                            "author": {"login": "gitbulk-bot"},
+                            "body": "stale heads-up <!-- gitbulk: stale-warning v1 -->",
+                            "createdAt": "2026-05-25T08:00:00Z",
+                        },
+                    ]
+                }
+            }
+        }
+    }
+}
+
+
+def test_fetch_pr_comments_argv_and_parse():
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps(_PR_COMMENTS_FIXTURE))
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        result = client.fetch_pr_comments("dhh1128/gitbulk", 42)
+
+    assert len(result) == 2
+    assert result[0].author_login == "alice"
+    assert result[1].body.startswith("stale heads-up")
+    assert result[1].at == datetime(2026, 5, 25, 8, 0, 0, tzinfo=timezone.utc)
+    args, _ = mock_run.call_args
+    argv = args[0]
+    assert argv[0:3] == ["gh", "api", "graphql"]
+    # Verify the three -F vars
+    f_indices = [i for i, a in enumerate(argv) if a == "-F"]
+    f_values = {argv[i + 1] for i in f_indices}
+    assert "owner=dhh1128" in f_values
+    assert "name=gitbulk" in f_values
+    assert "number=42" in f_values
+
+
+def test_fetch_pr_comments_empty_when_no_pr():
+    """Missing pullRequest node → empty list (defensive)."""
+    payload = {"data": {"repository": {"pullRequest": None}}}
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        assert client.fetch_pr_comments("a/b", 1) == []
+
+
+def test_fetch_pr_comments_skips_null_node_and_no_createdat():
+    payload = {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "comments": {
+                        "nodes": [
+                            None,
+                            {
+                                "author": {"login": "bob"},
+                                "body": "hi",
+                                # createdAt missing
+                            },
+                            {
+                                "author": None,
+                                "body": "anon comment",
+                                "createdAt": "2026-05-20T12:00:00Z",
+                            },
+                        ]
+                    }
+                }
+            }
+        }
+    }
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        result = client.fetch_pr_comments("a/b", 1)
+    # Null and missing-createdAt are dropped; null-author becomes "".
+    assert len(result) == 1
+    assert result[0].author_login == ""
+    assert result[0].body == "anon comment"
+
+
+def test_fetch_pr_comments_handles_empty_data():
+    """When gh returns {} (no data key)."""
+    side_effect = _make_run_mock(_CompletedFake(0, stdout="{}"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        assert client.fetch_pr_comments("a/b", 1) == []
+
+
+# ─── post_comment ──────────────────────────────────────────────────────────
+
+
+def test_post_comment_argv():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=""))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        result = client.post_comment("dhh1128/gitbulk", 42, "hello world")
+    assert result == {}
+    args, _ = mock_run.call_args
+    assert args[0] == [
+        "gh",
+        "pr",
+        "comment",
+        "42",
+        "--repo",
+        "dhh1128/gitbulk",
+        "--body",
+        "hello world",
+    ]
+
+
+def test_post_comment_parses_json_when_provided():
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout='{"url":"https://github.com/x/y/issues/1#c"}')
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        result = client.post_comment("a/b", 1, "x")
+    assert result == {"url": "https://github.com/x/y/issues/1#c"}
+
+
+def test_post_comment_returns_stdout_on_unparseable():
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout="https://github.com/a/b/issues/1\n")
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        result = client.post_comment("a/b", 1, "x")
+    assert "stdout" in result
+
+
+# ─── close_pr ──────────────────────────────────────────────────────────────
+
+
+def test_close_pr_argv_default_no_delete_branch():
+    """Stale-close keeps the branch per design (warn-and-close decision)."""
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=""))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        result = client.close_pr("dhh1128/gitbulk", 42)
+    assert result == {}
+    args, _ = mock_run.call_args
+    assert args[0] == [
+        "gh",
+        "pr",
+        "close",
+        "42",
+        "--repo",
+        "dhh1128/gitbulk",
+    ]
+
+
+def test_close_pr_argv_with_delete_branch():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=""))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.close_pr("a/b", 1, delete_branch=True)
+    args, _ = mock_run.call_args
+    assert "--delete-branch" in args[0]
+
+
+def test_close_pr_parses_json_when_provided():
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout='{"state":"CLOSED"}')
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        result = client.close_pr("a/b", 1)
+    assert result == {"state": "CLOSED"}
+
+
+def test_close_pr_returns_stdout_on_unparseable():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout="closed!\n"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        result = client.close_pr("a/b", 1)
+    assert "stdout" in result
+
+
 # ─── stateless guarantee ───────────────────────────────────────────────────
 
 

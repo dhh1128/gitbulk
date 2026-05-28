@@ -251,6 +251,107 @@ def test_merge_pr_increments_counter_even_on_failure():
     assert fake.call_count["merge_pr"] == 1
 
 
+# ─── FakeGHClient.fetch_pr_comments ────────────────────────────────────────
+
+
+def test_fetch_pr_comments_returns_configured_list():
+    from datetime import datetime, timezone
+
+    from gitbulk.pr_info import PRComment
+
+    c = PRComment(
+        author_login="alice",
+        body="hello",
+        at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+    )
+    fake = FakeGHClient(pr_comments={("a/b", 1): [c]})
+    result = fake.fetch_pr_comments("a/b", 1)
+    assert result == [c]
+    assert fake.call_count["fetch_pr_comments"] == 1
+
+
+def test_fetch_pr_comments_unknown_pr_returns_empty():
+    """Distinct from 'not configured at all': empty default means we set
+    pr_comments but this specific PR has no comments."""
+    fake = FakeGHClient(pr_comments={})
+    assert fake.fetch_pr_comments("a/b", 1) == []
+
+
+def test_fetch_pr_comments_raises_when_unconfigured():
+    fake = FakeGHClient()
+    with pytest.raises(GHError, match="fetch_pr_comments"):
+        fake.fetch_pr_comments("a/b", 1)
+
+
+# ─── FakeGHClient.post_comment ─────────────────────────────────────────────
+
+
+def test_post_comment_records_call_and_returns_response():
+    fake = FakeGHClient(
+        post_comment_responses={("a/b", 1): {"url": "https://github.com/..."}}
+    )
+    result = fake.post_comment("a/b", 1, "hello world")
+    assert result == {"url": "https://github.com/..."}
+    assert fake.call_count["post_comment"] == 1
+    assert fake.post_comment_calls[0]["slug"] == "a/b"
+    assert fake.post_comment_calls[0]["number"] == 1
+    assert fake.post_comment_calls[0]["body"] == "hello world"
+
+
+def test_post_comment_raises_when_unconfigured():
+    fake = FakeGHClient()
+    with pytest.raises(GHError, match="post_comment"):
+        fake.post_comment("a/b", 1, "x")
+
+
+def test_post_comment_raises_when_pair_unknown():
+    fake = FakeGHClient(post_comment_responses={("x/y", 1): {}})
+    with pytest.raises(GHError, match="post_comment"):
+        fake.post_comment("other/repo", 9, "x")
+
+
+def test_post_comment_raises_configured_exception():
+    fake = FakeGHClient(
+        post_comment_responses={("a/b", 1): GHError("rate limited")}
+    )
+    with pytest.raises(GHError, match="rate limited"):
+        fake.post_comment("a/b", 1, "x")
+
+
+# ─── FakeGHClient.close_pr ─────────────────────────────────────────────────
+
+
+def test_close_pr_records_call():
+    fake = FakeGHClient(close_responses={("a/b", 1): {}})
+    fake.close_pr("a/b", 1)
+    assert fake.call_count["close_pr"] == 1
+    assert fake.close_calls[0]["delete_branch"] is False
+
+
+def test_close_pr_passes_delete_branch_flag():
+    fake = FakeGHClient(close_responses={("a/b", 1): {}})
+    fake.close_pr("a/b", 1, delete_branch=True)
+    assert fake.close_calls[0]["delete_branch"] is True
+
+
+def test_close_pr_raises_when_unconfigured():
+    fake = FakeGHClient()
+    with pytest.raises(GHError, match="close_pr"):
+        fake.close_pr("a/b", 1)
+
+
+def test_close_pr_raises_when_pair_unknown():
+    fake = FakeGHClient(close_responses={("x/y", 1): {}})
+    with pytest.raises(GHError, match="close_pr"):
+        fake.close_pr("other/repo", 9)
+
+
+def test_close_pr_raises_configured_exception():
+    fake = FakeGHClient(close_responses={("a/b", 1): GHError("nope")})
+    with pytest.raises(GHError, match="nope"):
+        fake.close_pr("a/b", 1)
+
+
 # ─── Exception hierarchy ───────────────────────────────────────────────────
 
 

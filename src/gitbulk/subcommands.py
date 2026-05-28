@@ -61,6 +61,20 @@ _MERGE_CHAIN: tuple[str, ...] = (
     "pr.age_threshold",
 )
 
+# Phase 6+ chain for ``close-stale``. Layers the close-stale-only
+# ``pr.inactive`` invariant onto the gh-touching baseline. The two-phase
+# warn-then-close decision lives in the handler (post-chain), not in the
+# invariant chain — chains are gates, not action selectors.
+_CLOSE_STALE_CHAIN: tuple[str, ...] = (
+    "gh.authenticated",
+    "config.parseable",
+    "org.members.fresh",
+    "github.reachable",
+    "pr.base_is_default",
+    "pr.author_known",
+    "pr.inactive",
+)
+
 
 @dataclass(frozen=True)
 class Subcommand:
@@ -130,7 +144,7 @@ KNOWN: tuple[Subcommand, ...] = (
         mutating=True,
         lock_mode="exclusive",
         needs_clone=False,
-        invariant_chain=_GH_TOUCHING_CHAIN,
+        invariant_chain=_CLOSE_STALE_CHAIN,
     ),
     Subcommand(
         name="show",

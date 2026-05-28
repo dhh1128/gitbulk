@@ -46,6 +46,7 @@ from gitbulk.invariants.catalog import (
     PrApprovedPerPolicyInvariant,
     PrAuthorKnownInvariant,
     PrBaseIsDefaultInvariant,
+    PrInactiveInvariant,
     PrMergeableStateCleanInvariant,
     PrNoUnresolvedThreadsInvariant,
     PrRequiredChecksGreenInvariant,
@@ -166,6 +167,7 @@ def test_all_phase2_invariants_registered():
         "pr.approved_per_policy",
         "pr.no_unresolved_threads",
         "pr.age_threshold",
+        "pr.inactive",
     }
     registered = set(all_invariants().keys())
     missing = expected - registered
@@ -1090,3 +1092,103 @@ def test_utc_now_helper_returns_aware_datetime():
     """The clock indirection used by pr.age_threshold."""
     now = catalog._utc_now()
     assert now.tzinfo is not None
+
+
+# ─── pr.inactive (close-stale-only) ───────────────────────────────────────
+
+
+def test_pr_inactive_pass_when_past_cooloff_threshold(monkeypatch, runstate, repo):
+    """A PR untouched past stale_cooloff_days is a close-stale candidate.
+
+    Threshold is stale_cooloff_days (NOT stale_age_days) so that warned
+    PRs in their cooloff window — whose updated_at is anchored at the
+    warning timestamp — still pass this gate and reach the handler. The
+    handler enforces stale_age_days for the warn decision specifically.
+    """
+    policy = Policy(defaults=Defaults(stale_cooloff_days=7))
+    pr = _real_pr()
+    old = datetime.now(timezone.utc) - timedelta(days=10)
+    pr = PRInfo(**{**pr.__dict__, "updated_at": old})
+    ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
+    _freeze_now(monkeypatch, datetime.now(timezone.utc))
+    assert PrInactiveInvariant().check(ctx) == Pass()
+
+
+def test_pr_inactive_skip_when_within_cooloff(monkeypatch, runstate, repo):
+    """An active PR (updated within stale_cooloff_days) is Skipped."""
+    policy = Policy(defaults=Defaults(stale_cooloff_days=7))
+    recent = datetime.now(timezone.utc) - timedelta(days=3)
+    pr = _real_pr()
+    pr = PRInfo(**{**pr.__dict__, "updated_at": recent})
+    ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
+    _freeze_now(monkeypatch, datetime.now(timezone.utc))
+    result = PrInactiveInvariant().check(ctx)
+    assert isinstance(result, Skip)
+    assert "3 days ago" in result.reason
+
+
+def test_pr_inactive_skip_when_stale_policy_never(monkeypatch, runstate, repo):
+    """stale_policy=never opts the repo out entirely, even if inactive."""
+    policy = Policy(
+        defaults=Defaults(stale_age_days=60, stale_policy="never"),
+    )
+    old = datetime.now(timezone.utc) - timedelta(days=100)
+    pr = _real_pr()
+    pr = PRInfo(**{**pr.__dict__, "updated_at": old})
+    ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
+    _freeze_now(monkeypatch, datetime.now(timezone.utc))
+    result = PrInactiveInvariant().check(ctx)
+    assert isinstance(result, Skip)
+    assert "never" in result.reason
+
+
+def test_pr_inactive_per_repo_never_override(monkeypatch, runstate, repo):
+    """Per-repo stale_policy=never beats defaults.stale_policy."""
+    policy = Policy(
+        defaults=Defaults(stale_age_days=60, stale_policy="warn-and-close"),
+        repos={"dhh1128/gitbulk": RepoOverride(stale_policy="never")},
+    )
+    old = datetime.now(timezone.utc) - timedelta(days=100)
+    pr = _real_pr()
+    pr = PRInfo(**{**pr.__dict__, "updated_at": old})
+    ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
+    _freeze_now(monkeypatch, datetime.now(timezone.utc))
+    result = PrInactiveInvariant().check(ctx)
+    assert isinstance(result, Skip)
+
+
+def test_pr_inactive_warn_only_still_passes_inactive_gate(
+    monkeypatch, runstate, repo
+):
+    """warn-only doesn't disable close-stale processing — only ``never`` does.
+    The handler treats warn-only by suppressing the close action, but the
+    invariant still passes so the warn pathway can run.
+    """
+    policy = Policy(
+        defaults=Defaults(stale_cooloff_days=7, stale_policy="warn-only"),
+    )
+    old = datetime.now(timezone.utc) - timedelta(days=100)
+    pr = _real_pr()
+    pr = PRInfo(**{**pr.__dict__, "updated_at": old})
+    ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
+    _freeze_now(monkeypatch, datetime.now(timezone.utc))
+    assert PrInactiveInvariant().check(ctx) == Pass()
+
+
+def test_pr_inactive_fail_no_pr(runstate, repo):
+    ctx = _ctx(runstate, repo=repo, pr=None)
+    result = PrInactiveInvariant().check(ctx)
+    assert isinstance(result, Fail)
+
+
+def test_pr_inactive_fail_no_repo(runstate):
+    pr = _real_pr()
+    ctx = _ctx(runstate, repo=None, pr=pr)
+    result = PrInactiveInvariant().check(ctx)
+    assert isinstance(result, Fail)
+
+
+def test_pr_inactive_is_close_stale_only():
+    inv = PrInactiveInvariant()
+    assert inv.subcommands == frozenset({"close-stale"})
+    assert inv.kind == InvariantKind.PER_PR

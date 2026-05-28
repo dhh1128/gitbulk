@@ -12,6 +12,7 @@ defaults:
   bot_threads_block: true        # if true, unresolved bot threads also block "ready"
   stale_age_days: 60             # close-stale: inactivity threshold
   stale_cooloff_days: 7          # close-stale: must have been warned at least this long ago
+  stale_policy: warn-and-close   # warn-and-close | warn-only | never
   # skip_checks: []              # invariants suppressed for every repo
   # extra_checks: []             # extra invariants enabled for every repo
 

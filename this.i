@@ -372,6 +372,109 @@ Gitbulk Triage Tool = goal:
         failure mode — the user is more likely to forget to resolve their
         own threads than to forget the repo's burden setting.
 
+    # ─── CLOSE-STALE BEHAVIOR ───────────────────────────────────────────────
+
+    Any Activity Resets Stale Clock = decision:
+      id: 2aefqte7
+      why: >
+        For close-stale, the "is this PR inactive enough to consider"
+        check uses GitHub's ``updatedAt`` field, which advances on ANY
+        timeline event — push, comment, review, label change, base
+        change — by any actor (human or bot). This is the simpler of
+        the two semantics considered. Rejected "human activity only"
+        (would require classifying every actor and walking timeline
+        nodes for each PR, expensive); rejected "push only" (would
+        close PRs that are alive in active human discussion).
+        Tradeoff accepted: a PR with a chatty Dependabot might never
+        go stale even though no human is doing anything; if this hurts
+        the user can set bot logins to humans.exceptions to push them
+        out of being treated as activity-relevant — but in practice
+        the cost of an under-closed PR (it sits there) is much less
+        than the cost of an over-closed PR (it loses work-in-progress).
+
+        Side effect that drives a separate decision (e4yuzip6): when
+        gitbulk posts its own stale-warning comment, that also bumps
+        updatedAt, so the warning would re-extend the stale window by
+        itself unless the close-stale logic compensates. See the
+        marker-comment pattern.
+      approved-by: daniel, 2026-05-28
+
+    Stale Warning Marker Comment = decision:
+      id: e4yuzip6
+      why: >
+        Persistent state for "we already warned this PR" is encoded in
+        the PR's own comments via an HTML-comment marker
+        (``<!-- gitbulk: stale-warning v1 -->``). On each close-stale
+        run, fetch the PR's last 50 comments via GraphQL, look for the
+        marker, and use the comment's createdAt as the
+        warning-timestamp anchor for the cooloff check.
+
+        Rejected: a separate local cache file
+        (~/.cache/gitbulk/stale-warnings.yaml) tracking which PRs were
+        warned and when. Reasons: (1) drifts when the user moves
+        machines (cron host vs laptop); (2) drifts when GitHub
+        notifications carry the warning to the PR author but the cache
+        record disappears; (3) the warning comment itself is
+        load-bearing — if it's deleted from GitHub, the cooloff
+        SHOULD restart, which the marker-comment pattern naturally
+        encodes (no marker = no prior warning = start over).
+
+        Side effect (2aefqte7): the marker comment bumps updatedAt.
+        ``pr.inactive`` uses ``stale_cooloff_days`` (not
+        ``stale_age_days``) as its threshold so warned-in-cooloff PRs
+        still pass the gate; the handler enforces ``stale_age_days``
+        only for the WARN decision specifically. See
+        ``commands/close_stale.py:_decide_action`` for the matrix.
+
+        Marker versioning: ``v1`` lets a future warning-text revision
+        be detected (handler can match both v1 and v2 during a
+        transition, or refuse v0 if format changes incompatibly).
+      approved-by: daniel, 2026-05-28
+
+    Stale Policy Per-Repo Knob = decision:
+      id: esizf2qp
+      why: >
+        ``defaults.stale_policy`` (and per-repo
+        ``repos.<slug>.stale_policy``) takes one of three values:
+
+          - ``warn-and-close`` (default): post stale-warning comment,
+            wait ``stale_cooloff_days``, close. The standard path.
+          - ``warn-only``: post the warning but never close. Useful
+            while tuning thresholds on a new repo before committing to
+            close behavior, or for repos where the user wants the
+            heads-up but doesn't trust autoclose.
+          - ``never``: skip close-stale entirely for this repo.
+
+        Parallel to the existing ``merge_policy: strict | ci-only |
+        never`` shape — same naming pattern, same per-repo override
+        mechanism, same "never" as the off-switch. Rejected reusing
+        ``merge_policy: never`` for both: a repo might want manual
+        merges only AND auto-close stale PRs, or vice versa. They are
+        unrelated decisions, so they get unrelated knobs.
+
+        Per-repo opt-out is the load-bearing case (one repo I don't
+        want autoclosed without bothering with thresholds). The
+        warn-only middle case is cheap to support and useful during
+        rollout.
+      approved-by: daniel, 2026-05-28
+
+    Keep Branch On Stale Close = decision:
+      id: 45njfyds
+      why: >
+        ``gh.close_pr`` defaults to ``delete_branch=False``, in
+        contrast to ``gh.merge_pr`` which defaults to ``True``.
+        Reason: a stale-closed PR is often abandoned-but-recoverable
+        — the author may want to revisit, fix the rebase, and reopen.
+        Deleting the branch would force a re-push from local. GitHub
+        branch storage is essentially free; the reversibility wins.
+
+        Per the close-stale design interview, the alternative ("delete
+        the branch too") and the per-repo-configurable middle ground
+        were both considered and rejected for v1. If the asymmetry
+        with merge_pr becomes irritating, add a ``stale_delete_branch``
+        boolean knob then.
+      approved-by: daniel, 2026-05-28
+
     # ─── WORKTREE & LOCAL CLONE HANDLING ─────────────────────────────────────
 
     Worktree Root Under XDG Cache = decision:
