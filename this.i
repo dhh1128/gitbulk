@@ -280,6 +280,48 @@ Gitbulk Triage Tool = goal:
         elaborate.
       approved-by: daniel, 2026-05-28
 
+    Watchdog Ack On First Clean Observation = decision:
+      id: yhwagcvw
+      why: >
+        Once the post-merge watchdog observes a merge commit in a
+        "clean and complete" state — every check_run has status =
+        ``completed`` AND every conclusion is in {success, skipped,
+        neutral} — gitbulk persists an ack record at
+        ``~/.cache/gitbulk/watchdog-acked.yaml`` and skips that
+        (slug, sha) on all subsequent ``gitbulk report`` runs.
+
+        Why: the prior design re-fetched check_runs for every merge
+        on every nightly report, repeatedly re-confirming the same
+        green state. That's noise without value — once green stays
+        green, GitHub doesn't asynchronously turn it red.
+
+        The "all completed" gate matters. Without it, a 5-minute-post-
+        merge report could ack a commit whose test workflow has
+        finished but whose cd workflow hasn't started yet, missing the
+        delayed cd failure entirely. ``_is_ackable`` returns False as
+        long as anything is still ``in_progress``/``queued``, so the
+        watchdog keeps watching until every workflow has reported.
+
+        Conservative on unknown conclusions: a completed check with
+        ``conclusion=None`` or a future-GitHub-value we don't recognize
+        does NOT count as passing. Better to keep watching than to ack
+        uncertainty.
+
+        Tradeoff accepted: a delayed/scheduled check_run (a weekly
+        Dependabot scan that fires hours later on the same SHA) could
+        appear post-ack and fail. The watchdog would not catch it
+        because the ack is permanent. That's not really a "this merge
+        broke CD" failure — it's a separate concern that GitHub's own
+        notifications cover. Rejected alternative: re-fetch even
+        ack'd commits to catch this case → re-introduces the original
+        noise problem the ack was designed to solve.
+
+        Retention: ack entries are pruned at write time if older than
+        7 days, purely housekeeping since the 24h scan window in
+        ``_check_recent_merges`` already filters older merges from
+        even being candidates.
+      approved-by: daniel, 2026-05-28
+
     Post-Merge CD Watchdog = decision:
       id: aazqlwc3
       why: >

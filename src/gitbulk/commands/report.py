@@ -55,6 +55,7 @@ from gitbulk.locks import LockTimeoutError, global_lock
 from gitbulk.org_members_cache import refresh_cache
 from gitbulk.pr_info import CheckRun, PRInfo
 from gitbulk.runstate import RunState
+from gitbulk.watchdog_ack import load_acked, record_ack
 from gitbulk import subcommands as subcommands_mod
 
 #: Check-run conclusions that count as failures the user should see.
@@ -64,6 +65,13 @@ from gitbulk import subcommands as subcommands_mod
 #: yet — surface separately as "still running" if at all.
 _FAILURE_CONCLUSIONS: frozenset[str] = frozenset(
     {"failure", "cancelled", "timed_out", "action_required", "stale"}
+)
+
+#: Check-run conclusions that count as "green" for the ack cache. A
+#: merge is acked-and-forgotten only when every check is completed AND
+#: every conclusion is in this set.
+_PASSING_CONCLUSIONS: frozenset[str] = frozenset(
+    {"success", "skipped", "neutral"}
 )
 
 #: Window for the post-merge watchdog: how far back to scan run-state.
@@ -325,22 +333,50 @@ def _scan_recent_merges(now: datetime) -> list[dict]:
     return merges
 
 
+def _is_ackable(check_runs: list[CheckRun]) -> bool:
+    """True iff every check-run is completed AND in a passing conclusion.
+
+    Empty check-runs list returns True — a repo with no CI has nothing
+    to wait on. ``status != completed`` (anything still queued or in
+    progress) keeps the watchdog watching. A non-passing conclusion
+    (failure, cancelled, timed_out, action_required, stale, or even an
+    unrecognized future value) keeps the watchdog watching too — we
+    refuse to ack uncertainty.
+    """
+    for c in check_runs:
+        if c.status != "completed":
+            return False
+        if c.conclusion not in _PASSING_CONCLUSIONS:
+            return False
+    return True
+
+
 def _check_recent_merges(
     gh: GHClient,
     rs: RunState,
     now: datetime,
 ) -> tuple[list[dict], bool]:
-    """For each recent merge, fetch its check-runs and classify.
+    """For each recent merge not already ack'd, fetch its check-runs
+    and classify.
 
-    Returns ``(records, any_failure)`` where each record is the merge
-    metadata + ``check_runs: list[CheckRun]`` + ``has_failure: bool``.
-    A check-runs fetch failure is recorded as a WARNING on ``rs`` and
-    the record carries ``error: <message>`` instead of check_runs;
-    it does NOT count toward ``any_failure`` because we don't know.
+    Returns ``(records, any_failure)``. Each record describes one
+    still-watched merge; acked merges are skipped entirely and do not
+    appear in the returned records. A check-runs fetch failure is
+    recorded as a WARNING on ``rs`` and the record carries
+    ``error: <message>`` instead of check_runs; it does NOT count
+    toward ``any_failure`` because we don't know.
+
+    Ack-on-clean (this.i node ``yhwagcvw``): when ``_is_ackable``
+    returns True, persist the (slug, sha) pair via
+    :func:`gitbulk.watchdog_ack.record_ack` so future reports skip it.
     """
+    acked = load_acked()
     records: list[dict] = []
     any_failure = False
     for m in _scan_recent_merges(now):
+        key = (m["slug"], m["merge_commit_sha"])
+        if key in acked:
+            continue
         try:
             check_runs = gh.fetch_check_runs(m["slug"], m["merge_commit_sha"])
         except GHError as e:
@@ -359,6 +395,15 @@ def _check_recent_merges(
         has_failure = bool(failures)
         if has_failure:
             any_failure = True
+        else:
+            # No failures: maybe ackable. Only ack when all checks are
+            # completed (no in_progress remaining) so we don't ack early
+            # before async workflows like cd.yml have started.
+            if _is_ackable(check_runs):
+                record_ack(m["slug"], m["merge_commit_sha"], now)
+                # Acked-this-run: don't surface in the report either —
+                # it would just be noise saying "watched-then-cleared."
+                continue
         records.append(
             {
                 **m,

@@ -1098,10 +1098,14 @@ def test_report_watchdog_surfaces_check_failures(
     assert "FAILING checks: deploy" in summary
 
 
-def test_report_watchdog_clean_checks_no_attention(
+def test_report_watchdog_all_clean_merge_is_acked_and_dropped(
     monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
 ):
-    """All check-runs green → 'checks OK' shown, no extra ATTENTION."""
+    """All check-runs completed + green → merge is ack'd permanently
+    and does NOT appear in the Recent merges section. Subsequent
+    reports skip the merge entirely (no gh.fetch_check_runs call)."""
+    from gitbulk.watchdog_ack import load_acked
+
     write_config(repos_slugs=["dhh1128/alpha"])
     fresh_org_cache("provenant-dev", ["dhh1128"])
     merge_sha = "e" * 40
@@ -1145,7 +1149,112 @@ def test_report_watchdog_clean_checks_no_attention(
     rc = report_handler(_make_args(code_root=code_root))
     assert rc == EXIT_OK
     summary = (paths.latest_run_symlink("report").resolve() / "summary.md").read_text()
-    assert "checks OK" in summary
+    # Acked merges drop out of the section entirely.
+    assert "Recent merges" not in summary
+    # Ack cache now contains this pair → future report runs will skip
+    # the fetch_check_runs call for this (slug, sha).
+    assert ("dhh1128/alpha", merge_sha) in load_acked()
+    # Verify the skip path directly via _check_recent_merges. Use a
+    # stub RunState (only ``record_error`` would be called, only in the
+    # gh-error path which we don't hit when the entry is acked).
+    from types import SimpleNamespace
+    from gitbulk.commands.report import _check_recent_merges
+    rs2 = SimpleNamespace(record_error=lambda *a, **k: None)
+    records, any_failure = _check_recent_merges(
+        fake, rs2, datetime.now(timezone.utc)
+    )
+    assert records == []
+    assert any_failure is False
+    # fetch_check_runs total stays at 1 (the report_handler call); the
+    # direct _check_recent_merges call hit the cache.
+    assert fake.call_count["fetch_check_runs"] == 1
+
+
+def test_is_ackable_rejects_completed_with_unknown_conclusion():
+    """A completed check with a non-passing, non-failing conclusion
+    (or None) prevents ack — we refuse to ack uncertainty."""
+    from gitbulk.commands.report import _is_ackable
+    from gitbulk.pr_info import CheckRun
+
+    # status=completed, conclusion=None (defensive: shouldn't normally
+    # happen per GitHub docs, but tolerate it).
+    cr = CheckRun(
+        name="weird",
+        status="completed",
+        conclusion=None,
+        details_url="u",
+        completed_at=None,
+    )
+    assert _is_ackable([cr]) is False
+
+
+def test_is_ackable_returns_true_on_empty_list():
+    """A merge with no check-runs at all is trivially ackable (no CI
+    to wait on)."""
+    from gitbulk.commands.report import _is_ackable
+    assert _is_ackable([]) is True
+
+
+def test_report_watchdog_in_progress_check_not_acked(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """A check that's still running (status=in_progress) prevents ack
+    even if no failures are visible yet. Surfaces as an active record."""
+    from gitbulk.watchdog_ack import load_acked
+
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    merge_sha = "c" * 40
+    _write_merge_run(
+        isolated_xdg=isolated_xdg,
+        timestamp=_now_str(),
+        repos_payload={
+            "dhh1128/alpha": {
+                "pr_count": 1,
+                "prs": [
+                    {
+                        "number": 9,
+                        "title": "deploy still running",
+                        "url": "u",
+                        "merge_commit_sha": merge_sha,
+                    }
+                ],
+            }
+        },
+    )
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+        check_runs={
+            ("dhh1128/alpha", merge_sha): [
+                CheckRun(
+                    name="test",
+                    status="completed",
+                    conclusion="success",
+                    details_url="u",
+                    completed_at=None,
+                ),
+                CheckRun(
+                    name="cd",
+                    status="in_progress",
+                    conclusion=None,
+                    details_url="u",
+                    completed_at=None,
+                ),
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+    rc = report_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_OK
+    summary = (paths.latest_run_symlink("report").resolve() / "summary.md").read_text()
+    # Still listed because we haven't ack'd it yet.
+    assert "Recent merges" in summary
+    assert ("dhh1128/alpha", merge_sha) not in load_acked()
 
 
 def test_report_watchdog_handles_fetch_error(
