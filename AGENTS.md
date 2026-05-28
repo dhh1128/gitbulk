@@ -109,6 +109,10 @@ applies here. Use `git commit -s` on every commit, including amends.
 ## Language and runtime
 
 - **Python 3.10 or later.** Enforce with a runtime check in `cli.py`.
+- **POSIX-only runtime.** gitbulk uses `fcntl.flock` and POSIX symlink
+  semantics; Windows is not supported (see `this.i` node `posqx2nm`).
+  macOS works by virtue of being POSIX-compliant; Linux is the
+  primary target.
 - **All production code in `src/gitbulk/`.** Tests in `tests/`. Shell
   helpers (cron wrapper, etc.) in `bin/`. No mixing.
 - **No JavaScript, no Bash logic of consequence.** `bin/gitbulk-cron`

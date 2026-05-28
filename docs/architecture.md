@@ -185,7 +185,10 @@ Every subcommand follows the same outer skeleton:
 7. **Create or remove the `ATTENTION` sentinel** based on the exit code.
 8. **Release locks**, exit with the appropriate code.
 
-Exit codes (decision `tp4kq2nr`):
+Exit codes (decision `tp4kq2nr` — the same node defines the four-layer
+file-based notification model AND the exit-code semantics that drive
+the ATTENTION sentinel; the two concerns are inseparable in that
+design):
 
 | Code | Meaning |
 |---|---|

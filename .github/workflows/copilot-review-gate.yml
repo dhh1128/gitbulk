@@ -42,6 +42,12 @@ jobs:
           fi
           echo "skip=$skip" >> "$GITHUB_OUTPUT"
 
+      # TECH_DEBT: the `|| echo ...` fallbacks below silently mask any
+      # API error from GitHub's request_reviewers endpoint, including a
+      # future API change that renames or removes the "Copilot" reviewer.
+      # If Copilot review ever stops working silently, this is the first
+      # place to check — flip `|| echo` to `|| { echo ...; exit 1; }` to
+      # restore loud failure. Noted by devops adversarial review 2026-05-27.
       - name: Request Copilot as reviewer
         if: steps.decide.outputs.skip == 'false'
         env:
