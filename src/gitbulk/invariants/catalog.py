@@ -1,0 +1,387 @@
+"""Concrete Phase 2 invariants (this.i node ``ph2inv4n``).
+
+Each class registers itself via ``@register`` at import time. The
+``gitbulk.invariants`` package re-imports this module for the
+side effect; do not call into this module directly.
+
+Invariant catalog:
+
+  UNIVERSAL preflight
+    - gh.authenticated
+    - config.parseable
+    - org.members.fresh
+
+  PER_REPO preflight (subcommands whose ``needs_clone`` is True, plus
+  ``github.reachable`` which applies to every gh-touching subcommand)
+    - local.exists
+    - local.remote_matches
+    - local.default_branch_in_sync
+    - github.reachable
+
+  PER_PR baseline
+    - pr.base_is_default
+    - pr.author_known
+
+Ordering in a chain is UNIVERSAL → PER_REPO → PER_PR; chain stops on
+the first Fail per node ``c4jzm5pn``.
+
+Skip-vs-Fail convention (from node ``5xqp2nkr``): "this one repo/PR
+doesn't qualify" is a Skip; "the whole run is structurally broken"
+is a Fail. The local-git probes return Skip when a clone is missing
+or out-of-sync rather than aborting the whole run.
+
+All local-git interactions use only the read-only allowlist from
+node ``7mxr4pql`` (``rev-parse``, ``remote get-url``,
+``symbolic-ref``). Mutating subcommands are not permitted from
+invariants; this module never shells out to anything else.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+
+from gitbulk.classifier import Classification, classify_login
+from gitbulk.gh import GHError
+from gitbulk.invariants.base import (
+    Fail,
+    Invariant,
+    InvariantContext,
+    InvariantKind,
+    Pass,
+    Result,
+    Skip,
+)
+from gitbulk.invariants.registry import register
+from gitbulk.org_members_cache import is_fresh, load_cache
+
+# Subcommand sets reused across invariants. Defined once so a typo
+# would be caught (and so refactors only touch one place).
+_ALL_SUBS: frozenset[str] = frozenset(
+    {
+        "report",
+        "summarize",
+        "dispatch",
+        "merge",
+        "rebase-onto-default",
+        "close-stale",
+    }
+)
+_CLONE_SUBS: frozenset[str] = frozenset({"dispatch", "rebase-onto-default"})
+
+
+# ─── UNIVERSAL ────────────────────────────────────────────────────────────
+
+
+@register
+class GhAuthenticatedInvariant(Invariant):
+    """Probe ``gh api user`` to confirm an authenticated gh CLI session."""
+
+    name = "gh.authenticated"
+    kind = InvariantKind.UNIVERSAL
+    subcommands = _ALL_SUBS
+
+    def check(self, ctx: InvariantContext) -> Result:
+        if ctx.gh is None:
+            return Fail("gh client not present on context")
+        try:
+            user = ctx.gh.authenticated_user()
+        except GHError as e:
+            return Fail(f"gh not authenticated: {e}")
+        if not user.get("login"):
+            return Fail(f"gh authenticated but user has no login: {user!r}")
+        return Pass()
+
+
+@register
+class ConfigParseableInvariant(Invariant):
+    """Sanity check that ``ctx.policy`` is loaded.
+
+    The Policy is parsed by ``cli.py`` before the chain runs; if it
+    weren't parseable the run wouldn't have started. This invariant
+    is a defense-in-depth assertion that nobody constructed an
+    InvariantContext with a placeholder policy.
+    """
+
+    name = "config.parseable"
+    kind = InvariantKind.UNIVERSAL
+    subcommands = _ALL_SUBS
+
+    def check(self, ctx: InvariantContext) -> Result:
+        if ctx.policy is None:
+            return Fail("policy not loaded into context")
+        return Pass()
+
+
+@register
+class OrgMembersFreshInvariant(Invariant):
+    """Confirm the org-members cache exists and is younger than the TTL.
+
+    If ``policy.humans.org`` is None the classifier falls through to
+    BOT for unknown logins, which is the documented safe default; no
+    cache is required in that mode.
+    """
+
+    name = "org.members.fresh"
+    kind = InvariantKind.UNIVERSAL
+    subcommands = _ALL_SUBS
+
+    def check(self, ctx: InvariantContext) -> Result:
+        org = ctx.policy.humans.org
+        if org is None:
+            return Pass()
+        cached = load_cache(org)
+        if cached is None:
+            return Fail(
+                f"org members cache for {org!r} is missing; "
+                "rerun with --refresh-org-members"
+            )
+        if not is_fresh(cached, ctx.policy.humans.cache_ttl_hours):
+            return Fail(
+                f"org members cache for {org!r} is older than "
+                f"{ctx.policy.humans.cache_ttl_hours}h; "
+                "rerun with --refresh-org-members"
+            )
+        return Pass()
+
+
+# ─── PER_REPO ─────────────────────────────────────────────────────────────
+
+
+_GITHUB_REMOTE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # ssh: git@github.com:owner/repo(.git)
+    re.compile(r"^git@github\.com:(?P<slug>[^/]+/[^/]+?)(?:\.git)?$"),
+    # https: https://github.com/owner/repo(.git)
+    re.compile(r"^https?://github\.com/(?P<slug>[^/]+/[^/]+?)(?:\.git)?/?$"),
+    # ssh-url: ssh://git@github.com/owner/repo(.git)
+    re.compile(r"^ssh://git@github\.com/(?P<slug>[^/]+/[^/]+?)(?:\.git)?$"),
+)
+
+
+def _extract_slug_from_remote_url(url: str) -> str | None:
+    """Extract ``owner/repo`` from a GitHub remote URL, or None.
+
+    Accepts the three remote URL forms gh and git normally emit: SSH
+    shorthand (``git@github.com:o/r.git``), HTTPS
+    (``https://github.com/o/r``), and the rarer SSH URL form
+    (``ssh://git@github.com/o/r.git``). Returns None for anything
+    that doesn't match — including URLs pointing at non-GitHub hosts,
+    which is correct: ``local.remote_matches`` should Skip on those
+    rather than try to guess a slug.
+    """
+    for pattern in _GITHUB_REMOTE_PATTERNS:
+        match = pattern.match(url)
+        if match:
+            return match.group("slug")
+    return None
+
+
+@register
+class LocalExistsInvariant(Invariant):
+    """Verify ``ctx.repo.local_path`` is a git working tree.
+
+    Skip (not Fail) when missing or not a working tree: per node
+    ``5xqp2nkr`` a missing clone is a per-repo skip, not a whole-run
+    abort. The user's other 149 repos should still be processed.
+    """
+
+    name = "local.exists"
+    kind = InvariantKind.PER_REPO
+    subcommands = _CLONE_SUBS
+
+    def check(self, ctx: InvariantContext) -> Result:
+        if ctx.repo is None:
+            return Fail("per-repo invariant called without ctx.repo")
+        path = ctx.repo.local_path
+        if not path.exists():
+            return Skip(f"local clone missing at {path}")
+        result = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0 or result.stdout.strip() != "true":
+            return Skip(f"{path} is not a git working tree")
+        return Pass()
+
+
+@register
+class LocalRemoteMatchesInvariant(Invariant):
+    """Verify the clone's ``origin`` remote URL points at ``ctx.repo.slug``."""
+
+    name = "local.remote_matches"
+    kind = InvariantKind.PER_REPO
+    subcommands = _CLONE_SUBS
+
+    def check(self, ctx: InvariantContext) -> Result:
+        if ctx.repo is None:
+            return Fail("per-repo invariant called without ctx.repo")
+        result = subprocess.run(
+            ["git", "-C", str(ctx.repo.local_path), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return Skip(
+                f"origin remote not configured: {result.stderr.strip()}"
+            )
+        url = result.stdout.strip()
+        extracted = _extract_slug_from_remote_url(url)
+        if extracted is None:
+            return Skip(
+                f"origin URL {url!r} is not a recognized GitHub remote"
+            )
+        if extracted != ctx.repo.slug:
+            return Skip(
+                f"origin points at {extracted!r} but configured slug "
+                f"is {ctx.repo.slug!r}"
+            )
+        return Pass()
+
+
+@register
+class LocalDefaultBranchInSyncInvariant(Invariant):
+    """Verify the local clone's ``origin/HEAD`` agrees with GitHub's
+    current default branch for the slug.
+
+    Skip (not Fail) on divergence: the user has a one-line fix
+    (``git fetch && git remote set-head origin -a``) and we don't
+    want to abort the whole run for it.
+    """
+
+    name = "local.default_branch_in_sync"
+    kind = InvariantKind.PER_REPO
+    subcommands = _CLONE_SUBS
+
+    def check(self, ctx: InvariantContext) -> Result:
+        if ctx.repo is None:
+            return Fail("per-repo invariant called without ctx.repo")
+        if ctx.gh is None:
+            return Fail("per-repo invariant called without ctx.gh")
+        try:
+            github_default = ctx.gh.default_branch(ctx.repo.slug)
+        except GHError as e:
+            return Skip(
+                f"could not determine github default branch: {e}"
+            )
+        result = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(ctx.repo.local_path),
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return Skip(
+                "local origin/HEAD not set: "
+                f"{result.stderr.strip()}"
+            )
+        # symbolic-ref emits e.g. "refs/remotes/origin/main"
+        symref = result.stdout.strip()
+        prefix = "refs/remotes/origin/"
+        if not symref.startswith(prefix):
+            return Skip(
+                f"unrecognized origin/HEAD symref {symref!r}"
+            )
+        local_default = symref[len(prefix):]
+        if local_default != github_default:
+            return Skip(
+                f"local default branch {local_default!r} does not "
+                f"match github default {github_default!r}"
+            )
+        return Pass()
+
+
+@register
+class GithubReachableInvariant(Invariant):
+    """Single-call probe that ``ctx.gh`` works for this slug.
+
+    Caches via the underlying gh client's own behavior; this
+    invariant doesn't add a cache of its own.
+    """
+
+    name = "github.reachable"
+    kind = InvariantKind.PER_REPO
+    subcommands = _ALL_SUBS
+
+    def check(self, ctx: InvariantContext) -> Result:
+        if ctx.repo is None:
+            return Fail("per-repo invariant called without ctx.repo")
+        if ctx.gh is None:
+            return Fail("per-repo invariant called without ctx.gh")
+        try:
+            ctx.gh.default_branch(ctx.repo.slug)
+        except GHError as e:
+            return Skip(f"github not reachable for {ctx.repo.slug}: {e}")
+        return Pass()
+
+
+# ─── PER_PR ───────────────────────────────────────────────────────────────
+
+
+@register
+class PrBaseIsDefaultInvariant(Invariant):
+    """Verify ``ctx.pr.base_ref`` equals the repo's current default branch.
+
+    Per AGENTS.md "Default branch detection": every PR-touching
+    operation must verify the PR targets the current default branch
+    before acting. A non-default base is a Skip with a prominent
+    reason; ``--allow-non-default-base`` is the explicit override.
+    """
+
+    name = "pr.base_is_default"
+    kind = InvariantKind.PER_PR
+    subcommands = _ALL_SUBS
+
+    def check(self, ctx: InvariantContext) -> Result:
+        if ctx.pr is None or ctx.repo is None:
+            return Fail("per-PR invariant called without ctx.pr/ctx.repo")
+        if ctx.gh is None:
+            return Fail("per-PR invariant called without ctx.gh")
+        try:
+            default = ctx.gh.default_branch(ctx.repo.slug)
+        except GHError as e:
+            return Skip(f"could not determine default branch: {e}")
+        if ctx.pr.base_ref != default:
+            return Skip(
+                f"PR {ctx.pr.number} targets {ctx.pr.base_ref!r}, "
+                f"repo default is {default!r}"
+            )
+        return Pass()
+
+
+@register
+class PrAuthorKnownInvariant(Invariant):
+    """Confirm the classifier can decide HUMAN-or-BOT for ``ctx.pr.author``.
+
+    UNKNOWN is reserved for tooling running without an org-members
+    cache; in production the ``org.members.fresh`` preflight
+    guarantees a cache is loaded before this invariant runs, so
+    UNKNOWN here is a defensive Fail.
+    """
+
+    name = "pr.author_known"
+    kind = InvariantKind.PER_PR
+    subcommands = _ALL_SUBS
+
+    def check(self, ctx: InvariantContext) -> Result:
+        if ctx.pr is None:
+            return Fail("per-PR invariant called without ctx.pr")
+        org_members = None
+        if ctx.policy.humans.org:
+            cached = load_cache(ctx.policy.humans.org)
+            if cached is not None:
+                org_members = cached.members
+        result = classify_login(ctx.pr.author, ctx.policy, org_members)
+        if result == Classification.UNKNOWN:
+            return Fail(
+                f"classifier returned UNKNOWN for {ctx.pr.author!r}"
+            )
+        return Pass()

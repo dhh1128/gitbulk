@@ -36,3 +36,6 @@ __all__ = [
     "ChainResult",
     "run_chain",
 ]
+
+# Side-effect import: registers all concrete invariants in the catalog.
+from gitbulk.invariants import catalog  # noqa: F401, E402
