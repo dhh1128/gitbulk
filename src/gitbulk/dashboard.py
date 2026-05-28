@@ -13,13 +13,13 @@ from typing import Iterable
 import yaml
 
 from gitbulk import paths
-from gitbulk.cli import SUBCOMMANDS
+from gitbulk.subcommands import KNOWN
 
 _EXCERPT_LINES = 15
 
 
 def _known_subcommands() -> list[str]:
-    return [name for name, _ in SUBCOMMANDS]
+    return [sc.name for sc in KNOWN]
 
 
 def _read_yaml_if_present(path: Path) -> dict | None:

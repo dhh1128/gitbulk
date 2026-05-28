@@ -38,10 +38,10 @@ def test_dashboard_file_created_at_expected_path(isolated_cache):
 def test_dashboard_has_section_per_subcommand(isolated_cache):
     out = dashboard.rewrite_dashboard()
     text = out.read_text()
-    # Every subcommand from cli.SUBCOMMANDS should appear in the dashboard
-    from gitbulk.cli import SUBCOMMANDS
-    for name, _ in SUBCOMMANDS:
-        assert f"## {name}\n" in text
+    # Every subcommand from subcommands.KNOWN should appear in the dashboard
+    from gitbulk.subcommands import KNOWN
+    for sc in KNOWN:
+        assert f"## {sc.name}\n" in text
 
 
 def test_dashboard_no_runs_yet_placeholder(isolated_cache):

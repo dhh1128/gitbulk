@@ -10,6 +10,7 @@ import argparse
 import sys
 
 from gitbulk import __version__
+from gitbulk.subcommands import KNOWN, Subcommand  # noqa: F401  (Subcommand re-export)
 
 EXIT_OK = 0
 EXIT_STRUCTURAL_FAILURE = 1
@@ -18,17 +19,10 @@ EXIT_INVARIANT_SKIPPED = 3
 EXIT_OVERRIDES_APPLIED = 4
 EXIT_NOT_IMPLEMENTED = 99
 
-SUBCOMMANDS = [
-    ("report", "Summarize the state of your open PRs across all repos."),
-    ("summarize", "Run Claude over a previous report to prioritize attention."),
-    ("dispatch", "Launch headless Claude agents against PRs matching a filter."),
-    ("merge", "Auto-merge PRs that satisfy the per-repo merge policy."),
-    ("rebase-onto-default", "Rebase your PRs onto their repo's default branch."),
-    ("close-stale", "Close PRs that are inactive past the configured threshold."),
-    ("show", "Show the latest run of a given subcommand."),
-    ("ack", "Clear the ATTENTION sentinel after you have reviewed it."),
-    ("invariants", "List the invariant registry and which subcommands use them."),
-]
+# Back-compat alias. The canonical, typed source is ``gitbulk.subcommands.KNOWN``;
+# this exposes the same data shaped as a list of ``(name, help)`` tuples for any
+# pre-Phase-1D consumer. New code should import KNOWN.
+SUBCOMMANDS = [(s.name, s.help) for s in KNOWN]
 
 _ATTENTION_TRIGGER_CODES = {EXIT_ATTENTION_NEEDED, EXIT_INVARIANT_SKIPPED}
 
@@ -90,9 +84,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"gitbulk {__version__}")
     subparsers = parser.add_subparsers(dest="subcommand", metavar="SUBCOMMAND")
-    for name, help_text in SUBCOMMANDS:
-        sp = subparsers.add_parser(name, help=help_text)
-        handler = _SPECIAL_HANDLERS.get(name, _not_implemented(name))
+    for sc in KNOWN:
+        sp = subparsers.add_parser(sc.name, help=sc.help)
+        handler = _SPECIAL_HANDLERS.get(sc.name, _not_implemented(sc.name))
         sp.set_defaults(handler=handler)
     return parser
 
