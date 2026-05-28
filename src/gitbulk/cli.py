@@ -122,10 +122,19 @@ def _report_handler(args: argparse.Namespace) -> int:
     return report_handler(args)
 
 
+def _summarize_handler(args: argparse.Namespace) -> int:
+    # Lazy import for the same reason as _report_handler — claude.py
+    # and runstate stay out of the --help path.
+    from gitbulk.commands.summarize import summarize_handler
+
+    return summarize_handler(args)
+
+
 _SPECIAL_HANDLERS = {
     "ack": _ack_handler,
     "invariants": _invariants_handler,
     "report": _report_handler,
+    "summarize": _summarize_handler,
 }
 
 
@@ -159,6 +168,34 @@ def _add_report_args(sp: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_summarize_args(sp: argparse.ArgumentParser) -> None:
+    """Argparse flags specific to the ``summarize`` subcommand.
+
+    Per this.i node ``smprmpt4n.e`` and ``.f``, the user can A/B test
+    alternate prompt files and models without editing the package.
+    """
+    sp.add_argument(
+        "--prompt",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Override the default packaged triage prompt with a "
+            "different file. Path is read at run time and recorded in "
+            "the run's manifest.yaml."
+        ),
+    )
+    sp.add_argument(
+        "--model",
+        metavar="NAME",
+        default=None,
+        help=(
+            "Override the default claude model "
+            "(default: claude-sonnet-4-6). Accepts an alias like "
+            "'opus' or a full model name."
+        ),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gitbulk",
@@ -181,6 +218,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.set_defaults(handler=handler)
         if sc.name == "report":
             _add_report_args(sp)
+        elif sc.name == "summarize":
+            _add_summarize_args(sp)
     return parser
 
 

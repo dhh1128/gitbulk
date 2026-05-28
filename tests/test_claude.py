@@ -1,0 +1,239 @@
+"""Tests for the claude client surface (Protocol + Fake + Production).
+
+Per AGENTS.md "no network in tests", every test in this file either
+uses :class:`FakeClaudeClient` or mocks :func:`subprocess.run` so no
+actual ``claude`` invocation ever happens.
+"""
+
+from __future__ import annotations
+
+import subprocess
+from pathlib import Path
+from typing import Any
+from unittest.mock import patch
+
+import pytest
+
+from gitbulk.claude import (
+    ClaudeClient,
+    ClaudeError,
+    ClaudeTimeoutError,
+    FakeClaudeClient,
+    ProductionClaudeClient,
+)
+
+
+# ─── Protocol satisfaction ─────────────────────────────────────────────────
+
+
+def test_fake_satisfies_claudeclient_protocol():
+    fake = FakeClaudeClient()
+    assert isinstance(fake, ClaudeClient)
+
+
+def test_production_satisfies_claudeclient_protocol():
+    prod = ProductionClaudeClient()
+    assert isinstance(prod, ClaudeClient)
+
+
+# ─── FakeClaudeClient ──────────────────────────────────────────────────────
+
+
+def test_fake_unconfigured_raises_claudeerror():
+    fake = FakeClaudeClient()
+    with pytest.raises(ClaudeError, match="no responses configured"):
+        fake.run_prompt("anything")
+
+
+def test_fake_dict_prefix_match_returns_canned_output():
+    fake = FakeClaudeClient({"triage:": "TOP ATTENTION\n- a thing"})
+    out = fake.run_prompt("triage: please")
+    assert out == "TOP ATTENTION\n- a thing"
+
+
+def test_fake_dict_longest_prefix_wins():
+    fake = FakeClaudeClient(
+        {
+            "tri": "short",
+            "triage": "long",
+        }
+    )
+    assert fake.run_prompt("triage: go") == "long"
+    assert fake.run_prompt("tribe foo") == "short"
+
+
+def test_fake_dict_no_match_raises():
+    fake = FakeClaudeClient({"foo": "bar"})
+    with pytest.raises(ClaudeError, match="no prefix match"):
+        fake.run_prompt("zzz unrelated")
+
+
+def test_fake_callable_receives_prompt_and_input():
+    seen: dict[str, Any] = {}
+
+    def respond(prompt: str, input_text: str | None) -> str:
+        seen["prompt"] = prompt
+        seen["input"] = input_text
+        return "hi"
+
+    fake = FakeClaudeClient(respond)
+    out = fake.run_prompt("hello", input_text="world")
+    assert out == "hi"
+    assert seen == {"prompt": "hello", "input": "world"}
+
+
+def test_fake_tracks_call_count_and_last_call():
+    fake = FakeClaudeClient({"": "ok"})
+    fake.run_prompt("p1", input_text="i1", model="m", timeout=12.5)
+    fake.run_prompt("p2", working_directory=Path("/tmp"))
+    assert fake.call_count == 2
+    assert fake.last_call == {
+        "prompt": "p2",
+        "input_text": None,
+        "model": None,
+        "timeout": None,
+        "working_directory": Path("/tmp"),
+    }
+
+
+# ─── ProductionClaudeClient: argv shape + happy path ───────────────────────
+
+
+class _CompletedFake:
+    """Stand-in for :class:`subprocess.CompletedProcess` returned by mocks."""
+
+    def __init__(self, returncode: int, stdout: str = "", stderr: str = ""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def test_production_default_constructor():
+    p = ProductionClaudeClient()
+    assert p._claude_path == "claude"
+    assert p._default_model == "claude-sonnet-4-6"
+    assert p._default_timeout == 300.0
+
+
+def test_production_constructor_overrides():
+    p = ProductionClaudeClient(
+        claude_path="/usr/local/bin/claude",
+        default_model="opus",
+        default_timeout=60.0,
+    )
+    assert p._claude_path == "/usr/local/bin/claude"
+    assert p._default_model == "opus"
+    assert p._default_timeout == 60.0
+
+
+def test_production_happy_path_argv_and_stdout():
+    completed = _CompletedFake(0, stdout="triage output\n")
+    with patch(
+        "gitbulk.claude.subprocess.run", return_value=completed
+    ) as mock_run:
+        out = ProductionClaudeClient().run_prompt(
+            "do a triage", input_text="state yaml here"
+        )
+    assert out == "triage output\n"
+    args, kwargs = mock_run.call_args
+    argv = args[0]
+    assert argv[0] == "claude"
+    assert "-p" in argv
+    assert "do a triage" in argv
+    assert "--model" in argv
+    assert "claude-sonnet-4-6" in argv
+    assert "--dangerously-skip-permissions" in argv
+    assert kwargs["input"] == "state yaml here"
+    assert kwargs["capture_output"] is True
+    assert kwargs["text"] is True
+    assert kwargs["timeout"] == 300.0
+    assert kwargs["check"] is False
+    assert kwargs["cwd"] is None
+
+
+def test_production_respects_per_call_model_and_timeout():
+    completed = _CompletedFake(0, stdout="ok")
+    with patch(
+        "gitbulk.claude.subprocess.run", return_value=completed
+    ) as mock_run:
+        ProductionClaudeClient().run_prompt(
+            "x", model="opus", timeout=7.5
+        )
+    _, kwargs = mock_run.call_args
+    argv = mock_run.call_args[0][0]
+    assert "opus" in argv
+    assert kwargs["timeout"] == 7.5
+
+
+def test_production_working_directory_passed_as_cwd(tmp_path):
+    completed = _CompletedFake(0, stdout="ok")
+    with patch(
+        "gitbulk.claude.subprocess.run", return_value=completed
+    ) as mock_run:
+        ProductionClaudeClient().run_prompt(
+            "x", working_directory=tmp_path
+        )
+    _, kwargs = mock_run.call_args
+    assert kwargs["cwd"] == str(tmp_path)
+
+
+def test_production_uses_custom_claude_path():
+    completed = _CompletedFake(0, stdout="ok")
+    with patch(
+        "gitbulk.claude.subprocess.run", return_value=completed
+    ) as mock_run:
+        ProductionClaudeClient(claude_path="/opt/bin/claude").run_prompt("x")
+    argv = mock_run.call_args[0][0]
+    assert argv[0] == "/opt/bin/claude"
+
+
+# ─── ProductionClaudeClient: failure modes ─────────────────────────────────
+
+
+def test_production_timeout_raises_claudetimeouterror():
+    with patch(
+        "gitbulk.claude.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd=["claude"], timeout=1.0),
+    ):
+        with pytest.raises(ClaudeTimeoutError) as exc:
+            ProductionClaudeClient(default_timeout=1.0).run_prompt("x")
+    # ClaudeTimeoutError IS a ClaudeError and a TimeoutError
+    assert isinstance(exc.value, ClaudeError)
+    assert isinstance(exc.value, TimeoutError)
+    assert exc.value.command is not None
+    assert exc.value.command[0] == "claude"
+    assert "1.0s" in str(exc.value)
+
+
+def test_production_nonzero_exit_raises_claudeerror_with_stderr():
+    with patch(
+        "gitbulk.claude.subprocess.run",
+        return_value=_CompletedFake(2, stdout="", stderr="model not found"),
+    ):
+        with pytest.raises(ClaudeError) as exc:
+            ProductionClaudeClient().run_prompt("x")
+    assert "exit 2" in str(exc.value)
+    assert "model not found" in str(exc.value)
+    assert exc.value.command is not None
+    # not a timeout error
+    assert not isinstance(exc.value, ClaudeTimeoutError)
+
+
+def test_production_nonzero_exit_with_empty_stderr_still_raises():
+    with patch(
+        "gitbulk.claude.subprocess.run",
+        return_value=_CompletedFake(3, stdout="", stderr=""),
+    ):
+        with pytest.raises(ClaudeError) as exc:
+            ProductionClaudeClient().run_prompt("x")
+    assert "exit 3" in str(exc.value)
+
+
+def test_production_no_input_text_passes_none_to_subprocess():
+    completed = _CompletedFake(0, stdout="ok")
+    with patch(
+        "gitbulk.claude.subprocess.run", return_value=completed
+    ) as mock_run:
+        ProductionClaudeClient().run_prompt("x")
+    _, kwargs = mock_run.call_args
+    assert kwargs["input"] is None
