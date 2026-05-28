@@ -1,6 +1,28 @@
-# gitbulk repo list — one owner/repo per line.
+# gitbulk repo list — one GitHub slug per line.
+#
+# Format: owner/repo
+#   - The exact slug GitHub uses in URLs (e.g. github.com/<owner>/<repo>)
+#   - No protocol, no `.git` suffix, no local path
+#
+# Examples of VALID entries:
+#   provenant-dev/origin-platform
+#   dhh1128/gitbulk
+#
+# Examples of INVALID entries (will fail validation):
+#   git@github.com:provenant-dev/origin-platform.git    (remote URL, not a slug)
+#   https://github.com/provenant-dev/origin-platform    (URL, not a slug)
+#   /home/daniel/code/origin-platform                   (filesystem path, not a slug)
+#   provenant-dev/origin-platform.git                   (trailing .git not allowed)
+#
+# Local clone path: gitbulk assumes the local clone lives at
+# `<code-root>/<repo-basename>`, where code-root defaults to `~/code/` and
+# can be overridden per-invocation via `--code-root PATH`. Only subcommands
+# that need a working tree (`dispatch`, `rebase-onto-default`) actually
+# read the local clone; `report`, `merge`, `close-stale`, and `summarize`
+# operate purely against the GitHub API.
+#
 # Blank lines and lines starting with # are ignored.
-# Local clone is assumed to be at ~/code/<repo-basename>.
+# Duplicate slugs are logged as WARNINGs and silently deduped (first wins).
 
 # Provenant
 provenant-dev/origin-platform

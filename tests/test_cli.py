@@ -375,3 +375,20 @@ def test_set_private_umask_returns_none():
         assert _set_private_umask() is None
     finally:
         os.umask(prev)
+
+
+def test_config_error_prints_clean_message_no_stack_trace(
+    monkeypatch, capsys, tmp_path
+):
+    """User onboarding: a ConfigError raised by a subcommand handler
+    must not bubble as a Python stack trace. The CLI catches it,
+    prints a one-liner to stderr, and exits EXIT_STRUCTURAL_FAILURE."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-such-config"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    # No repos.txt → load_repos raises ConfigError → CLI catches.
+    rc = main(["report"])
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert "repos.txt not found" in err
+    assert err.startswith("gitbulk report:")

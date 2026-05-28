@@ -6,11 +6,11 @@
 
 defaults:
   merge_policy: strict           # strict | ci-only | never
-  merge_method: merge            # merge | squash | rebase — method passed to `gh pr merge`
+  merge_method: rebase           # rebase | merge | squash — method passed to `gh pr merge`
   min_business_days: 3           # business days (M-F local TZ) since "ready"
   unresolved_burden: me          # me | other | either — who marks threads resolved
   bot_threads_block: true        # if true, unresolved bot threads also block "ready"
-  stale_age_days: 60             # close-stale: inactivity threshold
+  stale_age_days: 90             # close-stale: inactivity threshold
   stale_cooloff_days: 7          # close-stale: must have been warned at least this long ago
   stale_policy: warn-and-close   # warn-and-close | warn-only | never
   # skip_checks: []              # invariants suppressed for every repo

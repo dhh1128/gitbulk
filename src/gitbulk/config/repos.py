@@ -56,7 +56,14 @@ def load_repos(
     if code_root is None:
         code_root = _default_code_root()
 
-    text = path.read_text()
+    try:
+        text = path.read_text()
+    except FileNotFoundError:
+        raise ConfigError(
+            f"repos.txt not found at {path}. "
+            f"Create it (one 'owner/repo' slug per line; see "
+            f"config/repos.txt.example) or pass --config-root."
+        ) from None
     seen_slugs: dict[str, int] = {}
     entries: list[RepoEntry] = []
 
@@ -67,8 +74,11 @@ def load_repos(
             continue
         if not _SLUG_PATTERN.match(stripped):
             raise ConfigError(
-                f"{path}:{lineno}: malformed slug {stripped!r} "
-                f"(expected exactly 'owner/repo')"
+                f"{path}:{lineno}: malformed slug {stripped!r}. "
+                f"Expected the GitHub slug form 'owner/repo' (e.g. "
+                f"'provenant-dev/origin-platform') — no protocol, no .git "
+                f"suffix, no local path. The local clone is assumed to live "
+                f"at <code-root>/<repo-name>; override with --code-root."
             )
         if any(part in _FORBIDDEN_SEGMENTS for part in stripped.split("/")):
             raise ConfigError(

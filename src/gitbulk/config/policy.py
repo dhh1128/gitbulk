@@ -54,14 +54,15 @@ _REPO_OVERRIDE_KEYS = _DEFAULTS_KEYS  # per-repo can override any defaults key
 @dataclass(frozen=True)
 class Defaults:
     merge_policy: str = "strict"
-    #: Merge method gitbulk passes to ``gh pr merge``. Default ``merge``
-    #: (a true merge commit) was chosen 2026-05-28 after the user pushed
-    #: back on the Phase-5 squash-default. See this.i node ``gji4dyze``.
-    merge_method: str = "merge"
+    #: Merge method gitbulk passes to ``gh pr merge``. Default ``rebase``:
+    #: keeps per-commit history (unlike squash) AND a linear main branch
+    #: (unlike merge commits). Choice flipped from ``merge`` during real-
+    #: use onboarding 2026-05-28. See this.i node ``gji4dyze``.
+    merge_method: str = "rebase"
     min_business_days: int = 3
     unresolved_burden: str = "me"
     bot_threads_block: bool = True
-    stale_age_days: int = 60
+    stale_age_days: int = 90
     stale_cooloff_days: int = 7
     #: How close-stale handles inactive PRs. ``warn-and-close`` (default)
     #: posts a heads-up comment, waits stale_cooloff_days, then closes.

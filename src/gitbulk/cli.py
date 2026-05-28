@@ -536,7 +536,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         return EXIT_OK
     _apply_config_root(getattr(args, "config_root", None))
-    exit_code = args.handler(args)
+    # User-facing config errors must not stack-trace: they're caused by
+    # a missing or malformed config file and the actionable info is the
+    # message itself, not a Python frame. Caught here at the top of the
+    # CLI so every subcommand inherits the friendly behavior.
+    from gitbulk.config.repos import ConfigError as _ConfigError
+    try:
+        exit_code = args.handler(args)
+    except _ConfigError as e:
+        print(f"gitbulk {args.subcommand}: {e}", file=sys.stderr)
+        return EXIT_STRUCTURAL_FAILURE
     _maybe_set_attention(exit_code, args.subcommand)
     return exit_code
 

@@ -31,7 +31,7 @@ def test_missing_file_returns_default_policy(tmp_path):
     policy = load_policy(tmp_path / "nonexistent.yaml")
     assert policy == Policy()
     assert policy.defaults.merge_policy == "strict"
-    assert policy.defaults.merge_method == "merge"
+    assert policy.defaults.merge_method == "rebase"
     assert policy.defaults.min_business_days == 3
     assert policy.defaults.unresolved_burden == "me"
     assert policy.defaults.bot_threads_block is True
@@ -91,11 +91,13 @@ def test_retain_runs_default():
 # ─── merge_method ─────────────────────────────────────────────────────────
 
 
-def test_merge_method_default_is_merge():
-    """Per this.i node gji4dyze, default merge method is `merge` (true
-    merge commit), reversing the Phase-5 squash default."""
+def test_merge_method_default_is_rebase():
+    """Per this.i node gji4dyze, default merge method is `rebase` —
+    preserves per-commit history (unlike squash) while keeping a
+    linear main branch (unlike merge commits). Flipped from `merge`
+    during real-use onboarding 2026-05-28."""
     from gitbulk.config.policy import Defaults
-    assert Defaults().merge_method == "merge"
+    assert Defaults().merge_method == "rebase"
 
 
 def test_merge_method_explicit_in_defaults(tmp_path):

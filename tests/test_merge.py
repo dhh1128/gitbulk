@@ -191,7 +191,7 @@ def test_dry_run_two_eligible_prs_lists_them_no_merge_calls(
     assert "dhh1128/beta" in summary
     manifest = yaml.safe_load((latest / "manifest.yaml").read_text())
     assert manifest["config_snapshot"]["apply"] is False
-    assert manifest["config_snapshot"]["merge_method_default"] == "merge"
+    assert manifest["config_snapshot"]["merge_method_default"] == "rebase"
 
 
 def test_dry_run_no_eligible_prs_exit_ok(
@@ -248,10 +248,10 @@ def test_apply_two_eligible_prs_both_merged(
     assert rc == EXIT_OK
     assert fake.call_count["merge_pr"] == 2
     assert not sentinel.has_attention()
-    # Both calls used the default merge method (`merge`, true merge commit
-    # per gji4dyze) and delete_branch=True (remote PR branch cleanup).
+    # Both calls used the default merge method (`rebase` per gji4dyze)
+    # and delete_branch=True (remote PR branch cleanup).
     for call in fake.merge_calls:
-        assert call["method"] == "merge"
+        assert call["method"] == "rebase"
         assert call["delete_branch"] is True
     latest = paths.latest_run_symlink("merge").resolve()
     summary = (latest / "summary.md").read_text()

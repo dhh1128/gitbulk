@@ -157,3 +157,15 @@ def test_empty_file_returns_empty_list(tmp_path):
 def test_only_comments_returns_empty_list(tmp_path):
     path = _write_repos(tmp_path, "# just a comment\n# another\n")
     assert load_repos(path, code_root=tmp_path / "code") == []
+
+
+# ─── Missing repos.txt → friendly ConfigError ──────────────────────────────
+
+
+def test_missing_repos_txt_raises_configerror(tmp_path):
+    """User onboarding: the first time gitbulk runs, there's no repos.txt.
+    Surface a friendly ConfigError pointing at the file location and the
+    example, not a bare FileNotFoundError."""
+    missing = tmp_path / "no-such-repos.txt"
+    with pytest.raises(ConfigError, match="repos.txt not found"):
+        load_repos(missing, code_root=tmp_path / "code")
