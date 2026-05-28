@@ -89,6 +89,34 @@ Tests MUST NOT call `gh`, `git fetch`, or any other network operation.
 Subprocess and network dependencies are injected so tests stay offline,
 deterministic, and fast.
 
+### Verify gh invocations against GitHub API deprecations
+
+Every `gh` command that lands in `ProductionGHClient` (or any other
+production code path that subprocesses to `gh`) MUST be verified to not
+emit a GitHub API deprecation warning at the time it is wired in. The
+`gh` CLI surfaces deprecation notices on stderr in the form
+`Warning: …` or `…is deprecated and will be removed on YYYY-MM-DD`.
+
+Verification procedure:
+
+1. Run the candidate command interactively against a real repo:
+   `gh <args> 2>&1 1>/dev/null | grep -iE 'warning|deprecat'`.
+2. If the grep matches anything, switch to the recommended alternative.
+   Common moves: REST endpoint flagged → use GraphQL or the new REST
+   endpoint named in the warning; GraphQL field deprecated (e.g.,
+   `mergeable` → `mergeStateStatus`) → use the new field.
+3. Record verification at the call site:
+   `# verified non-deprecated against gh CLI YYYY-MM-DD`.
+
+If no clean replacement exists yet, record a `tension:` node in
+`this.i` with the deprecation deadline, or a `TECH_DEBT` comment with
+the deadline. Do not let a known-deprecated command land silently.
+
+The rationale and full procedure are recorded in the global memory
+`feedback-gh-cli-deprecation-verification`. Decision node
+`ghclmp7n` (gh Client Implementation) makes the rule a hard
+requirement for Phase 2 code.
+
 ### Coverage standard
 
 100% branch coverage on `src/gitbulk/`, enforced in CI. A gap requires

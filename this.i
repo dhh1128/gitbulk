@@ -981,6 +981,44 @@ Gitbulk Triage Tool = goal:
             their own decision nodes.
       approved-by: daniel, 2026-05-27
 
+    Subcommand Invariant Chain Field = decision:
+      id: scinv4qm
+      why: >
+        Extends ``Subcommand`` (node smodlpr3) with a new ClassVar-
+        style field declaring which invariants run for that
+        subcommand, in order. Set in src/gitbulk/subcommands.py
+        per-Subcommand at construction time; consumed by the CLI
+        handler when building the chain for a run.
+
+            invariant_chain: tuple[str, ...]   # registry names
+
+        Resolves the "how does each subcommand know which
+        invariants to compose" question that was open after
+        ivp4wq7n. Three alternatives rejected:
+
+          (a) Invariants self-declare via subcommands ClassVar on
+              each invariant class. This works but means the chain
+              ORDER for a subcommand is implicit — the registry's
+              insertion order. Forcing ORDER to be declared at the
+              subcommand keeps "what runs and in what sequence" in
+              one place per subcommand.
+          (b) Hardcode chains in the CLI handler. Splits the
+              "what runs for X" knowledge between the registry
+              and the handler. Rejected.
+          (c) Dynamic discovery (run all registered invariants
+              with subcommand in their applies-to). Removes the
+              explicit ordering — bad for the c4jzm5pn semantics
+              where ordering matters (UNIVERSAL → PER_REPO →
+              PER_PR).
+
+        Phase 2 fills in invariant_chain on each Subcommand using
+        the catalog from ph2inv4n. Phase 5 adds the merge-specific
+        invariants and updates the merge Subcommand's chain.
+
+        Empty tuple () is valid (no invariants run; current state
+        for ack, invariants).
+      approved-by: daniel, 2026-05-28
+
     Subcommands Module And Dataclass = decision:
       id: smodlpr3
       why: >
@@ -1080,42 +1118,216 @@ Gitbulk Triage Tool = goal:
 
     # ─── TENSIONS (deferred, do not resolve silently) ────────────────────────
 
-    gh Client Interface Shape = tension:
-      id: ghc7npqk
+    gh Client Implementation = decision:
+      id: ghclmp7n
       why: >
-        Phase 2 will introduce src/gitbulk/gh.py (or similar) as
-        the exclusive channel for GitHub network traffic
-        (constraint hp4nck2v). The shape is not yet designed; the
-        platform-architect adversarial review (2026-05-27)
-        identified that without this design recorded, whichever
-        invariant lands first in Phase 2 will set the shape by
-        accident.
+        Resolves tension ghc7npqk (which now lives only in git
+        history as the pre-decision record). Six forks settled:
 
-        Forks the speculative interview must resolve before any
-        Phase 2 invariant calls into gh:
+        (a) **Protocol class + FakeGHClient.** ``typing.Protocol``
+        defines the interface; production ships one concrete impl
+        (``ProductionGHClient``) that subprocesses to ``gh``; tests
+        inject ``FakeGHClient`` returning canned data. Why: type-
+        safe at call sites (mypy / IDE checks against the Protocol),
+        clean test seam without monkeypatching ``subprocess``, no
+        hidden subprocess execution in tests (AGENTS.md "no network
+        in tests"). Cost: two classes per concept; accepted.
 
-          (a) Protocol class with FakeGHClient test double, OR
-              concrete class with subprocess injection?
-          (b) Per-method API (gh.list_open_prs(slug) →
-              list[PRInfo]) OR command-style with a typed result
-              (gh.run(["pr", "list", ...]) → Response)?
-          (c) Where does GraphQL coalescing live — inside the
-              client, or above it as a caching layer? (Decision
-              gd4kp7nz says "serial + coalescing"; the layer
-              question is still open.)
-          (d) Where do timeouts and retries live — inside the
-              client, in the invariant, or at the CLI?
-          (e) Does the client carry state (rate-limit headers,
-              auth-status cache) or is it stateless?
-          (f) Test seam: how do invariants get a mock gh in tests
-              that respect AGENTS.md's "no network in tests"?
+        (b) **Per-method typed API.** Methods like
+        ``gh.list_open_prs_for_repos(slugs) -> dict[str, list[PRInfo]]``
+        return typed structures. Rejected the command-style
+        (``gh.run([...args]) -> Response``) because it shifts the
+        burden of parsing raw gh output to every invariant, which
+        is the exact opposite of "single seam." Rejected per-method
+        without coalescing (option from Q2) because it would invite
+        N-call-per-repo loops.
 
-        Resolution timing: speculative interview AT Phase 2 entry,
-        with all forks surfaced in one batch (per user preference,
-        memory feedback-front-load-questions). The decision node
-        replacing this tension will be required before any gh-
-        touching code lands.
-      approved-by: daniel, 2026-05-27
+        (c) **Coalescing inside the client.** The list-style methods
+        accept iterables of slugs and emit one GraphQL query per
+        call, transparent to callers. Matches decision gd4kp7nz
+        ("serial + GraphQL coalescing"). Callers can NOT accidentally
+        produce N round-trips when one would do; the API doesn't
+        give them the option.
+
+        (d) **Client owns retry policy; per-call timeout kwarg.**
+        The client wraps each gh invocation in a small retry loop
+        for transient errors (5xx, network timeout). The retry
+        policy is hardcoded conservative — 3 attempts with
+        exponential backoff — and not configurable at call sites
+        (callers shouldn't need to think about it). Per-call
+        ``timeout: float | None = None`` kwarg lets callers extend
+        for slow GraphQL queries. Default timeout = 30s.
+
+        (e) **Stateless.** No per-client cache of rate-limit
+        headers, auth status, or org members. The org-members cache
+        lives separately in the humans/bots classifier (node
+        hbcls4pq); the gh client just runs commands.
+
+        (f) **Test seam: FakeGHClient protocol stub.** Tests
+        construct a ``FakeGHClient`` configured with the canned
+        responses they need, and pass it through ``InvariantContext``
+        (which already has a ``gh: Any`` field per ivp4wq7n that we
+        now type-narrow). No subprocess in tests; no network; the
+        Protocol contract is enforced by mypy on both sides.
+
+        Additional discipline (from user feedback during the Phase
+        2 interview): **Every gh subcommand wired into
+        ProductionGHClient must be verified non-deprecated** against
+        the live `gh` CLI at integration time and re-checked when
+        the call is touched. See AGENTS.md "Verify gh against GitHub
+        API deprecations" and the feedback memory
+        `feedback-gh-cli-deprecation-verification`. The verification
+        date is recorded in a comment at each call site.
+      approved-by: daniel, 2026-05-28
+
+    PR Data Model = decision:
+      id: prdtm4kn
+      why: >
+        ``PRInfo`` is a frozen dataclass carrying the shape every
+        invariant and ``report`` consumer needs. Lives in
+        ``src/gitbulk/pr_info.py``. Returned by gh client methods
+        and used as a parameter type in per-PR invariant chains.
+
+        Fields (initial Phase 2 set; future fields added via this.i
+        decision nodes):
+
+            slug: str                      # "owner/repo"
+            number: int                    # PR number
+            title: str
+            url: str                       # canonical browser URL
+            author: str                    # login
+            base_ref: str                  # baseRefName
+            head_ref: str                  # headRefName
+            head_sha: str
+            state: Literal["OPEN","CLOSED","MERGED"]
+            is_draft: bool
+            mergeable_state: str | None    # gh's mergeStateStatus
+            created_at: datetime           # UTC
+            updated_at: datetime           # UTC
+            last_pushed_at: datetime|None  # last head-ref push
+            labels: tuple[str, ...]
+            review_decision: str | None    # APPROVED/CHANGES_REQUESTED/REVIEW_REQUIRED/None
+            checks_status: str | None      # SUCCESS/FAILURE/PENDING/None
+
+        Rationale for "frozen dataclass + hand validation" over
+        pydantic: same rule as ck5pwr2n (no pydantic dep for a
+        small schema).
+
+        Why ``review_decision`` / ``checks_status`` / ``mergeable_state``
+        as ``str | None`` rather than enums: GitHub adds new values
+        periodically (the deprecation discipline ghclmp7n applies
+        here too). Hard enums would force a code change on every
+        new value; ``str | None`` plus a documented set of "known"
+        values plus a fallthrough behavior is more forward-
+        compatible. The set of known values lives in
+        ``pr_info.py`` as ``_KNOWN_REVIEW_DECISIONS`` etc., used
+        for validation but not for type narrowing.
+
+        Excluded from initial fields: ``ready_since`` (computed,
+        not stored — lives in a separate helper to keep PRInfo
+        as raw gh data), thread-resolution state (Phase 3 or
+        Phase 5 when merge needs it).
+      approved-by: daniel, 2026-05-28
+
+    Humans Bots Classifier = decision:
+      id: hbcls4pq
+      why: >
+        ``classify_login(login: str, policy: Policy) -> Classification``
+        where ``Classification`` is an ``Enum`` with values ``HUMAN``,
+        ``BOT``, ``UNKNOWN``. The classifier is a pure function over
+        the login string plus the policy snapshot; no I/O at call
+        time. Cached org-members data is loaded once at startup
+        into the policy snapshot or alongside it.
+
+        Resolution order (matches design-notes §3 and node
+        pj5kn2zw):
+
+          1. login in policy.humans.always_human → HUMAN
+          2. login in policy.bots                → BOT
+          3. login in cached_org_members AND login not in
+             policy.humans.exceptions             → HUMAN
+          4. otherwise                            → BOT  (default
+             non-human per pj5kn2zw)
+
+        ``UNKNOWN`` is reserved for tooling that needs to
+        distinguish "we asked but couldn't decide" (e.g., classifier
+        called before the org-members cache loaded). Production
+        flow never returns UNKNOWN because preflight invariant
+        ``org.members.fresh`` guarantees the cache is loaded before
+        any classifier call.
+
+        Org-members cache:
+
+          - File: ``~/.cache/gitbulk/org-members/<org>.yaml``
+          - Schema: ``schema_version: 1`` (per schv4nrm), ``fetched_at:
+            ISO-8601 UTC``, ``members: tuple[str, ...]``.
+          - TTL: ``policy.humans.cache_ttl_hours`` (default 24).
+            Stale cache → ``org.members.fresh`` invariant Fails
+            with reason "org members cache older than TTL; rerun
+            with --refresh-org-members".
+          - Refresh command (Phase 2): a CLI flag
+            ``--refresh-org-members`` on the universal preflight
+            forces a fetch via ``gh api orgs/<org>/members
+            --paginate``.
+          - Empty / null ``policy.humans.org``: the classifier
+            falls through step 3 (no org lookup), so unknown
+            logins default BOT per the safer-failure-mode rule.
+
+        Test seam: classifier is pure; tests pass canned Policy +
+        canned cached members. No mocking required.
+      approved-by: daniel, 2026-05-28
+
+    Phase 2 Invariant Catalog = decision:
+      id: ph2inv4n
+      why: >
+        Concrete invariants landing in Phase 2, as specified by the
+        Phase 2 scope ceiling answer (medium: gh wrappers + preflight
+        + per-PR baseline + classifier + report). Each invariant
+        below gets a Python class implementing the Invariant ABC
+        from ivp4wq7n.
+
+        UNIVERSAL preflight (run once per gitbulk run):
+          - gh.authenticated     — probes ``gh api user`` (returns
+            user JSON iff authed; clean exit-code semantics).
+            Verified non-deprecated 2026-05-28.
+          - config.parseable     — confirms gitbulk.yaml + repos.txt
+            already loaded (i.e. caller passed them; this is a
+            sanity invariant).
+          - org.members.fresh    — confirms the org-members cache
+            for ``policy.humans.org`` exists and is younger than
+            ``policy.humans.cache_ttl_hours``.
+
+        PER_REPO preflight (run once per configured repo, only for
+        subcommands whose Subcommand.needs_clone is True OR which
+        otherwise interact with the local clone):
+          - local.exists           — local_path is a git repo per
+            node 5xqp2nkr semantics.
+          - local.remote_matches   — clone's origin URL points at
+            the configured slug.
+          - local.default_branch_in_sync — local default branch
+            matches GitHub's per branch protection (preliminary;
+            full check is in pr.base_is_default).
+          - github.reachable       — single gh probe against the
+            configured slug succeeds.
+
+        PER_PR baseline (run once per open PR):
+          - pr.base_is_default     — PR.base_ref == default branch
+            per AGENTS.md hard rule.
+          - pr.author_known        — classify_login(PR.author,
+            policy) != UNKNOWN. UNKNOWN should be impossible by
+            invariant ordering, but the assertion is the protection.
+
+        Order in a chain: UNIVERSAL → PER_REPO → PER_PR. Stop on
+        first Fail per c4jzm5pn runner semantics.
+
+        Each invariant class registers via ``@register`` from the
+        invariants framework (ivp4wq7n) at import time. The
+        gitbulk-invariants entry-point handler from clip7nm4 now
+        lists them by name + kind + applies-to once Phase 2 lands.
+
+        Mutating / dispatch / merge-specific invariants are
+        deferred to Phase 3+ per the scope ceiling answer.
+      approved-by: daniel, 2026-05-28
 
 
     Summarize Prompt Design = tension:
