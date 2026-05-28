@@ -130,11 +130,20 @@ def _summarize_handler(args: argparse.Namespace) -> int:
     return summarize_handler(args)
 
 
+def _dispatch_handler(args: argparse.Namespace) -> int:
+    # Lazy import keeps the exec kernel + worktree + claude modules
+    # out of the --help path (same reason as _report_handler).
+    from gitbulk.commands.dispatch import dispatch_handler
+
+    return dispatch_handler(args)
+
+
 _SPECIAL_HANDLERS = {
     "ack": _ack_handler,
     "invariants": _invariants_handler,
     "report": _report_handler,
     "summarize": _summarize_handler,
+    "dispatch": _dispatch_handler,
 }
 
 
@@ -196,6 +205,77 @@ def _add_summarize_args(sp: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_dispatch_args(sp: argparse.ArgumentParser) -> None:
+    """Argparse flags specific to the ``dispatch`` subcommand.
+
+    Per node ``2vqp4nk6``, dispatch is mutating and defaults to dry-run;
+    ``--apply`` is the explicit opt-in. The other flags mirror the
+    knobs exposed by :func:`gitbulk.exec.execute_targets` (concurrency,
+    per-target timeout) plus the prompt path and the report-style
+    ``--code-root`` / ``--skip-check`` controls.
+    """
+    sp.add_argument(
+        "--apply",
+        action="store_true",
+        default=False,
+        help=(
+            "Actually run claude against eligible PRs. Without this flag, "
+            "dispatch is a dry run and prints what it WOULD do (per "
+            "AGENTS.md 'Mutating subcommands default to dry-run')."
+        ),
+    )
+    sp.add_argument(
+        "--prompt",
+        metavar="PATH",
+        default=None,
+        help=(
+            "Required. Path to the prompt file that will be sent to "
+            "claude inside each PR's worktree. Must exist and be "
+            "non-empty."
+        ),
+    )
+    sp.add_argument(
+        "--concurrency",
+        metavar="N",
+        type=int,
+        default=2,
+        help="Bounded-pool size for parallel claude children (default 2).",
+    )
+    sp.add_argument(
+        "--timeout",
+        metavar="SECONDS",
+        type=float,
+        default=1800.0,
+        help="Per-target wall-clock timeout (default 1800s).",
+    )
+    sp.add_argument(
+        "--filter",
+        metavar="LABEL",
+        default=None,
+        help=(
+            "Reserved for Phase 5+: filter eligible PRs by label. "
+            "Accepted but currently ignored."
+        ),
+    )
+    sp.add_argument(
+        "--code-root",
+        metavar="PATH",
+        default=None,
+        help="Override default ~/code/ where local clones live.",
+    )
+    sp.add_argument(
+        "--skip-check",
+        metavar="NAME",
+        action="append",
+        default=None,
+        help=(
+            "Skip the named invariant for this run (may be passed more "
+            "than once). Logs a WARNING and triggers exit-code 4 if no "
+            "other concern fires."
+        ),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gitbulk",
@@ -220,6 +300,8 @@ def build_parser() -> argparse.ArgumentParser:
             _add_report_args(sp)
         elif sc.name == "summarize":
             _add_summarize_args(sp)
+        elif sc.name == "dispatch":
+            _add_dispatch_args(sp)
     return parser
 
 
