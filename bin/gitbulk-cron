@@ -1,25 +1,105 @@
 #!/usr/bin/env bash
 # Cron-friendly wrapper around `gitbulk`.
+#
 # Captures all output to a timestamped log under ~/.cache/gitbulk/cron/.
-# On non-zero exit, symlinks the log as last-failure.log for easy inspection.
+# Exit-code-aware symlinks (this.i node clip7nm4):
+#   exit 0       no symlink (clean run, nothing to flag)
+#   exit 1       last-failure.log     structural failure
+#   exit 2 or 3  last-attention.log   PRs need attention / repos skipped
+#   exit 4       last-audit.log       override audit signal
+#   exit 99      no symlink (subcommand not yet implemented)
+#
+# Cron-overlap protection: an outer flock prevents two simultaneous
+# invocations of this wrapper from racing. The tool's internal lock
+# (locks.py) handles intra-tool concurrency; this is just a fast-fail
+# shortcut so the second cron firing doesn't pile up waiting.
+#
+# Log retention: cron logs older than $RETAIN_DAYS days are removed at the
+# end of every successful invocation. Default 30; override with the env var.
+#
+# PATH: cron's minimal PATH typically lacks ~/.local/bin or any venv. We
+# either source a venv (if VENV is set), use GITBULK_BIN (absolute path
+# to the gitbulk binary), or prepend a known-good PATH so a pip-installed
+# `gitbulk` is discoverable. Configure ONE of these in the crontab line.
 #
 # Usage from crontab:
 #   0 3 * * * /home/you/code/gitbulk/bin/gitbulk-cron report
+#   # or with explicit binary:
+#   0 3 * * * GITBULK_BIN=/home/you/venvs/gitbulk/bin/gitbulk \
+#               /home/you/code/gitbulk/bin/gitbulk-cron report
 #
+set -eo pipefail
 set -u
 
-LOG_DIR="${HOME}/.cache/gitbulk/cron"
+# ─── Configuration with sensible defaults ───────────────────────────────────
+
+CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/gitbulk"
+LOG_DIR="${CACHE_DIR}/cron"
+LOCK_FILE="${CACHE_DIR}/cron.lock"
+RETAIN_DAYS="${GITBULK_CRON_RETAIN_DAYS:-30}"
+
+# Resolve the gitbulk binary. Priority:
+#   1. GITBULK_BIN explicit absolute path
+#   2. gitbulk found on PATH after prepending ~/.local/bin
+#   3. error and exit 1
+if [ -n "${GITBULK_BIN:-}" ]; then
+    GITBULK="${GITBULK_BIN}"
+elif [ -n "${VIRTUAL_ENV:-}" ] && [ -x "${VIRTUAL_ENV}/bin/gitbulk" ]; then
+    GITBULK="${VIRTUAL_ENV}/bin/gitbulk"
+else
+    export PATH="${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    if ! command -v gitbulk >/dev/null 2>&1; then
+        echo "gitbulk-cron: cannot find gitbulk on PATH; set GITBULK_BIN or VIRTUAL_ENV" >&2
+        exit 1
+    fi
+    GITBULK="$(command -v gitbulk)"
+fi
+
 mkdir -p "${LOG_DIR}"
 
-TS=$(date +%Y%m%dT%H%M%S)
+TS=$(date -u +%Y%m%dT%H%M%SZ)
 SUBCMD="${1:-report}"
 LOG="${LOG_DIR}/${TS}-${SUBCMD}.log"
 
-gitbulk "$@" >"${LOG}" 2>&1
-rc=$?
+# ─── Outer flock so two cron firings don't pile up ──────────────────────────
 
-if [ ${rc} -ne 0 ]; then
-    ln -sf "${LOG}" "${LOG_DIR}/last-failure.log"
+# Acquire a non-blocking exclusive lock; if held, the previous run is still
+# going — bail out fast rather than queue up another waiter.
+exec 200>"${LOCK_FILE}"
+if ! flock -n 200; then
+    echo "gitbulk-cron: previous run still in progress (lock held on ${LOCK_FILE}); skipping this firing" >&2
+    exit 0
 fi
+
+# ─── Run the actual command, captured to the log ────────────────────────────
+
+# `set -e` would abort on the gitbulk failure before we can branch on rc;
+# disable it just for this call.
+set +e
+"${GITBULK}" "$@" >"${LOG}" 2>&1
+rc=$?
+set -e
+
+# ─── Exit-code-aware symlinks ───────────────────────────────────────────────
+
+case "${rc}" in
+    0)   ;;
+    1)   ln -sf "${LOG}" "${LOG_DIR}/last-failure.log"   ;;
+    2|3) ln -sf "${LOG}" "${LOG_DIR}/last-attention.log" ;;
+    4)   ln -sf "${LOG}" "${LOG_DIR}/last-audit.log"     ;;
+    99)  ;;  # subcommand not yet implemented; not a failure
+    *)   ln -sf "${LOG}" "${LOG_DIR}/last-failure.log"   ;;
+esac
+
+# ─── Cron-log retention sweep ───────────────────────────────────────────────
+
+# Prune timestamped logs older than RETAIN_DAYS. The named symlinks
+# (last-failure.log, last-attention.log, last-audit.log) are left alone;
+# they regenerate naturally on the next run.
+find "${LOG_DIR}" -maxdepth 1 -type f -name '*.log' -mtime "+${RETAIN_DAYS}" -delete 2>/dev/null || true
+
+# ─── One-line MAILTO-friendly status ────────────────────────────────────────
+
+echo "gitbulk-cron: ${SUBCMD} exit=${rc} log=${LOG}"
 
 exit ${rc}
