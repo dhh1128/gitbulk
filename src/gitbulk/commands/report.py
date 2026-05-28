@@ -35,13 +35,16 @@ from __future__ import annotations
 import argparse
 import sys
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable
+
+import yaml
 
 from gitbulk import paths, sentinel
 from gitbulk.config.policy import Policy, load_policy
 from gitbulk.config.repos import RepoEntry, load_repos
-from gitbulk.gh import GHError, ProductionGHClient
+from gitbulk.gh import GHClient, GHError, ProductionGHClient
 from gitbulk.invariants import (
     InvariantContext,
     get,
@@ -50,9 +53,28 @@ from gitbulk.invariants import (
 from gitbulk.invariants.base import Invariant, InvariantKind
 from gitbulk.locks import LockTimeoutError, global_lock
 from gitbulk.org_members_cache import refresh_cache
-from gitbulk.pr_info import PRInfo
+from gitbulk.pr_info import CheckRun, PRInfo
 from gitbulk.runstate import RunState
 from gitbulk import subcommands as subcommands_mod
+
+#: Check-run conclusions that count as failures the user should see.
+#: ``neutral`` is excluded (often a no-op CI rerun). ``skipped`` excluded
+#: too (intentional). Everything else that's "completed and not green"
+#: counts. ``status != completed`` (e.g. in_progress) is not a failure
+#: yet — surface separately as "still running" if at all.
+_FAILURE_CONCLUSIONS: frozenset[str] = frozenset(
+    {"failure", "cancelled", "timed_out", "action_required", "stale"}
+)
+
+#: Window for the post-merge watchdog: how far back to scan run-state.
+#: 24 hours covers nightly cron + a comfortable margin. Bounded so the
+#: watchdog doesn't unboundedly accumulate (state pruning per
+#: ``retain_runs`` will eventually drop older runs anyway).
+_WATCHDOG_WINDOW = timedelta(hours=24)
+
+#: Cap on number of merge SHAs to check per run, defensive against an
+#: unexpectedly long history. Each check costs one gh REST call.
+_WATCHDOG_MAX_MERGES = 50
 
 # Exit codes — duplicated here (instead of importing from cli.py) so
 # the cli ↔ commands dep stays one-way: cli imports commands, never
@@ -157,8 +179,10 @@ def _build_summary_md(
     prs_by_repo: dict[str, list[PRInfo]],
     pr_records_by_repo: dict[str, list[dict]],
     attention_count: int,
+    watchdog_records: list[dict] | None = None,
 ) -> str:
     """Human-readable summary.md (this.i tp4kq2nr layer 3)."""
+    watchdog_records = watchdog_records or []
     lines: list[str] = ["# gitbulk report", ""]
 
     if not all_repos:
@@ -175,6 +199,26 @@ def _build_summary_md(
     if policy.humans.org:
         lines.append(f"Humans org: {policy.humans.org}")
     lines.append("")
+
+    # Post-merge watchdog: surface CD failures BEFORE the open-PR list,
+    # because they represent breakage from yesterday's merges and the
+    # user likely cares about them first.
+    if watchdog_records:
+        lines.append("## Recent merges (last 24h)")
+        for rec in watchdog_records:
+            sha7 = rec["merge_commit_sha"][:7] if rec.get("merge_commit_sha") else "?"
+            if rec.get("error"):
+                tag = f"check-fetch FAILED: {rec['error']}"
+            elif rec.get("has_failure"):
+                names = ", ".join(c.name for c in rec.get("failures", []))
+                tag = f"FAILING checks: {names}"
+            else:
+                tag = "checks OK"
+            lines.append(
+                f"- `{rec['slug']}` #{rec['number']} *{rec['title']}* "
+                f"(merge={sha7}) — {tag}"
+            )
+        lines.append("")
 
     if skipped_repos:
         lines.append("## Skipped repos")
@@ -208,6 +252,122 @@ def _build_summary_md(
         lines.append("(no open PRs across the reachable repos)")
         lines.append("")
     return "\n".join(lines)
+
+
+def _scan_recent_merges(now: datetime) -> list[dict]:
+    """Return per-PR merge records from merge runs in the last 24 hours.
+
+    Walks ``~/.cache/gitbulk/runs/<TIMESTAMP>-merge/state.yaml`` for each
+    timestamp within the window. The TIMESTAMP prefix is the canonical
+    sort key (lexicographic == chronological because it's ISO-8601).
+
+    Returns a list of dicts with keys: ``slug``, ``number``, ``title``,
+    ``url``, ``merge_commit_sha``, ``run_id``. Drops entries that lack
+    a ``merge_commit_sha`` (dry-runs and pre-watchdog merges have none).
+    """
+    runs_root = paths.runs_dir()
+    if not runs_root.exists():
+        return []
+    cutoff = now - _WATCHDOG_WINDOW
+    merges: list[dict] = []
+    # Descending so the most recent runs are scanned first; the cap is
+    # enforced by truncating the result list.
+    candidate_dirs = sorted(
+        (p for p in runs_root.iterdir() if p.is_dir() and p.name.endswith("-merge")),
+        reverse=True,
+    )
+    for run_dir in candidate_dirs:
+        # Timestamp prefix is everything before "-merge", format
+        # YYYYMMDDTHHMMSSZ. Parse defensively — a non-conforming dir
+        # name is silently skipped.
+        ts_str = run_dir.name[: -len("-merge")]
+        try:
+            run_at = datetime.strptime(ts_str, "%Y%m%dT%H%M%SZ").replace(
+                tzinfo=timezone.utc
+            )
+        except ValueError:
+            continue
+        if run_at < cutoff:
+            # Older than the window → and since we're walking newest
+            # first, everything older lives after this in iteration
+            # order. Break early.
+            break
+        state_path = run_dir / "state.yaml"
+        if not state_path.exists():
+            continue
+        try:
+            doc = yaml.safe_load(state_path.read_text())
+        except yaml.YAMLError:
+            continue
+        if not isinstance(doc, dict):
+            continue
+        for slug, repo_payload in (doc.get("repos") or {}).items():
+            if not isinstance(repo_payload, dict):
+                continue
+            for pr_entry in repo_payload.get("prs") or []:
+                if not isinstance(pr_entry, dict):
+                    continue
+                sha = pr_entry.get("merge_commit_sha")
+                if not sha:
+                    continue
+                merges.append(
+                    {
+                        "slug": slug,
+                        "number": pr_entry.get("number"),
+                        "title": pr_entry.get("title") or "",
+                        "url": pr_entry.get("url") or "",
+                        "merge_commit_sha": sha,
+                        "run_id": ts_str,
+                    }
+                )
+                if len(merges) >= _WATCHDOG_MAX_MERGES:
+                    return merges
+    return merges
+
+
+def _check_recent_merges(
+    gh: GHClient,
+    rs: RunState,
+    now: datetime,
+) -> tuple[list[dict], bool]:
+    """For each recent merge, fetch its check-runs and classify.
+
+    Returns ``(records, any_failure)`` where each record is the merge
+    metadata + ``check_runs: list[CheckRun]`` + ``has_failure: bool``.
+    A check-runs fetch failure is recorded as a WARNING on ``rs`` and
+    the record carries ``error: <message>`` instead of check_runs;
+    it does NOT count toward ``any_failure`` because we don't know.
+    """
+    records: list[dict] = []
+    any_failure = False
+    for m in _scan_recent_merges(now):
+        try:
+            check_runs = gh.fetch_check_runs(m["slug"], m["merge_commit_sha"])
+        except GHError as e:
+            rs.record_error(
+                f"fetch_check_runs failed for {m['slug']}@{m['merge_commit_sha'][:7]}: {e}",
+                level="WARNING",
+                context={
+                    "slug": m["slug"],
+                    "sha": m["merge_commit_sha"],
+                    "error": str(e),
+                },
+            )
+            records.append({**m, "check_runs": [], "has_failure": False, "error": str(e)})
+            continue
+        failures = [c for c in check_runs if c.conclusion in _FAILURE_CONCLUSIONS]
+        has_failure = bool(failures)
+        if has_failure:
+            any_failure = True
+        records.append(
+            {
+                **m,
+                "check_runs": check_runs,
+                "failures": failures,
+                "has_failure": has_failure,
+            }
+        )
+    return records, any_failure
 
 
 def _read_repos_text() -> str:
@@ -457,6 +617,13 @@ def _run_under_lock(
             {"pr_count": len(repo_prs), "prs": pr_records},
         )
 
+    # 8b. Post-merge watchdog: scan recent merge runs for CD failures
+    # on the resulting merge commits. Surfaces them in the summary and
+    # forces ATTENTION if any are red.
+    watchdog_records, any_watchdog_failure = _check_recent_merges(
+        gh, rs, datetime.now(timezone.utc)
+    )
+
     # 9. Summary markdown.
     summary_md = _build_summary_md(
         policy,
@@ -466,11 +633,12 @@ def _run_under_lock(
         prs_by_repo,
         pr_records_by_repo,
         attention_count,
+        watchdog_records=watchdog_records,
     )
     rs.write_summary(summary_md)
 
     # 10. Compute exit code.
-    if attention_count > 0:
+    if attention_count > 0 or any_watchdog_failure:
         exit_code = EXIT_ATTENTION_NEEDED
     elif skipped_repos:
         exit_code = EXIT_INVARIANT_SKIPPED
@@ -479,9 +647,11 @@ def _run_under_lock(
     else:
         exit_code = EXIT_OK
 
+    wd_failed = sum(1 for r in watchdog_records if r.get("has_failure"))
     summary_text = (
         f"{attention_count} PRs need attention; "
-        f"{len(skipped_repos)} repos skipped"
+        f"{len(skipped_repos)} repos skipped; "
+        f"{wd_failed} recent-merge CD failure(s)"
     )
     return _finish(
         rs,

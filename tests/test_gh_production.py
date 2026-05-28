@@ -1149,6 +1149,103 @@ def test_close_pr_returns_stdout_on_unparseable():
     assert "stdout" in result
 
 
+# ─── fetch_merge_commit_sha ────────────────────────────────────────────────
+
+
+def test_fetch_merge_commit_sha_argv_and_parse():
+    payload = {"mergeCommit": {"oid": "f" * 40}}
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        result = client.fetch_merge_commit_sha("dhh1128/gitbulk", 42)
+    assert result == "f" * 40
+    args, _ = mock_run.call_args
+    assert args[0] == [
+        "gh", "pr", "view", "42", "--repo", "dhh1128/gitbulk", "--json", "mergeCommit",
+    ]
+
+
+def test_fetch_merge_commit_sha_null_merge_returns_none():
+    """PR not merged → mergeCommit is null."""
+    payload = {"mergeCommit": None}
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        assert client.fetch_merge_commit_sha("a/b", 1) is None
+
+
+def test_fetch_merge_commit_sha_unparseable_json_returns_none():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout="not json"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        assert client.fetch_merge_commit_sha("a/b", 1) is None
+
+
+def test_fetch_merge_commit_sha_missing_oid_returns_none():
+    """mergeCommit present but no oid (defensive)."""
+    payload = {"mergeCommit": {}}
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        assert client.fetch_merge_commit_sha("a/b", 1) is None
+
+
+# ─── fetch_check_runs ──────────────────────────────────────────────────────
+
+
+def test_fetch_check_runs_argv_and_parse_ndjson():
+    """gh --jq emits one JSON object per line (ndjson). Parser handles
+    blank lines and tolerates JSON errors."""
+    lines = [
+        json.dumps({
+            "name": "test", "status": "completed", "conclusion": "success",
+            "details_url": "https://x", "completed_at": "2026-05-28T10:00:00Z",
+        }),
+        "",  # blank line
+        "{not-json",  # malformed
+        json.dumps({
+            "name": "deploy", "status": "completed", "conclusion": "failure",
+            "details_url": "https://y", "completed_at": None,
+        }),
+    ]
+    stdout = "\n".join(lines) + "\n"
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=stdout))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        result = client.fetch_check_runs("dhh1128/gitbulk", "abc123")
+    args, _ = mock_run.call_args
+    assert args[0][:3] == ["gh", "api", "repos/dhh1128/gitbulk/commits/abc123/check-runs"]
+    assert "--jq" in args[0]
+    # Two valid rows; the malformed line is skipped.
+    assert len(result) == 2
+    assert result[0].name == "test"
+    assert result[0].conclusion == "success"
+    assert result[0].completed_at == datetime(2026, 5, 28, 10, 0, 0, tzinfo=timezone.utc)
+    assert result[1].name == "deploy"
+    assert result[1].conclusion == "failure"
+    assert result[1].completed_at is None
+
+
+def test_fetch_check_runs_empty_response_returns_empty():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=""))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        assert client.fetch_check_runs("a/b", "sha1") == []
+
+
+def test_fetch_check_runs_handles_missing_fields():
+    """Defensive: a row with no name / no status fields gets empty strings."""
+    row = json.dumps({"conclusion": "success"})
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=row + "\n"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        result = client.fetch_check_runs("a/b", "sha1")
+    assert len(result) == 1
+    assert result[0].name == ""
+    assert result[0].status == ""
+    assert result[0].details_url == ""
+
+
 # ─── stateless guarantee ───────────────────────────────────────────────────
 
 

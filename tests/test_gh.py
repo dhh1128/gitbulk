@@ -352,6 +352,56 @@ def test_close_pr_raises_configured_exception():
         fake.close_pr("a/b", 1)
 
 
+# ─── FakeGHClient.fetch_merge_commit_sha ───────────────────────────────────
+
+
+def test_fetch_merge_commit_sha_returns_configured_value():
+    fake = FakeGHClient(merge_commit_shas={("a/b", 1): "deadbeef" * 5})
+    assert fake.fetch_merge_commit_sha("a/b", 1) == "deadbeef" * 5
+    assert fake.call_count["fetch_merge_commit_sha"] == 1
+
+
+def test_fetch_merge_commit_sha_missing_key_returns_none():
+    """A PR closed unmerged has no merge commit; configured-but-missing returns None."""
+    fake = FakeGHClient(merge_commit_shas={})
+    assert fake.fetch_merge_commit_sha("a/b", 1) is None
+
+
+def test_fetch_merge_commit_sha_unconfigured_raises():
+    fake = FakeGHClient()
+    with pytest.raises(GHError, match="fetch_merge_commit_sha"):
+        fake.fetch_merge_commit_sha("a/b", 1)
+
+
+# ─── FakeGHClient.fetch_check_runs ─────────────────────────────────────────
+
+
+def test_fetch_check_runs_returns_configured_value():
+    from gitbulk.pr_info import CheckRun
+    cr = CheckRun(
+        name="test",
+        status="completed",
+        conclusion="success",
+        details_url="u",
+        completed_at=None,
+    )
+    fake = FakeGHClient(check_runs={("a/b", "sha1"): [cr]})
+    result = fake.fetch_check_runs("a/b", "sha1")
+    assert result == [cr]
+    assert fake.call_count["fetch_check_runs"] == 1
+
+
+def test_fetch_check_runs_missing_sha_returns_empty():
+    fake = FakeGHClient(check_runs={})
+    assert fake.fetch_check_runs("a/b", "sha1") == []
+
+
+def test_fetch_check_runs_unconfigured_raises():
+    fake = FakeGHClient()
+    with pytest.raises(GHError, match="fetch_check_runs"):
+        fake.fetch_check_runs("a/b", "sha1")
+
+
 # ─── Exception hierarchy ───────────────────────────────────────────────────
 
 

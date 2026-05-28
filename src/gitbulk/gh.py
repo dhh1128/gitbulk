@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping, Protocol, runtime_checkable
 
-from gitbulk.pr_info import PRComment, PRInfo, TimelineEvent
+from gitbulk.pr_info import CheckRun, PRComment, PRInfo, TimelineEvent
 
 
 @runtime_checkable
@@ -173,6 +173,37 @@ class GHClient(Protocol):
         """
         ...
 
+    def fetch_merge_commit_sha(
+        self,
+        slug: str,
+        number: int,
+        *,
+        timeout: float | None = None,
+    ) -> str | None:
+        """Return the resulting merge commit SHA for ``slug``#``number``,
+        or None if the PR isn't merged or no merge commit exists.
+
+        Called by the merge handler after a successful ``gh pr merge``
+        so the SHA can be recorded in state.yaml for the post-merge
+        watchdog (report's "Recent merges" section).
+        """
+        ...
+
+    def fetch_check_runs(
+        self,
+        slug: str,
+        sha: str,
+        *,
+        timeout: float | None = None,
+    ) -> list[CheckRun]:
+        """Return all check-runs reported for ``sha`` on ``slug``.
+
+        Read-only. Used by the post-merge watchdog to detect CI/CD
+        failures that fire on the merge commit (e.g., a cd.yml deploy
+        workflow that broke after the merge landed).
+        """
+        ...
+
 
 class GHError(RuntimeError):
     """Raised when a gh invocation fails in a way the caller is expected
@@ -235,6 +266,8 @@ class FakeGHClient:
         close_responses: Mapping[
             tuple[str, int], "dict[str, Any] | Exception"
         ] | None = None,
+        merge_commit_shas: Mapping[tuple[str, int], "str | None"] | None = None,
+        check_runs: Mapping[tuple[str, str], list[CheckRun]] | None = None,
     ) -> None:
         self._user = user
         self._org_members = dict(org_members) if org_members is not None else None
@@ -262,6 +295,14 @@ class FakeGHClient:
         self._close_responses = (
             dict(close_responses) if close_responses is not None else None
         )
+        self._merge_commit_shas = (
+            dict(merge_commit_shas) if merge_commit_shas is not None else None
+        )
+        self._check_runs = (
+            {k: list(v) for k, v in check_runs.items()}
+            if check_runs is not None
+            else None
+        )
         # Per-call argument records so tests can assert merge_pr was
         # invoked with the right method / delete_branch flags.
         self.merge_calls: list[dict[str, Any]] = []
@@ -277,6 +318,8 @@ class FakeGHClient:
             "fetch_pr_comments": 0,
             "post_comment": 0,
             "close_pr": 0,
+            "fetch_merge_commit_sha": 0,
+            "fetch_check_runs": 0,
         }
 
     def authenticated_user(self, *, timeout: float | None = None) -> dict[str, Any]:
@@ -429,6 +472,38 @@ class FakeGHClient:
         if isinstance(outcome, Exception):
             raise outcome
         return dict(outcome)
+
+    def fetch_merge_commit_sha(
+        self,
+        slug: str,
+        number: int,
+        *,
+        timeout: float | None = None,
+    ) -> str | None:
+        self.call_count["fetch_merge_commit_sha"] += 1
+        if self._merge_commit_shas is None:
+            raise GHError(
+                f"FakeGHClient: fetch_merge_commit_sha({slug!r}, {number}) "
+                "not configured"
+            )
+        # Missing keys default to None (a PR that didn't end up with a
+        # merge commit, e.g. closed unmerged).
+        return self._merge_commit_shas.get((slug, number))
+
+    def fetch_check_runs(
+        self,
+        slug: str,
+        sha: str,
+        *,
+        timeout: float | None = None,
+    ) -> list[CheckRun]:
+        self.call_count["fetch_check_runs"] += 1
+        if self._check_runs is None:
+            raise GHError(
+                f"FakeGHClient: fetch_check_runs({slug!r}, {sha[:7]}) "
+                "not configured"
+            )
+        return list(self._check_runs.get((slug, sha), []))
 
 
 # ─── ProductionGHClient ─────────────────────────────────────────────────────
@@ -867,6 +942,76 @@ class ProductionGHClient:
             return json.loads(stripped)
         except json.JSONDecodeError:
             return {"stdout": stripped}
+
+    def fetch_merge_commit_sha(
+        self,
+        slug: str,
+        number: int,
+        *,
+        timeout: float | None = None,
+    ) -> str | None:
+        # verified non-deprecated against gh CLI 2026-05-28
+        # (`gh pr view --json mergeCommit` works against current gh)
+        stdout = self._run(
+            (
+                "pr",
+                "view",
+                str(number),
+                "--repo",
+                slug,
+                "--json",
+                "mergeCommit",
+            ),
+            timeout=timeout,
+        )
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            return None
+        mc = payload.get("mergeCommit")
+        if not mc:
+            return None
+        return mc.get("oid")
+
+    def fetch_check_runs(
+        self,
+        slug: str,
+        sha: str,
+        *,
+        timeout: float | None = None,
+    ) -> list[CheckRun]:
+        # verified non-deprecated against gh CLI 2026-05-28
+        # (REST endpoint /repos/<slug>/commits/<sha>/check-runs)
+        stdout = self._run(
+            (
+                "api",
+                f"repos/{slug}/commits/{sha}/check-runs",
+                "--jq",
+                ".check_runs[] | {name, status, conclusion, details_url, completed_at}",
+            ),
+            timeout=timeout,
+        )
+        out: list[CheckRun] = []
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            completed_at_raw = row.get("completed_at")
+            completed_at = _parse_iso8601(completed_at_raw) if completed_at_raw else None
+            out.append(
+                CheckRun(
+                    name=row.get("name") or "",
+                    status=row.get("status") or "",
+                    conclusion=row.get("conclusion"),
+                    details_url=row.get("details_url") or "",
+                    completed_at=completed_at,
+                )
+            )
+        return out
 
 
 #: GraphQL document used by :meth:`ProductionGHClient.fetch_pr_comments`.

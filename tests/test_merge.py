@@ -713,6 +713,109 @@ def test_dry_run_shows_per_repo_method_when_different_from_default(
     assert "[method=`rebase`]" in summary
 
 
+# ─── one-merge-per-repo-per-run guardrail (G1) ────────────────────────────
+
+
+def test_apply_two_same_repo_prs_merges_one_defers_other(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """Two PRs in the same repo, both eligible → merge the lower-numbered,
+    defer the higher-numbered. The merged one gets a merge_commit_sha;
+    the deferred one is recorded with deferred=...
+    """
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr_low = _make_pr(slug="dhh1128/alpha", number=3, head_sha="a" * 40)
+    pr_high = _make_pr(slug="dhh1128/alpha", number=7, head_sha="b" * 40)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr_high, pr_low]},  # order shouldn't matter
+        merge_responses={("dhh1128/alpha", 3): {"merged": True}},
+        merge_commit_shas={("dhh1128/alpha", 3): "merge" + "0" * 35},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(_make_args(apply=True, code_root=code_root))
+    assert rc == EXIT_OK
+    # Only ONE merge_pr call, for the lower-numbered PR.
+    assert fake.call_count["merge_pr"] == 1
+    assert fake.merge_calls[0]["number"] == 3
+    # State + summary reflect both PRs.
+    latest = paths.latest_run_symlink("merge").resolve()
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    prs = state["repos"]["dhh1128/alpha"]["prs"]
+    assert len(prs) == 2
+    by_num = {p["number"]: p for p in prs}
+    assert by_num[3]["merged"] is True
+    assert by_num[3]["merge_commit_sha"].startswith("merge")
+    assert "deferred" in by_num[7]
+    summary = (latest / "summary.md").read_text()
+    assert "Deferred to next run" in summary
+    assert "#7" in summary
+
+
+def test_dry_run_two_same_repo_prs_lists_deferred(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """Dry-run mirrors the apply-time guardrail so the user can preview
+    what will actually fire."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr1 = _make_pr(slug="dhh1128/alpha", number=1)
+    pr2 = _make_pr(slug="dhh1128/alpha", number=2, head_sha="b" * 40)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr1, pr2]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_OK
+    summary = (paths.latest_run_symlink("merge").resolve() / "summary.md").read_text()
+    # Both sections present: would-merge for #1, deferred for #2.
+    assert "Would merge" in summary
+    assert "#1" in summary
+    assert "Deferred to next run" in summary
+    assert "#2" in summary
+
+
+def test_apply_two_repos_one_eligible_each_both_merged(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """Cross-repo: two repos with one eligible PR each → both merge in
+    a single run (guardrail is per-repo, not per-run)."""
+    write_config(repos_slugs=["dhh1128/alpha", "dhh1128/beta"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr_a = _make_pr(slug="dhh1128/alpha", number=1)
+    pr_b = _make_pr(slug="dhh1128/beta", number=1)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main", "dhh1128/beta": "main"},
+        my_open_prs={"dhh1128/alpha": [pr_a], "dhh1128/beta": [pr_b]},
+        merge_responses={
+            ("dhh1128/alpha", 1): {"merged": True},
+            ("dhh1128/beta", 1): {"merged": True},
+        },
+        merge_commit_shas={
+            ("dhh1128/alpha", 1): "a" + "1" * 39,
+            ("dhh1128/beta", 1): "b" + "1" * 39,
+        },
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(_make_args(apply=True, code_root=code_root))
+    assert rc == EXIT_OK
+    assert fake.call_count["merge_pr"] == 2
+
+
 # ─── CLI smoke through main() ──────────────────────────────────────────────
 
 

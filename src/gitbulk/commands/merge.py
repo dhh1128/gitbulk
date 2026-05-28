@@ -145,23 +145,33 @@ def _build_summary_md(
     eligible_prs: list[tuple[str, PRInfo]],
     merge_results: list[dict] | None,
     apply: bool,
+    deferred_prs: list[tuple[str, PRInfo]] | None = None,
 ) -> str:
     """Human-readable summary.md.
 
     Two shapes:
-      - dry-run: lists eligible PRs (what WOULD merge).
-      - apply: lists eligible PRs with per-PR merge outcome (merged /
-        failed-with-reason).
+      - dry-run: lists actionable PRs (what WOULD merge) + deferred.
+      - apply: lists actionable PRs with per-PR outcome + deferred.
+
+    ``eligible_prs`` here is the actionable subset (post-guardrail);
+    ``deferred_prs`` are gate-passing PRs that the one-merge-per-repo
+    guardrail postponed to the next gitbulk run.
     """
+    deferred_prs = deferred_prs or []
     lines: list[str] = ["# gitbulk merge", ""]
     mode = "APPLY" if apply else "DRY-RUN"
     lines.append(f"Mode: **{mode}**")
     lines.append(f"Default merge method: `{policy.defaults.merge_method}`")
+    deferred_note = (
+        f"  Deferred (same-repo guardrail): {len(deferred_prs)}"
+        if deferred_prs
+        else ""
+    )
     lines.append(
         f"Configured repos: {len(all_repos)}  "
         f"Reachable: {len(passing_repos)}  "
         f"Skipped: {len(skipped_repos)}  "
-        f"Eligible PRs: {len(eligible_prs)}"
+        f"Eligible PRs: {len(eligible_prs)}{deferred_note}"
     )
     lines.append("")
 
@@ -171,10 +181,18 @@ def _build_summary_md(
             lines.append(f"- `{slug}` — {reason}")
         lines.append("")
 
-    if not eligible_prs:
+    if not eligible_prs and not deferred_prs:
         lines.append("(no eligible PRs to merge)")
         lines.append("")
         return "\n".join(lines)
+
+    # Invariant: eligible_prs is non-empty here. The early return above
+    # handles the both-empty case; deferred_prs can only be non-empty if
+    # eligible_prs is too (the guardrail defers second-and-later PRs in
+    # a slug, never the first). The assertion would fire if a caller
+    # bypassed the guardrail and built deferred_prs without primaries —
+    # cheaper than carrying defensive code in the common path.
+    assert eligible_prs, "deferred_prs without eligible_prs violates guardrail invariant"
 
     if not apply:
         lines.append("## Would merge")
@@ -188,24 +206,30 @@ def _build_summary_md(
                 f"- `{slug}` #{pr.number} *{pr.title}* "
                 f"(head={pr.head_ref}@{pr.head_sha[:7]}){method_note}"
             )
-        lines.append("")
-        return "\n".join(lines)
-
-    # apply mode
-    by_key = {(r["slug"], r["number"]): r for r in (merge_results or [])}
-    lines.append("## Merge results")
-    for slug, pr in eligible_prs:
-        record = by_key.get((slug, pr.number))
-        if record is None:
-            status = "no result recorded"
-        elif record["merged"]:
-            status = "merged"
-        else:
-            status = f"FAILED: {record.get('error', '?')}"
-        lines.append(
-            f"- `{slug}` #{pr.number} *{pr.title}* — {status}"
-        )
+    else:
+        by_key = {(r["slug"], r["number"]): r for r in (merge_results or [])}
+        lines.append("## Merge results")
+        for slug, pr in eligible_prs:
+            record = by_key.get((slug, pr.number))
+            if record is None:
+                status = "no result recorded"
+            elif record["merged"]:
+                status = "merged"
+            else:
+                status = f"FAILED: {record.get('error', '?')}"
+            lines.append(
+                f"- `{slug}` #{pr.number} *{pr.title}* — {status}"
+            )
     lines.append("")
+
+    if deferred_prs:
+        lines.append("## Deferred to next run (same-repo guardrail)")
+        for slug, pr in deferred_prs:
+            lines.append(
+                f"- `{slug}` #{pr.number} *{pr.title}*"
+            )
+        lines.append("")
+
     return "\n".join(lines)
 
 
@@ -372,6 +396,26 @@ def _run_under_lock(
                     }
                 )
 
+    # One-merge-per-repo-per-run guardrail. Same-repo PRs targeting the
+    # same base can have domino effects on each other: merging A often
+    # makes B DIRTY (sibling conflict) and, on repos that dismiss-stale-
+    # approvals, also drops B's review_decision. Doing more than one in
+    # a single tick would mean acting on state we already know is about
+    # to change. Defer second-and-later PRs in any repo to the next
+    # gitbulk run, when GitHub has settled mergeable_state and any stale
+    # approvals have been dismissed for real. Tie-break: lowest PR number
+    # wins (oldest, most likely to have been ready longest).
+    eligible_prs.sort(key=lambda t: (t[0], t[1].number))
+    seen_slugs: set[str] = set()
+    primary_eligible_prs: list[tuple[str, PRInfo]] = []
+    deferred_prs: list[tuple[str, PRInfo]] = []
+    for slug, pr in eligible_prs:
+        if slug in seen_slugs:
+            deferred_prs.append((slug, pr))
+        else:
+            seen_slugs.add(slug)
+            primary_eligible_prs.append((slug, pr))
+
     # DRY-RUN GATE.
     if not args.apply:
         summary_md = _build_summary_md(
@@ -379,9 +423,10 @@ def _run_under_lock(
             all_repos=repos,
             passing_repos=passing_repos,
             skipped_repos=skipped_repos,
-            eligible_prs=eligible_prs,
+            eligible_prs=primary_eligible_prs,
             merge_results=None,
             apply=False,
+            deferred_prs=deferred_prs,
         )
         rs.write_summary(summary_md)
         if skipped_repos:
@@ -394,16 +439,23 @@ def _run_under_lock(
             exit_code = EXIT_OK
             attention = False
         summary_text = (
-            f"dry-run: {len(eligible_prs)} PRs would merge; "
+            f"dry-run: {len(primary_eligible_prs)} PRs would merge; "
+            f"{len(deferred_prs)} deferred; "
             f"{len(skipped_repos)} repos skipped"
         )
         # Record per-repo summary state in state.yaml so `gitbulk show
-        # merge --state` is informative on dry runs too.
-        for slug, pr in eligible_prs:
+        # merge --state` is informative on dry runs too. Include
+        # primary + deferred so the record reflects all gate-passing PRs.
+        for slug, pr in primary_eligible_prs + deferred_prs:
             rs.record_repo_state(
                 slug,
-                _state_for_repo(slug, eligible_prs, pr_skips_by_repo, [],
-                                apply=False),
+                _state_for_repo(
+                    slug,
+                    primary_eligible_prs + deferred_prs,
+                    pr_skips_by_repo,
+                    [],
+                    apply=False,
+                ),
             )
         return _finish(
             rs,
@@ -414,16 +466,17 @@ def _run_under_lock(
             all_repos=repos,
             passing_repos=passing_repos,
             skipped_repos=skipped_repos,
-            eligible_prs=eligible_prs,
+            eligible_prs=primary_eligible_prs,
             merge_results=None,
             apply=False,
             skip_writing_summary=True,
+            deferred_prs=deferred_prs,
         )
 
     # ── --apply path ──
     merge_results: list[dict] = []
     failure_count = 0
-    for slug, pr in eligible_prs:
+    for slug, pr in primary_eligible_prs:
         method = policy_for(policy, slug).merge_method
         try:
             response = gh.merge_pr(
@@ -458,6 +511,18 @@ def _run_under_lock(
             # CONTINUE — the other PRs still deserve a shot. A single
             # un-mergeable PR must not block the whole run.
             continue
+        # Capture the resulting merge commit SHA via a follow-up gh call.
+        # Failure here is non-fatal: the merge succeeded, we just won't
+        # be able to surface its CD status in the post-merge watchdog.
+        merge_commit_sha: str | None = None
+        try:
+            merge_commit_sha = gh.fetch_merge_commit_sha(slug, pr.number)
+        except GHError as e:
+            rs.record_error(
+                f"fetch_merge_commit_sha failed for {slug}#{pr.number}: {e}",
+                level="WARNING",
+                context={"slug": slug, "pr": pr.number, "error": str(e)},
+            )
         merge_results.append(
             {
                 "slug": slug,
@@ -465,24 +530,27 @@ def _run_under_lock(
                 "title": pr.title,
                 "url": pr.url,
                 "head_sha": pr.head_sha,
+                "merge_commit_sha": merge_commit_sha,
                 "merged": True,
                 "method": method,
                 "response": response,
             }
         )
 
-    # Record per-repo state for both eligible-merged and the skipped
-    # PRs that landed in pr_skips_by_repo. We aggregate per slug so the
-    # state.yaml shape is consistent across subcommands.
+    # Record per-repo state. Include primary + deferred so the record
+    # reflects all gate-passing PRs, not just the one that fired.
+    all_actionable = primary_eligible_prs + deferred_prs
     for repo in passing_repos:
         repo_results = [r for r in merge_results if r["slug"] == repo.slug]
         repo_skips = pr_skips_by_repo.get(repo.slug, [])
-        if repo_results or repo_skips:
+        if repo_results or repo_skips or any(
+            slug == repo.slug for slug, _ in all_actionable
+        ):
             rs.record_repo_state(
                 repo.slug,
                 _state_for_repo(
                     repo.slug,
-                    eligible_prs,
+                    all_actionable,
                     pr_skips_by_repo,
                     repo_results,
                     apply=True,
@@ -508,16 +576,18 @@ def _run_under_lock(
         all_repos=repos,
         passing_repos=passing_repos,
         skipped_repos=skipped_repos,
-        eligible_prs=eligible_prs,
+        eligible_prs=primary_eligible_prs,
         merge_results=merge_results,
         apply=True,
+        deferred_prs=deferred_prs,
     )
     rs.write_summary(summary_md)
 
     summary_text = (
         f"merged {len(merge_results) - failure_count} of "
-        f"{len(eligible_prs)} eligible PRs; "
+        f"{len(primary_eligible_prs)} primary-eligible PRs; "
         f"{failure_count} failed; "
+        f"{len(deferred_prs)} deferred; "
         f"{len(skipped_repos)} repos skipped"
     )
     return _finish(
@@ -529,10 +599,11 @@ def _run_under_lock(
         all_repos=repos,
         passing_repos=passing_repos,
         skipped_repos=skipped_repos,
-        eligible_prs=eligible_prs,
+        eligible_prs=primary_eligible_prs,
         merge_results=merge_results,
         apply=True,
         skip_writing_summary=True,
+        deferred_prs=deferred_prs,
     )
 
 
@@ -551,6 +622,17 @@ def _state_for_repo(
     so ``gitbulk show merge --state`` is grep-friendly.
     """
     prs_payload: list[dict] = []
+    # Detect which entries are deferred via the one-merge-per-repo
+    # guardrail: a same-slug PR that appears AFTER another same-slug PR
+    # in eligible_prs is deferred. (eligible_prs is sorted by (slug, num).)
+    seen_in_slug: set[int] = set()
+    deferred_numbers: set[int] = set()
+    for s, pr in eligible_prs:
+        if s != slug:
+            continue
+        if seen_in_slug:
+            deferred_numbers.add(pr.number)
+        seen_in_slug.add(pr.number)
     for s, pr in eligible_prs:
         if s != slug:
             continue
@@ -561,7 +643,9 @@ def _state_for_repo(
             "head_sha": pr.head_sha,
             "eligible": True,
         }
-        if apply:
+        if pr.number in deferred_numbers:
+            entry["deferred"] = "same-repo guardrail (one merge per repo per run)"
+        elif apply:
             match = next(
                 (r for r in repo_merge_results if r["number"] == pr.number),
                 None,
@@ -570,6 +654,8 @@ def _state_for_repo(
                 entry["merged"] = match["merged"]
                 if not match["merged"]:
                     entry["error"] = match.get("error", "")
+                if match.get("merge_commit_sha"):
+                    entry["merge_commit_sha"] = match["merge_commit_sha"]
         prs_payload.append(entry)
     for record in pr_skips_by_repo.get(slug, []):
         prs_payload.append(
@@ -599,6 +685,7 @@ def _finish(
     merge_results: list[dict] | None,
     apply: bool,
     skip_writing_summary: bool = False,
+    deferred_prs: list[tuple[str, PRInfo]] | None = None,
 ) -> int:
     """Terminal-stage write: summary.md (if not already), sentinel,
     runstate.complete().
@@ -612,6 +699,7 @@ def _finish(
             eligible_prs=eligible_prs,
             merge_results=merge_results,
             apply=apply,
+            deferred_prs=deferred_prs,
         )
         rs.write_summary(f"# gitbulk merge (FAILED)\n\n{summary}\n\n{synth}")
 

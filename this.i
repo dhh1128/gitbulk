@@ -246,6 +246,80 @@ Gitbulk Triage Tool = goal:
         subcommand, not the merge subcommand.
       approved-by: daniel, 2026-05-28
 
+    One Merge Per Repo Per Run Guardrail = decision:
+      id: kdgmyj7o
+      why: >
+        ``gitbulk merge --apply`` will merge AT MOST one PR per repo per
+        run. If multiple gate-passing PRs exist in the same repo, the
+        lowest-numbered one (oldest, most likely to have been ready
+        longest) is merged; the rest are recorded as "deferred to next
+        run" in summary.md and state.yaml. Dry-run mirrors the same
+        partitioning so what the user sees in DRY-RUN is what APPLY
+        will actually do.
+
+        Why: merging PR A in a repo has domino effects on its siblings
+        targeting the same base — chiefly (a) mergeable_state goes
+        DIRTY on conflicting siblings, and (b) if branch protection has
+        "Dismiss stale pull request approvals when new commits are
+        pushed" enabled, sibling approvals get dismissed silently when
+        the base advances. Acting on N PRs in a single run means
+        operating against state we KNOW is about to change.
+
+        Discovered the hard way 2026-05-28: PR #93 was merged by hand
+        into provenant-dev/origin-shim-svc; sibling PR #95 immediately
+        went DIRTY. gitbulk's pr.mergeable_state_clean correctly
+        Skipped it, but only because we hadn't already tried both in a
+        single run. Without the guardrail, a multi-PR cron tick would
+        attempt #95 against fresh stale data.
+
+        Rejected: "refetch state after each merge." Doubles GraphQL
+        calls, adds an async race window (GitHub recomputes
+        mergeable_state asynchronously; the refetch could return
+        UNKNOWN), and cron's per-tick cadence means a deferred PR only
+        waits one cron interval to be picked up. Simple beats
+        elaborate.
+      approved-by: daniel, 2026-05-28
+
+    Post-Merge CD Watchdog = decision:
+      id: aazqlwc3
+      why: >
+        After each successful merge, gitbulk captures the resulting
+        merge commit SHA (via a follow-up ``gh pr view --json
+        mergeCommit`` call) and records it in state.yaml. On every
+        subsequent ``gitbulk report`` run, the report scans run-state
+        from the last 24 hours, collects (slug, merge_sha) pairs (cap
+        50), fetches check-runs for each via
+        ``gh api repos/<slug>/commits/<sha>/check-runs``, and surfaces
+        any failing conclusions ({failure, cancelled, timed_out,
+        action_required, stale}) in a "Recent merges" section at the
+        top of the report. ATTENTION is raised on any failure.
+
+        Why: gitbulk's view of a merge ends the moment ``gh pr merge``
+        returns. CD workflows (cd.yml, deploy.yml, package-publish)
+        often run AFTER the merge and can fail invisibly to gitbulk.
+        Discovered 2026-05-28: a manual merge of #93 in
+        provenant-dev/origin-shim-svc broke cd.yml; gitbulk had no
+        record. Two-call cost (one extra ``gh pr view`` per merged PR,
+        one ``gh api check-runs`` per recent merge per report run) is
+        small.
+
+        Rejected: a dedicated ``gitbulk verify-merges`` subcommand
+        polling more aggressively (every 5 minutes for 30 minutes
+        post-merge). Higher cost, requires cron orchestration, and
+        report already runs nightly which is the natural cadence for
+        catching previous-day breakage.
+
+        Rejected for v1: acknowledgement-of-seen-failures mechanism.
+        Every report run shows current state of recent merges; if a
+        failure stays red, every report run re-flags it as ATTENTION.
+        If that becomes noisy in practice, add an ``ack`` flow then.
+
+        Failure to fetch check-runs (gh error, transient or otherwise)
+        is recorded as WARNING but does NOT force ATTENTION — we don't
+        actually know the check state, and a downstream gh outage
+        shouldn't escalate every report run.
+      approved-by: daniel, 2026-05-28
+
     Two File Configuration = decision:
       id: ws2pn4kr
       why: >

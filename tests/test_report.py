@@ -33,7 +33,7 @@ from gitbulk.commands.report import (
 from gitbulk.gh import FakeGHClient, GHError
 from gitbulk.locks import LockTimeoutError
 from gitbulk.org_members_cache import CachedMembers, save_cache
-from gitbulk.pr_info import PRInfo
+from gitbulk.pr_info import CheckRun, PRInfo
 
 
 # ─── Fixtures ──────────────────────────────────────────────────────────────
@@ -853,3 +853,338 @@ def test_config_root_flag_routes_paths(
         ]
     )
     assert rc == EXIT_OK
+
+
+# ─── Post-merge watchdog (G2c) ────────────────────────────────────────────
+
+
+def _write_merge_run(
+    *,
+    isolated_xdg,
+    timestamp: str,
+    repos_payload: dict,
+) -> None:
+    """Synthesize a ``runs/<timestamp>-merge/state.yaml`` so the watchdog
+    scan picks it up. Mimics the on-disk shape merge_handler writes."""
+    run_dir = paths.runs_dir() / f"{timestamp}-merge"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    state_doc = {"schema_version": 1, "repos": repos_payload}
+    (run_dir / "state.yaml").write_text(yaml.safe_dump(state_doc))
+
+
+def _now_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _past_str(hours_ago: int) -> str:
+    from datetime import timedelta
+    return (
+        datetime.now(timezone.utc) - timedelta(hours=hours_ago)
+    ).strftime("%Y%m%dT%H%M%SZ")
+
+
+def test_scan_recent_merges_returns_empty_when_no_runs(isolated_xdg):
+    from gitbulk.commands.report import _scan_recent_merges
+    assert _scan_recent_merges(datetime.now(timezone.utc)) == []
+
+
+def test_scan_recent_merges_returns_empty_when_runs_dir_missing(
+    monkeypatch, tmp_path,
+):
+    """Defensive: paths.runs_dir() doesn't exist (no gitbulk run has ever
+    happened on this machine). Walks no directories, returns empty."""
+    missing = tmp_path / "no-runs-here"
+    monkeypatch.setattr(
+        "gitbulk.commands.report.paths.runs_dir", lambda: missing
+    )
+    from gitbulk.commands.report import _scan_recent_merges
+    assert _scan_recent_merges(datetime.now(timezone.utc)) == []
+
+
+def test_scan_recent_merges_finds_merge_in_window(isolated_xdg):
+    from gitbulk.commands.report import _scan_recent_merges
+    _write_merge_run(
+        isolated_xdg=isolated_xdg,
+        timestamp=_now_str(),
+        repos_payload={
+            "a/b": {
+                "pr_count": 1,
+                "prs": [
+                    {
+                        "number": 7,
+                        "title": "x",
+                        "url": "u",
+                        "head_sha": "h" * 40,
+                        "eligible": True,
+                        "merged": True,
+                        "merge_commit_sha": "deadbeef" * 5,
+                    }
+                ],
+            }
+        },
+    )
+    result = _scan_recent_merges(datetime.now(timezone.utc))
+    assert len(result) == 1
+    assert result[0]["slug"] == "a/b"
+    assert result[0]["merge_commit_sha"] == "deadbeef" * 5
+
+
+def test_scan_recent_merges_skips_old_runs(isolated_xdg):
+    from gitbulk.commands.report import _scan_recent_merges
+    _write_merge_run(
+        isolated_xdg=isolated_xdg,
+        timestamp=_past_str(48),  # 48h ago > 24h window
+        repos_payload={
+            "a/b": {
+                "pr_count": 1,
+                "prs": [
+                    {
+                        "number": 1,
+                        "merge_commit_sha": "a" * 40,
+                    }
+                ],
+            }
+        },
+    )
+    assert _scan_recent_merges(datetime.now(timezone.utc)) == []
+
+
+def test_scan_recent_merges_skips_pr_without_merge_sha(isolated_xdg):
+    from gitbulk.commands.report import _scan_recent_merges
+    _write_merge_run(
+        isolated_xdg=isolated_xdg,
+        timestamp=_now_str(),
+        repos_payload={
+            "a/b": {
+                "pr_count": 1,
+                "prs": [{"number": 1}],  # dry-run-style, no merge_commit_sha
+            }
+        },
+    )
+    assert _scan_recent_merges(datetime.now(timezone.utc)) == []
+
+
+def test_scan_recent_merges_ignores_non_merge_dirs(isolated_xdg):
+    """Only directories named ``<timestamp>-merge`` are scanned."""
+    other = paths.runs_dir() / f"{_now_str()}-report"
+    other.mkdir(parents=True, exist_ok=True)
+    (other / "state.yaml").write_text(yaml.safe_dump({"repos": {}}))
+    from gitbulk.commands.report import _scan_recent_merges
+    assert _scan_recent_merges(datetime.now(timezone.utc)) == []
+
+
+def test_scan_recent_merges_skips_malformed_timestamp(isolated_xdg):
+    bad = paths.runs_dir() / "not-a-timestamp-merge"
+    bad.mkdir(parents=True, exist_ok=True)
+    (bad / "state.yaml").write_text(yaml.safe_dump({"repos": {}}))
+    from gitbulk.commands.report import _scan_recent_merges
+    assert _scan_recent_merges(datetime.now(timezone.utc)) == []
+
+
+def test_scan_recent_merges_skips_missing_state_yaml(isolated_xdg):
+    run_dir = paths.runs_dir() / f"{_now_str()}-merge"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    # No state.yaml written
+    from gitbulk.commands.report import _scan_recent_merges
+    assert _scan_recent_merges(datetime.now(timezone.utc)) == []
+
+
+def test_scan_recent_merges_skips_malformed_yaml(isolated_xdg):
+    run_dir = paths.runs_dir() / f"{_now_str()}-merge"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "state.yaml").write_text("not: : valid: yaml: [")
+    from gitbulk.commands.report import _scan_recent_merges
+    assert _scan_recent_merges(datetime.now(timezone.utc)) == []
+
+
+def test_scan_recent_merges_skips_non_dict_doc(isolated_xdg):
+    run_dir = paths.runs_dir() / f"{_now_str()}-merge"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "state.yaml").write_text(yaml.safe_dump([1, 2, 3]))
+    from gitbulk.commands.report import _scan_recent_merges
+    assert _scan_recent_merges(datetime.now(timezone.utc)) == []
+
+
+def test_scan_recent_merges_skips_non_dict_repo_payload(isolated_xdg):
+    """Defensive: a repos entry whose value isn't a dict (corrupt file)."""
+    run_dir = paths.runs_dir() / f"{_now_str()}-merge"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "state.yaml").write_text(
+        yaml.safe_dump({"repos": {"a/b": "not-a-dict"}})
+    )
+    from gitbulk.commands.report import _scan_recent_merges
+    assert _scan_recent_merges(datetime.now(timezone.utc)) == []
+
+
+def test_scan_recent_merges_skips_non_dict_pr_entry(isolated_xdg):
+    run_dir = paths.runs_dir() / f"{_now_str()}-merge"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "state.yaml").write_text(
+        yaml.safe_dump({"repos": {"a/b": {"prs": ["not-a-dict"]}}})
+    )
+    from gitbulk.commands.report import _scan_recent_merges
+    assert _scan_recent_merges(datetime.now(timezone.utc)) == []
+
+
+def test_scan_recent_merges_caps_at_50(isolated_xdg):
+    """_WATCHDOG_MAX_MERGES cap. Build a single run with 60 PRs and
+    verify only 50 come back."""
+    prs = [
+        {"number": i, "merge_commit_sha": f"sha{i:040d}"}
+        for i in range(60)
+    ]
+    _write_merge_run(
+        isolated_xdg=isolated_xdg,
+        timestamp=_now_str(),
+        repos_payload={"a/b": {"pr_count": 60, "prs": prs}},
+    )
+    from gitbulk.commands.report import _scan_recent_merges
+    result = _scan_recent_merges(datetime.now(timezone.utc))
+    assert len(result) == 50
+
+
+def test_report_watchdog_surfaces_check_failures(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """A recent merge whose merge commit has a failing check run is
+    surfaced in the summary and forces ATTENTION."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    merge_sha = "f" * 40
+    _write_merge_run(
+        isolated_xdg=isolated_xdg,
+        timestamp=_now_str(),
+        repos_payload={
+            "dhh1128/alpha": {
+                "pr_count": 1,
+                "prs": [
+                    {
+                        "number": 42,
+                        "title": "the merged one",
+                        "url": "https://github.com/dhh1128/alpha/pull/42",
+                        "head_sha": "h" * 40,
+                        "eligible": True,
+                        "merged": True,
+                        "merge_commit_sha": merge_sha,
+                    }
+                ],
+            }
+        },
+    )
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+        check_runs={
+            ("dhh1128/alpha", merge_sha): [
+                CheckRun(
+                    name="deploy",
+                    status="completed",
+                    conclusion="failure",
+                    details_url="https://example.com",
+                    completed_at=None,
+                ),
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+    rc = report_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_ATTENTION_NEEDED
+    summary = (paths.latest_run_symlink("report").resolve() / "summary.md").read_text()
+    assert "Recent merges (last 24h)" in summary
+    assert "FAILING checks: deploy" in summary
+
+
+def test_report_watchdog_clean_checks_no_attention(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """All check-runs green → 'checks OK' shown, no extra ATTENTION."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    merge_sha = "e" * 40
+    _write_merge_run(
+        isolated_xdg=isolated_xdg,
+        timestamp=_now_str(),
+        repos_payload={
+            "dhh1128/alpha": {
+                "pr_count": 1,
+                "prs": [
+                    {
+                        "number": 5,
+                        "title": "good merge",
+                        "url": "u",
+                        "merge_commit_sha": merge_sha,
+                    }
+                ],
+            }
+        },
+    )
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+        check_runs={
+            ("dhh1128/alpha", merge_sha): [
+                CheckRun(
+                    name="test",
+                    status="completed",
+                    conclusion="success",
+                    details_url="u",
+                    completed_at=None,
+                ),
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+    rc = report_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_OK
+    summary = (paths.latest_run_symlink("report").resolve() / "summary.md").read_text()
+    assert "checks OK" in summary
+
+
+def test_report_watchdog_handles_fetch_error(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """fetch_check_runs raising is recorded as a WARNING; the merge is
+    listed with the error message but doesn't force ATTENTION (we don't
+    actually know the check state)."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    merge_sha = "d" * 40
+    _write_merge_run(
+        isolated_xdg=isolated_xdg,
+        timestamp=_now_str(),
+        repos_payload={
+            "dhh1128/alpha": {
+                "pr_count": 1,
+                "prs": [
+                    {
+                        "number": 3,
+                        "title": "fetch fails",
+                        "url": "u",
+                        "merge_commit_sha": merge_sha,
+                    }
+                ],
+            }
+        },
+    )
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+        # No check_runs configured → fetch_check_runs raises
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+    rc = report_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_OK  # no other attention triggers, watchdog error doesn't escalate
+    summary = (paths.latest_run_symlink("report").resolve() / "summary.md").read_text()
+    assert "check-fetch FAILED" in summary

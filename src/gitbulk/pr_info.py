@@ -67,6 +67,24 @@ KNOWN_CHECKS_STATUSES: frozenset[str] = frozenset(
 
 
 @dataclass(frozen=True)
+class CheckRun:
+    """One check-run row from ``GET /repos/<slug>/commits/<sha>/check-runs``.
+
+    Used by the post-merge watchdog in :mod:`gitbulk.commands.report` to
+    surface CD failures that fire AFTER a merge gitbulk performed.
+    ``conclusion`` is null while a check is still running and otherwise
+    one of: success, failure, neutral, cancelled, skipped, timed_out,
+    action_required, stale.
+    """
+
+    name: str
+    status: str
+    conclusion: str | None
+    details_url: str
+    completed_at: datetime | None
+
+
+@dataclass(frozen=True)
 class PRComment:
     """One PR issue-comment, fetched by close-stale to find prior warnings.
 
