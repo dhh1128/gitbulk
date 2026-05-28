@@ -160,8 +160,10 @@ def test_maybe_set_attention_on_exit_2_with_no_existing(isolated_cache):
     assert not sentinel.has_attention()
     _maybe_set_attention(EXIT_ATTENTION_NEEDED, "report")
     assert sentinel.has_attention()
-    content = sentinel.read_attention()
-    assert content.startswith("2 report ")
+    parsed = sentinel.parse_attention()
+    assert parsed is not None
+    assert parsed["exit_code"] == EXIT_ATTENTION_NEEDED
+    assert parsed["subcommand"] == "report"
 
 
 def test_maybe_set_attention_on_exit_3_with_no_existing(isolated_cache):
@@ -169,7 +171,10 @@ def test_maybe_set_attention_on_exit_3_with_no_existing(isolated_cache):
 
     _maybe_set_attention(EXIT_INVARIANT_SKIPPED, "merge")
     assert sentinel.has_attention()
-    assert sentinel.read_attention().startswith("3 merge ")
+    parsed = sentinel.parse_attention()
+    assert parsed is not None
+    assert parsed["exit_code"] == EXIT_INVARIANT_SKIPPED
+    assert parsed["subcommand"] == "merge"
 
 
 def test_maybe_set_attention_does_not_overwrite_existing(isolated_cache):
@@ -177,9 +182,11 @@ def test_maybe_set_attention_does_not_overwrite_existing(isolated_cache):
 
     sentinel.set_attention(2, "report", "REAL-RUNID", "real handler summary")
     _maybe_set_attention(EXIT_ATTENTION_NEEDED, "report")
-    # Existing richer sentinel is preserved
-    assert "REAL-RUNID" in sentinel.read_attention()
-    assert "real handler summary" in sentinel.read_attention()
+    # Existing richer sentinel is preserved (richer summary survives the fallback)
+    parsed = sentinel.parse_attention()
+    assert parsed is not None
+    assert parsed["runid"] == "REAL-RUNID"
+    assert parsed["summary"] == "real handler summary"
 
 
 def test_maybe_set_attention_does_nothing_on_exit_0(isolated_cache):

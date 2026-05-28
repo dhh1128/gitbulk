@@ -2,8 +2,9 @@
 
 A :class:`RunState` owns one ``~/.cache/gitbulk/runs/<runid>-<subcommand>/``
 directory and is the single place each subcommand records its decisions.
-See this.i nodes ``tp4kq2nr`` (the 4-layer notification model) and
-``kp7nw4mq`` (this module's schema and API contract).
+See this.i nodes ``tp4kq2nr`` (the 4-layer notification model),
+``kp7nw4mq`` (this module's schema and API contract), and ``schv4nrm``
+(the schema-versioning convention applied to every artifact).
 """
 
 from __future__ import annotations
@@ -17,6 +18,12 @@ from typing import Any
 import yaml
 
 from gitbulk import __version__, paths
+
+#: Schema version stamped onto every artifact this module writes.
+#: Bump (and document a corresponding decision node in ``this.i``) when
+#: a breaking change to manifest.yaml / state.yaml / invariants.log /
+#: errors.log shape lands.
+SCHEMA_VERSION = 1
 
 _VALID_INVARIANT_RESULTS = {"PASS", "SKIP", "FAIL"}
 
@@ -73,9 +80,13 @@ class RunState:
 
         # Initial empty state.yaml so a crash before any record_repo_state
         # still leaves a parseable file.
-        _atomic_write_text(run_dir / "state.yaml", yaml.safe_dump({"repos": {}}))
+        _atomic_write_text(
+            run_dir / "state.yaml",
+            yaml.safe_dump({"schema_version": SCHEMA_VERSION, "repos": {}}),
+        )
 
         manifest = {
+            "schema_version": SCHEMA_VERSION,
             "gitbulk_version": __version__,
             "subcommand": subcommand,
             "argv": list(argv),
@@ -106,6 +117,7 @@ class RunState:
                 f"expected one of {sorted(_VALID_INVARIANT_RESULTS)}"
             )
         event = {
+            "v": SCHEMA_VERSION,
             "ts": _utc_now_iso(),
             "name": name,
             "target": target,
@@ -122,6 +134,7 @@ class RunState:
         context: dict[str, Any] | None = None,
     ) -> None:
         event = {
+            "v": SCHEMA_VERSION,
             "ts": _utc_now_iso(),
             "level": level,
             "message": message,
@@ -131,7 +144,10 @@ class RunState:
 
     def record_repo_state(self, slug: str, payload: dict[str, Any]) -> None:
         self._per_repo[slug] = payload
-        full_state = {"repos": dict(self._per_repo)}
+        full_state = {
+            "schema_version": SCHEMA_VERSION,
+            "repos": dict(self._per_repo),
+        }
         _atomic_write_text(
             self._run_dir / "state.yaml",
             yaml.safe_dump(full_state, sort_keys=False),

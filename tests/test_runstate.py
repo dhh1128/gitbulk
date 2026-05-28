@@ -12,6 +12,7 @@ import yaml
 
 from gitbulk import __version__, paths
 from gitbulk.runstate import (
+    SCHEMA_VERSION,
     RunState,
     _atomic_write_symlink,
     _atomic_write_text,
@@ -42,6 +43,7 @@ def test_begin_writes_manifest_with_expected_fields(isolated_cache):
     config = {"defaults": {"merge_policy": "strict"}}
     rs = RunState.begin("report", argv, config, when=when)
     manifest = yaml.safe_load((rs.run_dir / "manifest.yaml").read_text())
+    assert manifest["schema_version"] == SCHEMA_VERSION
     assert manifest["gitbulk_version"] == __version__
     assert manifest["subcommand"] == "report"
     assert manifest["argv"] == argv
@@ -55,7 +57,7 @@ def test_begin_writes_manifest_with_expected_fields(isolated_cache):
 def test_begin_writes_initial_empty_state_yaml(isolated_cache):
     rs = RunState.begin("merge", [], {})
     state = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
-    assert state == {"repos": {}}
+    assert state == {"schema_version": SCHEMA_VERSION, "repos": {}}
 
 
 def test_begin_run_dir_property_matches_paths_module(isolated_cache):
@@ -81,6 +83,7 @@ def test_record_invariant_appends_jsonl_event(isolated_cache):
     lines = (rs.run_dir / "invariants.log").read_text().splitlines()
     assert len(lines) == 1
     event = json.loads(lines[0])
+    assert event["v"] == SCHEMA_VERSION
     assert event["name"] == "gh.authenticated"
     assert event["target"] == "global"
     assert event["result"] == "PASS"
@@ -118,6 +121,7 @@ def test_record_error_appends_jsonl_with_default_level(isolated_cache):
     lines = (rs.run_dir / "errors.log").read_text().splitlines()
     assert len(lines) == 1
     event = json.loads(lines[0])
+    assert event["v"] == SCHEMA_VERSION
     assert event["level"] == "ERROR"
     assert event["message"] == "something went wrong"
     assert event["context"] == {}
@@ -152,7 +156,10 @@ def test_record_repo_state_writes_state_yaml(isolated_cache):
     rs = RunState.begin("merge", [], {})
     rs.record_repo_state("owner/repo", {"prs_seen": 3, "merged": 1})
     state = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
-    assert state == {"repos": {"owner/repo": {"prs_seen": 3, "merged": 1}}}
+    assert state == {
+        "schema_version": SCHEMA_VERSION,
+        "repos": {"owner/repo": {"prs_seen": 3, "merged": 1}},
+    }
 
 
 def test_record_repo_state_preserves_earlier_repos(isolated_cache):
@@ -162,10 +169,11 @@ def test_record_repo_state_preserves_earlier_repos(isolated_cache):
     rs.record_repo_state("owner1/repo1", {"x": 99})  # update repo1
     state = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
     assert state == {
+        "schema_version": SCHEMA_VERSION,
         "repos": {
             "owner1/repo1": {"x": 99},
             "owner2/repo2": {"y": 2},
-        }
+        },
     }
 
 
