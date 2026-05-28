@@ -38,7 +38,6 @@ invariants; this module never shells out to anything else.
 
 from __future__ import annotations
 
-import re
 import subprocess
 from datetime import datetime, timezone
 
@@ -154,32 +153,7 @@ class OrgMembersFreshInvariant(Invariant):
 # ─── PER_REPO ─────────────────────────────────────────────────────────────
 
 
-_GITHUB_REMOTE_PATTERNS: tuple[re.Pattern[str], ...] = (
-    # ssh: git@github.com:owner/repo(.git)
-    re.compile(r"^git@github\.com:(?P<slug>[^/]+/[^/]+?)(?:\.git)?$"),
-    # https: https://github.com/owner/repo(.git)
-    re.compile(r"^https?://github\.com/(?P<slug>[^/]+/[^/]+?)(?:\.git)?/?$"),
-    # ssh-url: ssh://git@github.com/owner/repo(.git)
-    re.compile(r"^ssh://git@github\.com/(?P<slug>[^/]+/[^/]+?)(?:\.git)?$"),
-)
-
-
-def _extract_slug_from_remote_url(url: str) -> str | None:
-    """Extract ``owner/repo`` from a GitHub remote URL, or None.
-
-    Accepts the three remote URL forms gh and git normally emit: SSH
-    shorthand (``git@github.com:o/r.git``), HTTPS
-    (``https://github.com/o/r``), and the rarer SSH URL form
-    (``ssh://git@github.com/o/r.git``). Returns None for anything
-    that doesn't match — including URLs pointing at non-GitHub hosts,
-    which is correct: ``local.remote_matches`` should Skip on those
-    rather than try to guess a slug.
-    """
-    for pattern in _GITHUB_REMOTE_PATTERNS:
-        match = pattern.match(url)
-        if match:
-            return match.group("slug")
-    return None
+from gitbulk.util.github_url import extract_slug_from_url as _extract_slug_from_remote_url  # noqa: E402,F401
 
 
 @register

@@ -1,28 +1,40 @@
-# gitbulk repo list — one GitHub slug per line.
+# gitbulk repo list — one entry per line.
 #
-# Format: owner/repo
-#   - The exact slug GitHub uses in URLs (e.g. github.com/<owner>/<repo>)
-#   - No protocol, no `.git` suffix, no local path
+# ACCEPTED FORMS (mix freely):
 #
-# Examples of VALID entries:
-#   provenant-dev/origin-platform
-#   dhh1128/gitbulk
+#   1. Canonical slug: owner/repo
+#        provenant-dev/origin-platform
+#      Local clone assumed at <code-root>/<repo-name>.
 #
-# Examples of INVALID entries (will fail validation):
-#   git@github.com:provenant-dev/origin-platform.git    (remote URL, not a slug)
-#   https://github.com/provenant-dev/origin-platform    (URL, not a slug)
-#   /home/daniel/code/origin-platform                   (filesystem path, not a slug)
-#   provenant-dev/origin-platform.git                   (trailing .git not allowed)
+#   2. GitHub URL (HTTPS or SSH): gitbulk parses the slug from the URL.
+#        https://github.com/provenant-dev/origin-platform
+#        git@github.com:provenant-dev/origin-platform.git
+#        ssh://git@github.com/provenant-dev/origin-platform
+#      Local clone still assumed at <code-root>/<repo-name>.
 #
-# Local clone path: gitbulk assumes the local clone lives at
-# `<code-root>/<repo-basename>`, where code-root defaults to `~/code/` and
-# can be overridden per-invocation via `--code-root PATH`. Only subcommands
-# that need a working tree (`dispatch`, `rebase-onto-default`) actually
-# read the local clone; `report`, `merge`, `close-stale`, and `summarize`
-# operate purely against the GitHub API.
+#   3. Local path: gitbulk runs `git -C <path> remote get-url origin` to
+#      discover the slug, AND uses the path itself as the local clone
+#      location (overriding <code-root>/<repo-name>). Useful when your
+#      clones aren't organized by basename (nested categories, duplicate
+#      basenames across owners, etc.).
+#        /home/daniel/code/origin-platform
+#        ~/code/work/special/nested-clone
 #
-# Blank lines and lines starting with # are ignored.
-# Duplicate slugs are logged as WARNINGs and silently deduped (first wins).
+# REJECTED (these will fail with a friendly error message):
+#   - URLs pointing at non-github.com hosts
+#   - Paths to directories that don't exist or aren't git repos
+#   - Paths to git repos with no `origin` remote
+#   - Anything else that can't be canonicalized to owner/repo
+#
+# OTHER:
+#   - Blank lines and lines starting with # are ignored.
+#   - Inline comments after #  are stripped.
+#   - Duplicate slugs (after canonicalization) → first wins, rest
+#     warned + skipped.
+#   - Default <code-root> is ~/code/; override per-invocation via
+#     `--code-root PATH`.
+#   - The `--code-root` override only matters for entries that use
+#     forms 1 or 2; form 3 already pins the clone location explicitly.
 
 # Provenant
 provenant-dev/origin-platform
