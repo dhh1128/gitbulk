@@ -1,0 +1,31 @@
+# Dependabot config for gitbulk.
+# See: https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+
+version: 2
+updates:
+  # Python deps (PyYAML, pytest, etc.) — pin via uv.lock and bump regularly so
+  # the lockfile does not rot and a known-good tree is always available for
+  # reproducing past CI runs (per this.i node ck5pwr2n's lockfile rationale).
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: deps
+      include: scope
+
+  # GitHub Actions versions — node20 → node24 deprecations are exactly the
+  # class of change that already bit this codebase (see ~/.claude/CLAUDE.md
+  # "GitHub Actions versions"). Dependabot catches them on a schedule rather
+  # than waiting for the deprecation warning to surface in CI.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: ci
+      include: scope
