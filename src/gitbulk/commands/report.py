@@ -333,6 +333,35 @@ def _scan_recent_merges(now: datetime) -> list[dict]:
     return merges
 
 
+def _serialize_watchdog_record(record: dict) -> dict:
+    """Flatten a watchdog record (containing CheckRun dataclass instances)
+    into a YAML-friendly dict shape for state.yaml.
+
+    Drops ``check_runs`` and ``failures`` from the unfailing case (the
+    record's ``has_failure`` flag is the load-bearing signal); for
+    failing or errored records, include the failing check details so
+    the LLM prompt can name them in its triage output.
+    """
+    out: dict = {
+        "slug": record["slug"],
+        "number": record.get("number"),
+        "title": record.get("title", ""),
+        "url": record.get("url", ""),
+        "merge_commit_sha": record["merge_commit_sha"],
+        "run_id": record.get("run_id"),
+        "has_failure": record.get("has_failure", False),
+    }
+    if record.get("error"):
+        out["error"] = record["error"]
+    failures = record.get("failures") or []
+    if failures:
+        out["failing_checks"] = [
+            {"name": c.name, "details_url": c.details_url}
+            for c in failures
+        ]
+    return out
+
+
 def _is_ackable(check_runs: list[CheckRun]) -> bool:
     """True iff every check-run is completed AND in a passing conclusion.
 
@@ -668,6 +697,15 @@ def _run_under_lock(
     watchdog_records, any_watchdog_failure = _check_recent_merges(
         gh, rs, datetime.now(timezone.utc)
     )
+    # Persist the watchdog findings into state.yaml so downstream
+    # consumers (notably ``gitbulk summarize``'s LLM prompt) see them
+    # alongside the per-repo PR data. CheckRun is a dataclass — flatten
+    # to plain dicts for YAML serialization.
+    if watchdog_records:
+        rs.record_extra(
+            "recent_merges",
+            [_serialize_watchdog_record(r) for r in watchdog_records],
+        )
 
     # 9. Summary markdown.
     summary_md = _build_summary_md(

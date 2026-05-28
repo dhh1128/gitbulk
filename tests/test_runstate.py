@@ -184,6 +184,50 @@ def test_record_repo_state_leaves_no_tmp_file(isolated_cache):
     assert not (rs.run_dir / "state.yaml.tmp").exists()
 
 
+# ─── record_extra() ────────────────────────────────────────────────────────
+
+
+def test_record_extra_writes_top_level_key(isolated_cache):
+    """record_extra adds a top-level key alongside repos/schema_version."""
+    rs = RunState.begin("report", [], {})
+    rs.record_extra("recent_merges", [{"slug": "a/b", "sha": "x"}])
+    doc = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
+    assert doc["recent_merges"] == [{"slug": "a/b", "sha": "x"}]
+    # repos and schema_version still present.
+    assert "repos" in doc
+    assert doc["schema_version"] == 1
+
+
+def test_record_extra_overwrites_on_repeat(isolated_cache):
+    rs = RunState.begin("report", [], {})
+    rs.record_extra("recent_merges", [{"slug": "a/b"}])
+    rs.record_extra("recent_merges", [{"slug": "c/d"}])
+    doc = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
+    assert doc["recent_merges"] == [{"slug": "c/d"}]
+
+
+def test_record_extra_coexists_with_record_repo_state(isolated_cache):
+    """Both record_extra and record_repo_state writes survive
+    interleaving."""
+    rs = RunState.begin("report", [], {})
+    rs.record_repo_state("a/b", {"prs": []})
+    rs.record_extra("recent_merges", [])
+    rs.record_repo_state("c/d", {"prs": []})
+    doc = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
+    assert set(doc["repos"].keys()) == {"a/b", "c/d"}
+    assert doc["recent_merges"] == []
+
+
+def test_record_extra_rejects_reserved_keys(isolated_cache):
+    """schema_version and repos are reserved; trying to overwrite them
+    via record_extra raises ValueError."""
+    rs = RunState.begin("report", [], {})
+    with pytest.raises(ValueError, match="reserved"):
+        rs.record_extra("schema_version", 99)
+    with pytest.raises(ValueError, match="reserved"):
+        rs.record_extra("repos", {})
+
+
 # ─── write_summary() ───────────────────────────────────────────────────────
 
 

@@ -64,6 +64,7 @@ class RunState:
         self._run_dir = run_dir
         self._subcommand = subcommand
         self._per_repo: dict[str, dict[str, Any]] = {}
+        self._extras: dict[str, Any] = {}
 
     @classmethod
     def begin(
@@ -144,10 +145,28 @@ class RunState:
 
     def record_repo_state(self, slug: str, payload: dict[str, Any]) -> None:
         self._per_repo[slug] = payload
-        full_state = {
+        self._rewrite_state()
+
+    def record_extra(self, key: str, value: Any) -> None:
+        """Add or replace a top-level key in state.yaml besides ``repos``.
+
+        Used for cross-cutting findings that don't fit the per-repo
+        ``repos`` map — e.g. ``report``'s ``recent_merges`` watchdog
+        records. Repeated calls with the same ``key`` overwrite.
+        Reserved keys (``schema_version``, ``repos``) raise ValueError
+        to keep the file shape predictable.
+        """
+        if key in {"schema_version", "repos"}:
+            raise ValueError(f"reserved state.yaml key: {key!r}")
+        self._extras[key] = value
+        self._rewrite_state()
+
+    def _rewrite_state(self) -> None:
+        full_state: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "repos": dict(self._per_repo),
         }
+        full_state.update(self._extras)
         _atomic_write_text(
             self._run_dir / "state.yaml",
             yaml.safe_dump(full_state, sort_keys=False),
