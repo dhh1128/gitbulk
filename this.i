@@ -1330,17 +1330,74 @@ Gitbulk Triage Tool = goal:
       approved-by: daniel, 2026-05-28
 
 
-    Summarize Prompt Design = tension:
-      id: kw2pn7qz
+    Summarize Prompt Design = decision:  # resolves tension kw2pn7qz
+      id: smprmpt4n
       why: >
-        The prompt that `gitbulk summarize` sends to claude -p has not
-        been designed. The stub at prompts/triage.md captures intent but
-        the actual prompt depends on the structured output format that
-        `gitbulk report` produces — which is itself unbuilt (Phase 2).
-        Deferred to Phase 3 entry: the speculative interview at that
-        gate will design the prompt with real report output in hand.
-        Resolving earlier would produce a prompt against an imagined
-        data shape.
+        At Phase 3 entry, with `gitbulk report`'s state.yaml shape now
+        concrete (per node prdtm4kn and the per_repo records emitted by
+        commands/report.py), the summarize prompt is FROZEN as the
+        content of `prompts/triage.md`. Load-bearing choices:
+
+        (a) **Three fixed sections — TOP ATTENTION, BACKBURNER, CLEAN.**
+            The user's daily question is "what needs my eyes right now?"
+            Three sections answer it in decreasing urgency without
+            forcing the model into a long taxonomy. CLEAN is a count
+            only (no enumeration) so a quiet day produces a short
+            report. The fixed headings are also the parse target for
+            the attention-detection heuristic in commands/summarize.py
+            (`## TOP ATTENTION` followed by a non-empty body → set the
+            ATTENTION sentinel and exit 2). Renaming or reordering the
+            headings is a coupled change to that parser.
+
+        (b) **Input shape: structured state.yaml piped on stdin.**
+            Chosen over inlining the data in the prompt or feeding a
+            pre-rendered summary.md because: (i) state.yaml is the
+            only artifact stable enough across phases to commit to,
+            (ii) the model handles structured input well, (iii) it
+            keeps the prompt body small and reusable. The prompt
+            documents the field names it expects, so a future
+            state.yaml schema bump (per schv4nrm) is a prompt
+            update — caught by the test that asserts the prompt
+            references the current PRInfo field names.
+
+        (c) **Priority rules listed explicitly in the prompt.** An
+            ordered "first match wins" list (failing checks → changes
+            requested → blocked/dirty → review required → ready-to-
+            merge). Rejected: leaving prioritization implicit ("you
+            decide") — produces inconsistent runs day to day, which
+            defeats the "did the report change?" use case. Rejected:
+            full scoring formula — over-specifies without a measured
+            need yet.
+
+        (d) **Length cap: ~30 lines, terse.** A scannable triage in
+            a terminal is the point; longer output is friction at
+            6 a.m. The cap is advisory in the prompt, not enforced
+            by the handler — the model honors it reliably in
+            practice. If empirical drift shows otherwise, add a
+            post-hoc truncation in commands/summarize.py and update
+            this node.
+
+        (e) **--prompt PATH override.** The handler accepts an
+            alternate prompt file at runtime so the user can A/B
+            test prompt variants without editing the package. The
+            packaged prompt is the default, discovered via the
+            ``prompts/`` directory at the repo root (per AGENTS.md
+            "Where things live").
+
+        (f) **--model NAME override.** Same A/B story for the model;
+            default stays ``claude-sonnet-4-6`` (matches multiprompt
+            per node mp7kn4qz).
+
+        Out of scope for Phase 3 (revisit when needed):
+          - Multi-prompt summarize (per-priority-tier prompts). The
+            current single-shot prompt produces good output; adding
+            chained prompts triples the API cost without a measured
+            improvement.
+          - Structured (JSON) output from claude. Markdown is the
+            terminal-native format; a future ``gitbulk show
+            --summary --json`` would need a separate prompt variant.
+      approved-by: daniel, 2026-05-28
+      # was: tension kw2pn7qz (Summarize Prompt Design, deferred at Phase 0)
 
     Dispatch Execution Kernel = tension:
       id: mp7kn4qz
