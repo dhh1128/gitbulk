@@ -209,7 +209,12 @@ def load_repos(
             explicit_path = None
 
         if slug in seen_slugs:
-            _log.warning(
+            # Silent dedup — first wins. Duplicates have no harmful
+            # consequence (just a wasted line in repos.txt) so they don't
+            # warrant a WARNING-level log. Kept at DEBUG so anyone
+            # actively debugging "why isn't gitbulk seeing my entry?"
+            # can still find the answer.
+            _log.debug(
                 "%s:%d: duplicate slug %r (first seen at line %d); ignoring",
                 path,
                 lineno,

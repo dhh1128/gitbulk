@@ -711,6 +711,9 @@ def _finish(
         sentinel.set_attention(exit_code, "close-stale", runid, summary)
 
     rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
+
+    # One-line stdout summary; see report._finish for the rationale.
+    print(f"gitbulk close-stale: {summary}. View: gitbulk show close-stale")
     return exit_code
 
 

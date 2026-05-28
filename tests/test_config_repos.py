@@ -136,7 +136,9 @@ def test_security_hardened_slug_regex_rejects_in_repos(tmp_path):
 # ─── Duplicate slugs ───────────────────────────────────────────────────────
 
 
-def test_duplicate_slug_keeps_first_and_warns(tmp_path, caplog):
+def test_duplicate_slug_keeps_first_silently(tmp_path, caplog):
+    """First-wins dedup is silent (DEBUG-only) per the design that
+    duplicates are harmless and don't warrant a WARNING."""
     content = "dhh1128/gitbulk\nprovenant-dev/origin-platform\ndhh1128/gitbulk\n"
     path = _write_repos(tmp_path, content)
     with caplog.at_level(logging.WARNING, logger="gitbulk.config"):
@@ -144,6 +146,17 @@ def test_duplicate_slug_keeps_first_and_warns(tmp_path, caplog):
     assert len(entries) == 2
     assert entries[0].slug == "dhh1128/gitbulk"
     assert entries[0].source_line == 1
+    # No WARNING surfaced — duplicates are silent.
+    assert not any("duplicate slug" in rec.message for rec in caplog.records)
+
+
+def test_duplicate_slug_records_debug_log(tmp_path, caplog):
+    """Debug-level record is still available for anyone investigating
+    'why isn't my entry being seen?'"""
+    content = "dhh1128/gitbulk\ndhh1128/gitbulk\n"
+    path = _write_repos(tmp_path, content)
+    with caplog.at_level(logging.DEBUG, logger="gitbulk.config"):
+        load_repos(path, code_root=tmp_path / "code")
     assert any("duplicate slug" in rec.message for rec in caplog.records)
 
 
@@ -322,16 +335,14 @@ def test_mixed_forms_in_one_repos_txt(tmp_path):
     assert entries[2].local_path == repo.resolve()
 
 
-def test_duplicate_slug_across_forms_keeps_first(tmp_path, caplog):
+def test_duplicate_slug_across_forms_keeps_first(tmp_path):
     """A slug entry followed by a URL pointing at the same slug is
-    deduped to the slug entry (first wins)."""
+    deduped to the slug entry (first wins, silent)."""
     content = (
         "dhh1128/gitbulk\n"
         "https://github.com/dhh1128/gitbulk\n"
     )
     path = _write_repos(tmp_path, content)
-    with caplog.at_level(logging.WARNING, logger="gitbulk.config"):
-        entries = load_repos(path, code_root=tmp_path / "code")
+    entries = load_repos(path, code_root=tmp_path / "code")
     assert len(entries) == 1
     assert entries[0].source_line == 1
-    assert any("duplicate slug" in rec.message for rec in caplog.records)

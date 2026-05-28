@@ -793,6 +793,12 @@ def _finish(
         sentinel.set_attention(exit_code, "report", runid, summary)
 
     rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
+
+    # Tell the user what happened. Without this line, a successful
+    # report produces no stdout — the user has to know to look at
+    # ~/.cache/gitbulk/runs/latest-report/ on their own. Form is
+    # deliberately terse: one line summary + how to read more.
+    print(f"gitbulk report: {summary}. View: gitbulk show report")
     return exit_code
 
 

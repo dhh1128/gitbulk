@@ -708,6 +708,11 @@ def _finish(
         sentinel.set_attention(exit_code, "merge", runid, summary)
 
     rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
+
+    # One-line stdout summary so the user knows what happened without
+    # having to know about ~/.cache/gitbulk/runs/. See report._finish
+    # for the rationale.
+    print(f"gitbulk merge: {summary}. View: gitbulk show merge")
     return exit_code
 
 

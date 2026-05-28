@@ -247,9 +247,14 @@ def _run_under_lock(
             f"triage output flagged {len(items)} attention items",
         )
         rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
+        print(
+            f"gitbulk summarize: {len(items)} attention item(s). "
+            f"View: gitbulk show summarize"
+        )
         return exit_code
 
     rs.complete(EXIT_OK, retain_runs=policy.defaults.retain_runs)
+    print("gitbulk summarize: nothing requires attention. View: gitbulk show summarize")
     return EXIT_OK
 
 
