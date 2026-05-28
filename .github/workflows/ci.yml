@@ -10,10 +10,6 @@ permissions:
 
 jobs:
   test:
-    # Single-version per this.i node cipym4kr (revised 2026-05-28 after
-    # CI exposed flaky tests across the matrix). Track the deployment
-    # version in .python-version; bump both together.
-    name: pytest (py3.12)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
