@@ -10,11 +10,18 @@ compat assertions, but not for type narrowing.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal
 
 PRState = Literal["OPEN", "CLOSED", "MERGED"]
+
+#: Kinds of PR-timeline events that affect the continuously-ready window.
+#: ``draft`` (ConvertToDraftEvent) and ``changes_requested`` (a review
+#: with state CHANGES_REQUESTED) BREAK ready. ``ready`` (ReadyForReviewEvent)
+#: and ``approved`` (a review with state APPROVED) RESTORE it.
+#: See zk3r4nqp / bg4pqn7m and ``gitbulk.ready.compute_ready_since``.
+TimelineEventKind = Literal["draft", "ready", "changes_requested", "approved"]
 
 #: Values gh GraphQL currently emits for ``mergeStateStatus``. New values
 #: are tolerated at the type level (the field is ``str``) but trigger a
@@ -60,6 +67,21 @@ KNOWN_CHECKS_STATUSES: frozenset[str] = frozenset(
 
 
 @dataclass(frozen=True)
+class TimelineEvent:
+    """One PR-timeline event relevant to the continuously-ready window.
+
+    Captured from a subset of GraphQL ``timelineItems`` types — currently
+    ``ReadyForReviewEvent``, ``ConvertToDraftEvent``, and
+    ``PullRequestReview`` (where ``state in {APPROVED, CHANGES_REQUESTED}``).
+    Other timeline kinds (label changes, comments, force-pushes captured
+    via ``last_pushed_at``) are not stored.
+    """
+
+    kind: TimelineEventKind
+    at: datetime
+
+
+@dataclass(frozen=True)
 class PRInfo:
     """Read-only structured snapshot of one open PR.
 
@@ -85,3 +107,21 @@ class PRInfo:
     labels: tuple[str, ...]
     review_decision: str | None
     checks_status: str | None
+    #: Count of currently-unresolved review threads on the PR. Bots are
+    #: counted alongside humans per the merge-gate decision (see gaps.md
+    #: and the merge-only ``pr.no_unresolved_threads`` invariant).
+    #: Defaults to 0 so legacy test fixtures and the FakeGHClient stay
+    #: ergonomic; production code fills this from
+    #: ``reviewThreads.totalCount`` minus the resolved count.
+    unresolved_thread_count: int = 0
+    #: Subset of PR ``timelineItems`` ordered chronologically (oldest
+    #: first). Only kinds enumerated in :data:`TimelineEventKind` are
+    #: stored. Empty tuple when no relevant events occurred (or when
+    #: timeline data was not fetched, e.g. by FakeGHClient defaults).
+    timeline_events: tuple[TimelineEvent, ...] = field(default_factory=tuple)
+    #: True if the timeline window we fetched did not reach back to
+    #: ``last_pushed_at`` (i.e., GraphQL truncated). ``compute_ready_since``
+    #: treats this conservatively: if there is no anchor inside the
+    #: returned window, fall through to ``last_pushed_at`` as the only
+    #: reliable lower bound.
+    timeline_capped: bool = False

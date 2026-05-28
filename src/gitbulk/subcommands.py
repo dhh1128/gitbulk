@@ -57,6 +57,7 @@ _MERGE_CHAIN: tuple[str, ...] = (
     "pr.mergeable_state_clean",
     "pr.required_checks_green",
     "pr.approved_per_policy",
+    "pr.no_unresolved_threads",
     "pr.age_threshold",
 )
 

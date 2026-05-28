@@ -197,12 +197,14 @@ def test_merge_pr_records_call_arguments():
     ]
 
 
-def test_merge_pr_default_squash_and_delete_branch():
+def test_merge_pr_default_method_is_merge_and_delete_branch_true():
+    """Default merge method is `merge` (true merge commit) per gji4dyze.
+    delete_branch defaults to True so the remote PR branch is cleaned up."""
     fake = FakeGHClient(
         merge_responses={("a/b", 1): {}}
     )
     fake.merge_pr("a/b", 1)
-    assert fake.merge_calls[0]["method"] == "squash"
+    assert fake.merge_calls[0]["method"] == "merge"
     assert fake.merge_calls[0]["delete_branch"] is True
 
 

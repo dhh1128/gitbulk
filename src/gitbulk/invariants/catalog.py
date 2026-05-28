@@ -442,17 +442,55 @@ class PrApprovedPerPolicyInvariant(Invariant):
 
 
 @register
+class PrNoUnresolvedThreadsInvariant(Invariant):
+    """Skip the PR unless every review thread is resolved.
+
+    Per the merge-gate decision in ``gaps.md`` and zk3r4nqp: an unresolved
+    review thread is an explicit human signal that something is awaiting
+    response, and gitbulk must not bypass it. Bots are counted alongside
+    humans — see the upfront merge-gate question/answer recorded in the
+    Phase-5+ design session. Surfaced in the run summary as a
+    "blocked (waiting on humans)" classification, distinguishing it from
+    structural readiness skips like ``pr.required_checks_green``.
+    """
+
+    name = "pr.no_unresolved_threads"
+    kind = InvariantKind.PER_PR
+    subcommands = _MERGE_ONLY
+
+    def check(self, ctx: InvariantContext) -> Result:
+        if ctx.pr is None:
+            return Fail("per-PR invariant called without ctx.pr")
+        count = ctx.pr.unresolved_thread_count
+        if count > 0:
+            return Skip(
+                f"{count} unresolved review thread(s) "
+                "(blocked: waiting on humans)"
+            )
+        return Pass()
+
+
+@register
 class PrAgeThresholdInvariant(Invariant):
     """Skip unless the PR has been continuously ready long enough.
 
     "Long enough" = at least ``policy.defaults.min_business_days`` business
-    days have elapsed between the conservative ``ready_since`` anchor and
-    "now". See ``bg4pqn7m`` (Three Business Days From Continuously Ready)
-    and the ``compute_ready_since`` docstring for the MVP simplification.
+    days have elapsed between the timeline-aware ``ready_since`` anchor
+    and "now". See ``bg4pqn7m`` (Three Business Days From Continuously
+    Ready) and the ``compute_ready_since`` docstring for the algorithm.
 
     Implementation detail: ``add_business_days(ready_since, n)`` gives the
     moment at which the PR becomes age-eligible. We compare ``now`` to
     that moment; if ``now`` is earlier, Skip with the remaining duration.
+
+    Approval short-circuit (zk3r4nqp): if the PR's review_decision is
+    APPROVED, the age threshold is bypassed and the invariant Passes
+    immediately. Rationale: the 3-business-day window's purpose is to
+    let humans react; an explicit approval IS the reaction, so further
+    waiting is pointless. Under strict policy this makes the gate
+    effectively vacuous (``pr.approved_per_policy`` already required
+    APPROVED to get this far); under ci-only it remains meaningful for
+    PRs with green CI but no human review yet.
     """
 
     name = "pr.age_threshold"
@@ -462,6 +500,10 @@ class PrAgeThresholdInvariant(Invariant):
     def check(self, ctx: InvariantContext) -> Result:
         if ctx.pr is None or ctx.repo is None:
             return Fail("per-PR invariant called without ctx.pr/ctx.repo")
+        # Approval short-circuit: an APPROVED review is the merge signal
+        # we're waiting for, so further age-gating adds no value.
+        if ctx.pr.review_decision == "APPROVED":
+            return Pass()
         effective = policy_for(ctx.policy, ctx.repo.slug)
         require_approval = effective.merge_policy != "ci-only"
         ready_since = compute_ready_since(

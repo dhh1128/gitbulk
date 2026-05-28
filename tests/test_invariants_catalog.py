@@ -47,6 +47,7 @@ from gitbulk.invariants.catalog import (
     PrAuthorKnownInvariant,
     PrBaseIsDefaultInvariant,
     PrMergeableStateCleanInvariant,
+    PrNoUnresolvedThreadsInvariant,
     PrRequiredChecksGreenInvariant,
     _extract_slug_from_remote_url,
 )
@@ -163,6 +164,7 @@ def test_all_phase2_invariants_registered():
         "pr.mergeable_state_clean",
         "pr.required_checks_green",
         "pr.approved_per_policy",
+        "pr.no_unresolved_threads",
         "pr.age_threshold",
     }
     registered = set(all_invariants().keys())
@@ -750,6 +752,7 @@ def _real_pr(
     base_ref: str = "main",
     slug: str = "dhh1128/gitbulk",
     number: int = 7,
+    unresolved_thread_count: int = 0,
 ) -> PRInfo:
     """A real PRInfo (not the SimpleNamespace stand-in) because the
     merge invariants consult ``mergeable_state`` / ``checks_status`` /
@@ -777,6 +780,7 @@ def _real_pr(
         labels=(),
         review_decision=review_decision,
         checks_status=checks_status,
+        unresolved_thread_count=unresolved_thread_count,
     )
 
 
@@ -909,6 +913,44 @@ def test_pr_approved_per_policy_fail_no_repo(runstate):
     assert isinstance(result, Fail)
 
 
+# ─── pr.no_unresolved_threads ─────────────────────────────────────────────
+
+
+def test_pr_no_unresolved_threads_pass_when_zero(runstate, repo):
+    pr = _real_pr(unresolved_thread_count=0)
+    ctx = _ctx(runstate, repo=repo, pr=pr)
+    assert PrNoUnresolvedThreadsInvariant().check(ctx) == Pass()
+
+
+def test_pr_no_unresolved_threads_skip_when_one(runstate, repo):
+    pr = _real_pr(unresolved_thread_count=1)
+    ctx = _ctx(runstate, repo=repo, pr=pr)
+    result = PrNoUnresolvedThreadsInvariant().check(ctx)
+    assert isinstance(result, Skip)
+    assert "1 unresolved" in result.reason
+
+
+def test_pr_no_unresolved_threads_skip_includes_count(runstate, repo):
+    pr = _real_pr(unresolved_thread_count=4)
+    ctx = _ctx(runstate, repo=repo, pr=pr)
+    result = PrNoUnresolvedThreadsInvariant().check(ctx)
+    assert isinstance(result, Skip)
+    assert "4 unresolved" in result.reason
+
+
+def test_pr_no_unresolved_threads_fail_no_pr(runstate, repo):
+    ctx = _ctx(runstate, repo=repo, pr=None)
+    result = PrNoUnresolvedThreadsInvariant().check(ctx)
+    assert isinstance(result, Fail)
+    assert "without ctx.pr" in result.reason
+
+
+def test_pr_no_unresolved_threads_is_merge_only():
+    inv = PrNoUnresolvedThreadsInvariant()
+    assert inv.subcommands == frozenset({"merge"})
+    assert inv.kind == InvariantKind.PER_PR
+
+
 # ─── pr.age_threshold ─────────────────────────────────────────────────────
 
 
@@ -917,21 +959,25 @@ def _freeze_now(monkeypatch, when: datetime) -> None:
 
 
 def test_pr_age_threshold_pass_when_old_enough(monkeypatch, runstate, repo):
-    """min_business_days=3, ready_since=10 days ago → eligible."""
-    policy = Policy(defaults=Defaults(min_business_days=3))
+    """min_business_days=3, ready_since=10 days ago, ci-only no review →
+    eligible via the time path. Uses ci-only + review_decision=None to
+    avoid the APPROVED short-circuit so the time math is what's tested.
+    """
+    policy = Policy(defaults=Defaults(merge_policy="ci-only", min_business_days=3))
     pushed = datetime(2026, 5, 1, 12, 0, 0, tzinfo=timezone.utc)
-    pr = _real_pr(last_pushed_at=pushed)
+    pr = _real_pr(last_pushed_at=pushed, review_decision=None)
     _freeze_now(monkeypatch, datetime(2026, 5, 28, 12, 0, 0, tzinfo=timezone.utc))
     ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
     assert PrAgeThresholdInvariant().check(ctx) == Pass()
 
 
 def test_pr_age_threshold_skip_when_too_recent(monkeypatch, runstate, repo):
-    """ready_since = today, min_business_days=3 → not yet eligible."""
-    policy = Policy(defaults=Defaults(min_business_days=3))
+    """ci-only, no approval, ready_since = today, min_business_days=3
+    → not yet eligible (time path)."""
+    policy = Policy(defaults=Defaults(merge_policy="ci-only", min_business_days=3))
     # Friday 2026-05-22 push; "now" 2026-05-25 Monday → only 1 business day
     pushed = datetime(2026, 5, 22, 12, 0, 0, tzinfo=timezone.utc)
-    pr = _real_pr(last_pushed_at=pushed)
+    pr = _real_pr(last_pushed_at=pushed, review_decision=None)
     _freeze_now(monkeypatch, datetime(2026, 5, 25, 12, 0, 0, tzinfo=timezone.utc))
     ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
     result = PrAgeThresholdInvariant().check(ctx)
@@ -942,19 +988,20 @@ def test_pr_age_threshold_skip_when_too_recent(monkeypatch, runstate, repo):
 def test_pr_age_threshold_skip_when_zero_days_still_now(
     monkeypatch, runstate, repo
 ):
-    """min_business_days=0 → eligible immediately, even on the day of push."""
-    policy = Policy(defaults=Defaults(min_business_days=0))
+    """min_business_days=0 → eligible immediately, even on the day of
+    push. ci-only + no review to exercise the time path."""
+    policy = Policy(defaults=Defaults(merge_policy="ci-only", min_business_days=0))
     pushed = datetime(2026, 5, 25, 12, 0, 0, tzinfo=timezone.utc)
-    pr = _real_pr(last_pushed_at=pushed)
+    pr = _real_pr(last_pushed_at=pushed, review_decision=None)
     _freeze_now(monkeypatch, pushed)
     ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
     assert PrAgeThresholdInvariant().check(ctx) == Pass()
 
 
 def test_pr_age_threshold_skip_when_not_ready(runstate, repo):
-    """If compute_ready_since returns None (e.g. mergeable_state DIRTY),
-    Skip with a clear reason."""
-    pr = _real_pr(mergeable_state="DIRTY")
+    """If compute_ready_since returns None (e.g. mergeable_state DIRTY)
+    AND there's no approval bypass, Skip with a clear reason."""
+    pr = _real_pr(mergeable_state="DIRTY", review_decision=None)
     ctx = _ctx(runstate, repo=repo, pr=pr)
     result = PrAgeThresholdInvariant().check(ctx)
     assert isinstance(result, Skip)
@@ -962,13 +1009,68 @@ def test_pr_age_threshold_skip_when_not_ready(runstate, repo):
 
 
 def test_pr_age_threshold_ci_only_ignores_review(monkeypatch, runstate, repo):
-    """ci-only policy → review_decision irrelevant for ready_since."""
+    """ci-only policy → review_decision irrelevant for ready_since.
+
+    A non-approved PR with no review (REVIEW_REQUIRED-or-None) still
+    Passes purely on the time path when min_business_days=0.
+    """
     policy = Policy(defaults=Defaults(merge_policy="ci-only", min_business_days=0))
     pushed = datetime(2026, 5, 25, 12, 0, 0, tzinfo=timezone.utc)
     pr = _real_pr(review_decision=None, last_pushed_at=pushed)
     _freeze_now(monkeypatch, pushed)
     ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
     assert PrAgeThresholdInvariant().check(ctx) == Pass()
+
+
+# ─── pr.age_threshold APPROVED short-circuit (zk3r4nqp) ───────────────────
+
+
+def test_pr_age_threshold_approved_short_circuits_under_strict(
+    monkeypatch, runstate, repo
+):
+    """Strict policy + APPROVED review_decision → Pass immediately,
+    regardless of how recent last_pushed_at is.
+
+    Encodes the user's rule that approval is the merge signal we wait
+    for, not a clock-restart event. Without this short-circuit a
+    just-pushed-and-approved PR would Skip on age and force a 3-day wait.
+    """
+    policy = Policy(defaults=Defaults(merge_policy="strict", min_business_days=3))
+    pushed = datetime(2026, 5, 28, 11, 0, 0, tzinfo=timezone.utc)
+    pr = _real_pr(last_pushed_at=pushed, review_decision="APPROVED")
+    _freeze_now(monkeypatch, datetime(2026, 5, 28, 12, 0, 0, tzinfo=timezone.utc))
+    ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
+    assert PrAgeThresholdInvariant().check(ctx) == Pass()
+
+
+def test_pr_age_threshold_approved_short_circuits_under_ci_only(
+    monkeypatch, runstate, repo
+):
+    """Under ci-only, an approval is a bonus (not required) — but if it
+    happens, it still short-circuits the age gate. A 1-hour-old PR with
+    green CI and an approval is eligible immediately under ci-only.
+    """
+    policy = Policy(defaults=Defaults(merge_policy="ci-only", min_business_days=3))
+    pushed = datetime(2026, 5, 28, 11, 0, 0, tzinfo=timezone.utc)
+    pr = _real_pr(last_pushed_at=pushed, review_decision="APPROVED")
+    _freeze_now(monkeypatch, datetime(2026, 5, 28, 12, 0, 0, tzinfo=timezone.utc))
+    ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
+    assert PrAgeThresholdInvariant().check(ctx) == Pass()
+
+
+def test_pr_age_threshold_changes_requested_does_not_short_circuit(
+    monkeypatch, runstate, repo
+):
+    """Only APPROVED bypasses. CHANGES_REQUESTED falls through to the
+    time path (which then also Skips since compute_ready_since returns
+    None on a non-CLEAN review)."""
+    policy = Policy(defaults=Defaults(merge_policy="ci-only", min_business_days=3))
+    pushed = datetime(2026, 5, 28, 11, 0, 0, tzinfo=timezone.utc)
+    pr = _real_pr(last_pushed_at=pushed, review_decision="CHANGES_REQUESTED")
+    _freeze_now(monkeypatch, datetime(2026, 5, 28, 12, 0, 0, tzinfo=timezone.utc))
+    ctx = _ctx(runstate, policy=policy, repo=repo, pr=pr)
+    result = PrAgeThresholdInvariant().check(ctx)
+    assert isinstance(result, Skip)
 
 
 def test_pr_age_threshold_fail_no_pr(runstate, repo):

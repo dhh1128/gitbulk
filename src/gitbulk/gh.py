@@ -31,7 +31,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping, Protocol, runtime_checkable
 
-from gitbulk.pr_info import PRInfo
+from gitbulk.pr_info import PRInfo, TimelineEvent
 
 
 @runtime_checkable
@@ -91,7 +91,7 @@ class GHClient(Protocol):
         slug: str,
         number: int,
         *,
-        method: Literal["merge", "squash", "rebase"] = "squash",
+        method: Literal["merge", "squash", "rebase"] = "merge",
         delete_branch: bool = True,
         timeout: float | None = None,
     ) -> dict[str, Any]:
@@ -102,10 +102,15 @@ class GHClient(Protocol):
         per node ``2vqp4nk6``. Raises :class:`GHError` on non-clean
         mergeable state, auth failure, or any other refusal from gh.
 
-        ``method`` selects squash / merge / rebase; ``delete_branch``
-        toggles ``--delete-branch``. Both are pinned at the call site
-        in the merge handler (squash + delete-branch as Phase-5 default
-        per the task spec; per-repo override deferred).
+        ``method`` selects merge / squash / rebase. Default ``merge``
+        (true merge commit) per this.i node ``gji4dyze`` — the merge
+        handler typically passes the per-repo-overridden value from
+        ``policy_for(slug).merge_method`` and only falls back to this
+        default when called from contexts without a Policy.
+        ``delete_branch`` toggles ``--delete-branch``; the merge handler
+        passes True so the remote PR branch is cleaned up after a
+        successful merge (GitHub server-side refuses if another open PR
+        targets the same head).
 
         NOTE: the ``.agent-bin/gh`` shim BLOCKS ``gh pr merge`` for AI
         agents. Production code constructs the right argv anyway; the
@@ -243,7 +248,7 @@ class FakeGHClient:
         slug: str,
         number: int,
         *,
-        method: Literal["merge", "squash", "rebase"] = "squash",
+        method: Literal["merge", "squash", "rebase"] = "merge",
         delete_branch: bool = True,
         timeout: float | None = None,
     ) -> dict[str, Any]:
@@ -296,6 +301,18 @@ def _is_retryable_stderr(stderr: str) -> bool:
 #: GraphQL document used by ``my_open_prs``. Lives at module scope so the
 #: test suite can assert on the exact wire shape and so the verification
 #: comment at the call site stays close to the call, not the literal.
+#: Window size for the per-PR timelineItems walk. Picked at 50 because a
+#: typical merge-ready PR has well under a dozen ready/draft/review events
+#: in its lifetime; 50 leaves headroom while keeping per-PR GraphQL cost
+#: roughly constant. ``pageInfo.hasPreviousPage`` signals truncation so the
+#: ``ready`` module can fall back to ``last_pushed_at`` defensively.
+_TIMELINE_WINDOW = 50
+
+#: Window size for reviewThreads. The PR-level invariant only consults the
+#: count of currently-unresolved threads; 100 is GraphQL's default cap and
+#: more than enough for any normal PR.
+_REVIEW_THREADS_WINDOW = 100
+
 _MY_OPEN_PRS_GRAPHQL = """\
 query($q: String!) {
   search(query: $q, type: ISSUE, first: 100) {
@@ -322,6 +339,25 @@ query($q: String!) {
               statusCheckRollup { state }
             }
           }
+        }
+        reviewThreads(first: 100) {
+          nodes { isResolved }
+        }
+        timelineItems(
+          last: 50,
+          itemTypes: [
+            READY_FOR_REVIEW_EVENT,
+            CONVERT_TO_DRAFT_EVENT,
+            PULL_REQUEST_REVIEW
+          ]
+        ) {
+          nodes {
+            __typename
+            ... on ReadyForReviewEvent { createdAt }
+            ... on ConvertToDraftEvent { createdAt }
+            ... on PullRequestReview { submittedAt state }
+          }
+          pageInfo { hasPreviousPage }
         }
         repository { nameWithOwner }
       }
@@ -541,7 +577,7 @@ class ProductionGHClient:
         slug: str,
         number: int,
         *,
-        method: Literal["merge", "squash", "rebase"] = "squash",
+        method: Literal["merge", "squash", "rebase"] = "merge",
         delete_branch: bool = True,
         timeout: float | None = None,
     ) -> dict[str, Any]:
@@ -607,6 +643,54 @@ def _pr_info_from_graphql_node(node: dict[str, Any]) -> PRInfo:
         if rollup:
             checks_status = rollup.get("state")
 
+    review_threads_obj = node.get("reviewThreads") or {}
+    thread_nodes = review_threads_obj.get("nodes") or []
+    unresolved_thread_count = sum(
+        1
+        for t in thread_nodes
+        if t is not None and not t.get("isResolved", False)
+    )
+
+    timeline_obj = node.get("timelineItems") or {}
+    timeline_nodes = timeline_obj.get("nodes") or []
+    page_info = timeline_obj.get("pageInfo") or {}
+    timeline_capped = bool(page_info.get("hasPreviousPage", False))
+    timeline_events: list[TimelineEvent] = []
+    for item in timeline_nodes:
+        if not item:
+            continue
+        typename = item.get("__typename")
+        if typename == "ReadyForReviewEvent":
+            at = item.get("createdAt")
+            if at:
+                timeline_events.append(
+                    TimelineEvent(kind="ready", at=_parse_iso8601(at))
+                )
+        elif typename == "ConvertToDraftEvent":
+            at = item.get("createdAt")
+            if at:
+                timeline_events.append(
+                    TimelineEvent(kind="draft", at=_parse_iso8601(at))
+                )
+        elif typename == "PullRequestReview":
+            state = item.get("state")
+            at = item.get("submittedAt")
+            if not at:
+                # Pending reviews have no submittedAt yet; not a timeline
+                # signal until submitted.
+                continue
+            if state == "APPROVED":
+                timeline_events.append(
+                    TimelineEvent(kind="approved", at=_parse_iso8601(at))
+                )
+            elif state == "CHANGES_REQUESTED":
+                timeline_events.append(
+                    TimelineEvent(
+                        kind="changes_requested", at=_parse_iso8601(at)
+                    )
+                )
+            # COMMENTED / DISMISSED / PENDING reviews are not gates.
+
     return PRInfo(
         slug=slug,
         number=node["number"],
@@ -625,4 +709,7 @@ def _pr_info_from_graphql_node(node: dict[str, Any]) -> PRInfo:
         labels=labels,
         review_decision=node.get("reviewDecision"),
         checks_status=checks_status,
+        unresolved_thread_count=unresolved_thread_count,
+        timeline_events=tuple(timeline_events),
+        timeline_capped=timeline_capped,
     )

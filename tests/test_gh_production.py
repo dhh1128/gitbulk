@@ -32,7 +32,7 @@ from gitbulk.gh import (
     _parse_iso8601,
     _pr_info_from_graphql_node,
 )
-from gitbulk.pr_info import PRInfo
+from gitbulk.pr_info import PRInfo, TimelineEvent
 
 
 @pytest.fixture(autouse=True)
@@ -388,6 +388,22 @@ _GRAPHQL_FIXTURE = {
                             }
                         ]
                     },
+                    "reviewThreads": {
+                        "nodes": [
+                            {"isResolved": True},
+                            {"isResolved": True},
+                        ]
+                    },
+                    "timelineItems": {
+                        "nodes": [
+                            {
+                                "__typename": "PullRequestReview",
+                                "submittedAt": "2026-05-28T10:30:00Z",
+                                "state": "APPROVED",
+                            },
+                        ],
+                        "pageInfo": {"hasPreviousPage": False},
+                    },
                     "repository": {"nameWithOwner": "dhh1128/gitbulk"},
                 }
             ]
@@ -418,6 +434,8 @@ def test_my_open_prs_argv_no_slugs_uses_open_search():
     assert "search(query: $q" in argv[f_index + 1]
     assert "mergeStateStatus" in argv[f_index + 1]
     assert "statusCheckRollup" in argv[f_index + 1]
+    assert "reviewThreads" in argv[f_index + 1]
+    assert "timelineItems" in argv[f_index + 1]
 
 
 def test_my_open_prs_argv_includes_repo_terms_for_each_slug():
@@ -635,6 +653,194 @@ def test_pr_info_parser_handles_missing_mergeable_state():
     assert pr.mergeable_state is None
 
 
+# ─── reviewThreads + timelineItems parsing ──────────────────────────────────
+
+
+def test_pr_info_parser_counts_unresolved_review_threads():
+    node = _node_template()
+    node["reviewThreads"] = {
+        "nodes": [
+            {"isResolved": True},
+            {"isResolved": False},
+            {"isResolved": False},
+            {"isResolved": True},
+        ]
+    }
+    pr = _pr_info_from_graphql_node(node)
+    assert pr.unresolved_thread_count == 2
+
+
+def test_pr_info_parser_unresolved_threads_zero_when_all_resolved():
+    pr = _pr_info_from_graphql_node(_node_template())
+    assert pr.unresolved_thread_count == 0
+
+
+def test_pr_info_parser_tolerates_missing_reviewthreads_container():
+    """An older fixture / a query that doesn't include reviewThreads."""
+    node = _node_template()
+    node.pop("reviewThreads", None)
+    pr = _pr_info_from_graphql_node(node)
+    assert pr.unresolved_thread_count == 0
+
+
+def test_pr_info_parser_tolerates_null_thread_node():
+    node = _node_template()
+    node["reviewThreads"] = {"nodes": [None, {"isResolved": False}]}
+    pr = _pr_info_from_graphql_node(node)
+    assert pr.unresolved_thread_count == 1
+
+
+def test_pr_info_parser_thread_missing_isresolved_treated_as_unresolved():
+    """Defensive: ``isResolved`` field absent → assume unresolved
+    (safer to over-skip than to merge an open thread)."""
+    node = _node_template()
+    node["reviewThreads"] = {"nodes": [{}]}
+    pr = _pr_info_from_graphql_node(node)
+    assert pr.unresolved_thread_count == 1
+
+
+def test_pr_info_parser_extracts_approved_review_into_timeline():
+    pr = _pr_info_from_graphql_node(_node_template())
+    assert len(pr.timeline_events) == 1
+    event = pr.timeline_events[0]
+    assert event.kind == "approved"
+    assert event.at == datetime(2026, 5, 28, 10, 30, 0, tzinfo=timezone.utc)
+
+
+def test_pr_info_parser_extracts_changes_requested_review():
+    node = _node_template()
+    node["timelineItems"] = {
+        "nodes": [
+            {
+                "__typename": "PullRequestReview",
+                "submittedAt": "2026-05-28T09:30:00Z",
+                "state": "CHANGES_REQUESTED",
+            }
+        ],
+        "pageInfo": {"hasPreviousPage": False},
+    }
+    pr = _pr_info_from_graphql_node(node)
+    assert len(pr.timeline_events) == 1
+    assert pr.timeline_events[0].kind == "changes_requested"
+
+
+def test_pr_info_parser_extracts_draft_and_ready_events():
+    node = _node_template()
+    node["timelineItems"] = {
+        "nodes": [
+            {
+                "__typename": "ConvertToDraftEvent",
+                "createdAt": "2026-05-28T08:00:00Z",
+            },
+            {
+                "__typename": "ReadyForReviewEvent",
+                "createdAt": "2026-05-28T09:00:00Z",
+            },
+        ],
+        "pageInfo": {"hasPreviousPage": False},
+    }
+    pr = _pr_info_from_graphql_node(node)
+    kinds = [e.kind for e in pr.timeline_events]
+    assert kinds == ["draft", "ready"]
+
+
+def test_pr_info_parser_ignores_non_gating_review_states():
+    """COMMENTED, DISMISSED, PENDING reviews are not gates and should
+    not produce timeline events."""
+    node = _node_template()
+    node["timelineItems"] = {
+        "nodes": [
+            {
+                "__typename": "PullRequestReview",
+                "submittedAt": "2026-05-28T09:30:00Z",
+                "state": "COMMENTED",
+            },
+            {
+                "__typename": "PullRequestReview",
+                "submittedAt": "2026-05-28T09:31:00Z",
+                "state": "DISMISSED",
+            },
+            {
+                "__typename": "PullRequestReview",
+                "submittedAt": None,
+                "state": "PENDING",
+            },
+        ],
+        "pageInfo": {"hasPreviousPage": False},
+    }
+    pr = _pr_info_from_graphql_node(node)
+    assert pr.timeline_events == ()
+
+
+def test_pr_info_parser_sets_timeline_capped_from_pageinfo():
+    node = _node_template()
+    node["timelineItems"]["pageInfo"]["hasPreviousPage"] = True
+    pr = _pr_info_from_graphql_node(node)
+    assert pr.timeline_capped is True
+
+
+def test_pr_info_parser_timeline_capped_defaults_false():
+    pr = _pr_info_from_graphql_node(_node_template())
+    assert pr.timeline_capped is False
+
+
+def test_pr_info_parser_tolerates_missing_timelineitems_container():
+    node = _node_template()
+    node.pop("timelineItems", None)
+    pr = _pr_info_from_graphql_node(node)
+    assert pr.timeline_events == ()
+    assert pr.timeline_capped is False
+
+
+def test_pr_info_parser_skips_ready_event_without_createdat():
+    """Defensive: ReadyForReviewEvent without createdAt is dropped."""
+    node = _node_template()
+    node["timelineItems"] = {
+        "nodes": [{"__typename": "ReadyForReviewEvent", "createdAt": None}],
+        "pageInfo": {"hasPreviousPage": False},
+    }
+    pr = _pr_info_from_graphql_node(node)
+    assert pr.timeline_events == ()
+
+
+def test_pr_info_parser_skips_draft_event_without_createdat():
+    node = _node_template()
+    node["timelineItems"] = {
+        "nodes": [{"__typename": "ConvertToDraftEvent", "createdAt": None}],
+        "pageInfo": {"hasPreviousPage": False},
+    }
+    pr = _pr_info_from_graphql_node(node)
+    assert pr.timeline_events == ()
+
+
+def test_pr_info_parser_skips_unknown_typename():
+    """Defensive: a __typename we don't recognize is ignored."""
+    node = _node_template()
+    node["timelineItems"] = {
+        "nodes": [{"__typename": "SomeFutureEvent", "createdAt": "2026-05-28T09:00:00Z"}],
+        "pageInfo": {"hasPreviousPage": False},
+    }
+    pr = _pr_info_from_graphql_node(node)
+    assert pr.timeline_events == ()
+
+
+def test_pr_info_parser_skips_null_timeline_node():
+    node = _node_template()
+    node["timelineItems"] = {
+        "nodes": [
+            None,
+            {
+                "__typename": "ReadyForReviewEvent",
+                "createdAt": "2026-05-28T09:00:00Z",
+            },
+        ],
+        "pageInfo": {"hasPreviousPage": False},
+    }
+    pr = _pr_info_from_graphql_node(node)
+    assert len(pr.timeline_events) == 1
+    assert pr.timeline_events[0].kind == "ready"
+
+
 # ─── search payload missing keys (defensive) ───────────────────────────────
 
 
@@ -652,7 +858,9 @@ def test_my_open_prs_handles_missing_data_key_gracefully():
 # ─── merge_pr ──────────────────────────────────────────────────────────────
 
 
-def test_merge_pr_default_argv_squash_delete_branch():
+def test_merge_pr_default_argv_merge_delete_branch():
+    """Default method is `merge` (true merge commit) per gji4dyze;
+    delete_branch defaults to True so `--delete-branch` is on the argv."""
     side_effect = _make_run_mock(_CompletedFake(0, stdout=""))
     with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
         client = ProductionGHClient()
@@ -667,7 +875,7 @@ def test_merge_pr_default_argv_squash_delete_branch():
         "42",
         "--repo",
         "dhh1128/gitbulk",
-        "--squash",
+        "--merge",
         "--delete-branch",
     ]
 

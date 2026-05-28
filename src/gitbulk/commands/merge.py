@@ -17,9 +17,11 @@ Phase 5's first mutating subcommand. Pipeline mirrors :mod:`dispatch`:
   8. DRY-RUN GATE: without ``--apply``, write a summary listing what
      WOULD merge and exit 0 / 3 / 4 per the same exit-code ladder.
   9. (``--apply`` path) For each eligible PR, call
-     ``gh.merge_pr(slug, number, method="squash", delete_branch=True)``.
-     Method is hardcoded squash for Phase 5; per-repo method override
-     is deferred.
+     ``gh.merge_pr(slug, number, method=policy_for(slug).merge_method,
+     delete_branch=True)``. The default merge method is ``merge`` (true
+     merge commit, this.i node ``gji4dyze``); per-repo override via
+     ``repos.<slug>.merge_method`` lets individual repos opt for
+     ``squash`` or ``rebase``.
  10. Compute exit code (failures → 2; skips → 3; --skip-check used → 4;
      else → 0). Write summary.md, state.yaml; set ATTENTION on 2/3.
 
@@ -37,7 +39,7 @@ from pathlib import Path
 from typing import Iterable
 
 from gitbulk import paths, sentinel
-from gitbulk.config.policy import Policy, load_policy
+from gitbulk.config.policy import Policy, load_policy, policy_for
 from gitbulk.config.repos import RepoEntry, load_repos
 from gitbulk.gh import GHError, ProductionGHClient
 from gitbulk.invariants import InvariantContext, get, run_chain
@@ -57,13 +59,6 @@ EXIT_OVERRIDES_APPLIED = 4
 
 #: Per node ``tmlk5pq3``: mutating subcommands get a 1800s lock budget.
 _LOCK_TIMEOUT_SECONDS: float = 1800.0
-
-#: Phase-5 hardcoded merge method. Per-repo method override is deferred
-#: (the user has expressed strong preference for squash across all repos
-#: they currently maintain). When a per-repo override is added it will
-#: arrive via a new ``RepoOverride.merge_method`` field plus a CLI
-#: ``--method`` flag for ad-hoc overrides.
-_MERGE_METHOD: str = "squash"
 
 
 # ─── Internal helpers ─────────────────────────────────────────────────────
@@ -110,7 +105,7 @@ def _config_snapshot(
         },
         "repos_txt": repos_text,
         "apply": bool(getattr(args, "apply", False)),
-        "merge_method": _MERGE_METHOD,
+        "merge_method_default": policy.defaults.merge_method,
     }
 
 
@@ -158,11 +153,10 @@ def _build_summary_md(
       - apply: lists eligible PRs with per-PR merge outcome (merged /
         failed-with-reason).
     """
-    del policy  # not yet rendered; kept for parity with dispatch._finish
     lines: list[str] = ["# gitbulk merge", ""]
     mode = "APPLY" if apply else "DRY-RUN"
     lines.append(f"Mode: **{mode}**")
-    lines.append(f"Merge method: `{_MERGE_METHOD}`")
+    lines.append(f"Default merge method: `{policy.defaults.merge_method}`")
     lines.append(
         f"Configured repos: {len(all_repos)}  "
         f"Reachable: {len(passing_repos)}  "
@@ -185,9 +179,14 @@ def _build_summary_md(
     if not apply:
         lines.append("## Would merge")
         for slug, pr in eligible_prs:
+            method = policy_for(policy, slug).merge_method
+            method_note = (
+                "" if method == policy.defaults.merge_method
+                else f" [method=`{method}`]"
+            )
             lines.append(
                 f"- `{slug}` #{pr.number} *{pr.title}* "
-                f"(head={pr.head_ref}@{pr.head_sha[:7]})"
+                f"(head={pr.head_ref}@{pr.head_sha[:7]}){method_note}"
             )
         lines.append("")
         return "\n".join(lines)
@@ -425,11 +424,12 @@ def _run_under_lock(
     merge_results: list[dict] = []
     failure_count = 0
     for slug, pr in eligible_prs:
+        method = policy_for(policy, slug).merge_method
         try:
             response = gh.merge_pr(
                 slug,
                 pr.number,
-                method=_MERGE_METHOD,
+                method=method,
                 delete_branch=True,
             )
         except GHError as e:
@@ -452,7 +452,7 @@ def _run_under_lock(
                     "head_sha": pr.head_sha,
                     "merged": False,
                     "error": str(e),
-                    "method": _MERGE_METHOD,
+                    "method": method,
                 }
             )
             # CONTINUE — the other PRs still deserve a shot. A single
@@ -466,7 +466,7 @@ def _run_under_lock(
                 "url": pr.url,
                 "head_sha": pr.head_sha,
                 "merged": True,
-                "method": _MERGE_METHOD,
+                "method": method,
                 "response": response,
             }
         )

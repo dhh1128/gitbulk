@@ -6,6 +6,7 @@
 
 defaults:
   merge_policy: strict           # strict | ci-only | never
+  merge_method: merge            # merge | squash | rebase — method passed to `gh pr merge`
   min_business_days: 3           # business days (M-F local TZ) since "ready"
   unresolved_burden: me          # me | other | either — who marks threads resolved
   bot_threads_block: true        # if true, unresolved bot threads also block "ready"
@@ -39,6 +40,8 @@ repos: {}
   #   skip_checks: [repo.agentprep_verified]
   # provenant-dev/origin-platform:
   #   unresolved_burden: other     # acting as maintainer here, not contributor
+  # provenant-dev/origin-canonical-history-svc:
+  #   merge_method: squash         # this repo wants squash, not the default merge commit
 
 # Disposable worktree root. Defaults to ~/.cache/gitbulk/worktrees/
 # (per this.i node mw6kp2nq). Override only if you need a different

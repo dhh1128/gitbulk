@@ -132,6 +132,7 @@ def test_subcommand_has_invariant_chain_default_empty():
                 "pr.mergeable_state_clean",
                 "pr.required_checks_green",
                 "pr.approved_per_policy",
+                "pr.no_unresolved_threads",
                 "pr.age_threshold",
             ),
         ),

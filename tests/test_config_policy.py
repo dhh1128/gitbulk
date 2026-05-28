@@ -31,6 +31,7 @@ def test_missing_file_returns_default_policy(tmp_path):
     policy = load_policy(tmp_path / "nonexistent.yaml")
     assert policy == Policy()
     assert policy.defaults.merge_policy == "strict"
+    assert policy.defaults.merge_method == "merge"
     assert policy.defaults.min_business_days == 3
     assert policy.defaults.unresolved_burden == "me"
     assert policy.defaults.bot_threads_block is True
@@ -85,6 +86,63 @@ defaults:
 def test_retain_runs_default():
     from gitbulk.config.policy import Defaults
     assert Defaults().retain_runs == 30
+
+
+# ─── merge_method ─────────────────────────────────────────────────────────
+
+
+def test_merge_method_default_is_merge():
+    """Per this.i node gji4dyze, default merge method is `merge` (true
+    merge commit), reversing the Phase-5 squash default."""
+    from gitbulk.config.policy import Defaults
+    assert Defaults().merge_method == "merge"
+
+
+def test_merge_method_explicit_in_defaults(tmp_path):
+    content = "defaults:\n  merge_method: squash\n"
+    policy = load_policy(_write_policy(tmp_path, content))
+    assert policy.defaults.merge_method == "squash"
+
+
+def test_merge_method_rebase_in_defaults(tmp_path):
+    content = "defaults:\n  merge_method: rebase\n"
+    policy = load_policy(_write_policy(tmp_path, content))
+    assert policy.defaults.merge_method == "rebase"
+
+
+def test_merge_method_rejects_invalid_value(tmp_path):
+    content = "defaults:\n  merge_method: ff-only\n"
+    with pytest.raises(ConfigError, match="merge_method"):
+        load_policy(_write_policy(tmp_path, content))
+
+
+def test_merge_method_per_repo_override(tmp_path):
+    content = """
+defaults:
+  merge_method: merge
+repos:
+  owner/legacy:
+    merge_method: squash
+  owner/normal:
+    merge_policy: ci-only
+"""
+    policy = load_policy(_write_policy(tmp_path, content))
+    assert policy.defaults.merge_method == "merge"
+    assert policy_for(policy, "owner/legacy").merge_method == "squash"
+    # No merge_method override → effective is default
+    assert policy_for(policy, "owner/normal").merge_method == "merge"
+    # Repo not in config at all → effective is default
+    assert policy_for(policy, "owner/other").merge_method == "merge"
+
+
+def test_merge_method_per_repo_override_rejects_invalid(tmp_path):
+    content = """
+repos:
+  owner/repo:
+    merge_method: bogus
+"""
+    with pytest.raises(ConfigError, match="merge_method"):
+        load_policy(_write_policy(tmp_path, content))
 
 
 def test_retain_runs_rejects_zero(tmp_path):

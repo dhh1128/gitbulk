@@ -205,6 +205,47 @@ Gitbulk Triage Tool = goal:
         subcommand requires --apply on every invocation forever; accepted
         as the audit signal it is.
 
+    Merge Method Default And Per-Repo Override = decision:
+      id: gji4dyze
+      why: >
+        Default merge method is ``merge`` (a true merge commit), passed
+        through to ``gh pr merge --merge``. Per-repo override via
+        ``repos.<slug>.merge_method: merge|squash|rebase`` honors the
+        cases where a specific repo's convention differs. Branch
+        cleanup defaults to ON (``gh pr merge --delete-branch``);
+        GitHub server-side refuses to delete a branch still pointed to
+        by another open PR, so that's the safety net there.
+
+        Why merge (not squash) as default: the user's review history is
+        valuable. Squash collapses each PR to one commit, losing the
+        intermediate commits that explain HOW a change was developed
+        (incremental refactors, "ah, that broke a test, here's why"
+        commits). Merge commits preserve that ladder and make
+        ``git bisect`` more useful. Squash makes sense when a project
+        treats PRs as opaque units; the user's projects don't.
+
+        Why per-repo override matters: some repos (e.g. ones with
+        outside contributors whose commit hygiene varies) genuinely
+        want squash. Others (history-curated mainlines that mandate
+        linear history) want rebase. A single default can't serve
+        all; the override exists for the minority of repos that need
+        something other than the default.
+
+        Phase 5 originally hardcoded squash with delete-branch=true,
+        deferring per-repo override (recorded in gaps.md as a known
+        gap). Decided 2026-05-28: undeferred, with the default
+        flipped to merge per the user's stated preference. The
+        Phase-5 implementation comment is now the wrong default; the
+        per-repo override IS implemented.
+
+        Not in scope here (deferred to gitbulk gc, tension jw3kpn4q):
+        local worktree / branch cleanup after merge. AGENTS.md forbids
+        touching the main clone, so the only legitimate post-merge
+        local cleanup target is disposable worktrees under
+        ~/.cache/gitbulk/worktrees/; that work happens with the gc
+        subcommand, not the merge subcommand.
+      approved-by: daniel, 2026-05-28
+
     Two File Configuration = decision:
       id: ws2pn4kr
       why: >
@@ -291,6 +332,32 @@ Gitbulk Triage Tool = goal:
         2 days (too aggressive), 5 days (too conservative for a personal
         tool), measuring from PR creation (lets actively-edited week-old
         PRs slip through).
+
+    Approval Bypasses Age Gate = decision:
+      id: kjyfc4m5
+      why: >
+        An explicit approval short-circuits the 3-business-day window
+        from bg4pqn7m and the timeline anchor from zk3r4nqp. The 3-day
+        wait exists to let humans react to a PR; an approval IS the
+        positive human reaction, so further waiting is pointless.
+        Concretely: (a) ``compute_ready_since`` treats an ``approved``
+        timeline event as a breaker-closer for ``changes_requested``
+        but NEVER advances the anchor — approvals are what we're
+        waiting for, not a fresh-start event; (b) ``pr.age_threshold``
+        short-circuits to Pass when ``review_decision == "APPROVED"``,
+        making the age gate effectively vacuous under strict policy
+        (where ``pr.approved_per_policy`` already required APPROVED)
+        and a "soft escape hatch" under ci-only (the 3-day wait still
+        applies to green-CI PRs without human review, but evaporates
+        the moment a human says yes). Decided 2026-05-28 after the user
+        observed that my initial timeline-aware implementation was
+        restarting the clock on approval, which produced the exact
+        wrong behavior — making the user wait 3 more days after the
+        signal they were waiting for. Rejected alternative: treat
+        approval as a normal restorer (would re-anchor at approval
+        timestamp, breaking the user's "merge immediately on approval"
+        mental model).
+      approved-by: daniel, 2026-05-28
 
     Unresolved Thread Burden Configurable Default Author = decision:
       id: hj3nq5kp
@@ -1235,8 +1302,20 @@ Gitbulk Triage Tool = goal:
 
         Excluded from initial fields: ``ready_since`` (computed,
         not stored — lives in a separate helper to keep PRInfo
-        as raw gh data), thread-resolution state (Phase 3 or
-        Phase 5 when merge needs it).
+        as raw gh data).
+
+        Phase 5+ additions for the merge gate (this.i nodes
+        zk3r4nqp / bg4pqn7m): ``unresolved_thread_count: int``
+        (count of currently-open review threads, bots included),
+        ``timeline_events: tuple[TimelineEvent, ...]`` (a subset
+        of GraphQL timelineItems — ReadyForReview, ConvertToDraft,
+        and PullRequestReview with APPROVED/CHANGES_REQUESTED
+        state), and ``timeline_capped: bool`` (true if the
+        timeline-walk window truncated). These power the
+        ``pr.no_unresolved_threads`` invariant and the
+        timeline-aware ``compute_ready_since``. Fields default
+        to safe-empty so legacy fixtures and ``FakeGHClient``
+        usages do not need updating.
       approved-by: daniel, 2026-05-28
 
     Humans Bots Classifier = decision:

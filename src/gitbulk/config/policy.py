@@ -20,6 +20,7 @@ from gitbulk.config.repos import ConfigError
 
 _VALID_MERGE_POLICIES = {"strict", "ci-only", "never"}
 _VALID_UNRESOLVED_BURDENS = {"me", "other", "either"}
+_VALID_MERGE_METHODS = {"merge", "squash", "rebase"}
 
 _TOP_LEVEL_KEYS = {
     "defaults",
@@ -32,6 +33,7 @@ _TOP_LEVEL_KEYS = {
 
 _DEFAULTS_KEYS = {
     "merge_policy",
+    "merge_method",
     "min_business_days",
     "unresolved_burden",
     "bot_threads_block",
@@ -50,6 +52,10 @@ _REPO_OVERRIDE_KEYS = _DEFAULTS_KEYS  # per-repo can override any defaults key
 @dataclass(frozen=True)
 class Defaults:
     merge_policy: str = "strict"
+    #: Merge method gitbulk passes to ``gh pr merge``. Default ``merge``
+    #: (a true merge commit) was chosen 2026-05-28 after the user pushed
+    #: back on the Phase-5 squash-default. See this.i node ``gji4dyze``.
+    merge_method: str = "merge"
     min_business_days: int = 3
     unresolved_burden: str = "me"
     bot_threads_block: bool = True
@@ -71,6 +77,7 @@ class HumansConfig:
 @dataclass(frozen=True)
 class RepoOverride:
     merge_policy: str | None = None
+    merge_method: str | None = None
     min_business_days: int | None = None
     unresolved_burden: str | None = None
     bot_threads_block: bool | None = None
@@ -150,6 +157,10 @@ def _parse_defaults(raw: dict[str, Any], where: str) -> Defaults:
         kwargs["merge_policy"] = _ensure_str(
             raw["merge_policy"], f"{where}.merge_policy", allowed=_VALID_MERGE_POLICIES
         )
+    if "merge_method" in raw:
+        kwargs["merge_method"] = _ensure_str(
+            raw["merge_method"], f"{where}.merge_method", allowed=_VALID_MERGE_METHODS
+        )
     if "min_business_days" in raw:
         kwargs["min_business_days"] = _ensure_int(
             raw["min_business_days"], f"{where}.min_business_days", minimum=0
@@ -218,6 +229,10 @@ def _parse_repo_override(raw: dict[str, Any], where: str) -> RepoOverride:
     if "merge_policy" in raw:
         kwargs["merge_policy"] = _ensure_str(
             raw["merge_policy"], f"{where}.merge_policy", allowed=_VALID_MERGE_POLICIES
+        )
+    if "merge_method" in raw:
+        kwargs["merge_method"] = _ensure_str(
+            raw["merge_method"], f"{where}.merge_method", allowed=_VALID_MERGE_METHODS
         )
     if "min_business_days" in raw:
         kwargs["min_business_days"] = _ensure_int(
@@ -318,6 +333,7 @@ def policy_for(policy: Policy, slug: str) -> Defaults:
     updates: dict[str, Any] = {}
     for key in (
         "merge_policy",
+        "merge_method",
         "min_business_days",
         "unresolved_burden",
         "bot_threads_block",

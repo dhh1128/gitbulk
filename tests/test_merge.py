@@ -191,7 +191,7 @@ def test_dry_run_two_eligible_prs_lists_them_no_merge_calls(
     assert "dhh1128/beta" in summary
     manifest = yaml.safe_load((latest / "manifest.yaml").read_text())
     assert manifest["config_snapshot"]["apply"] is False
-    assert manifest["config_snapshot"]["merge_method"] == "squash"
+    assert manifest["config_snapshot"]["merge_method_default"] == "merge"
 
 
 def test_dry_run_no_eligible_prs_exit_ok(
@@ -248,9 +248,10 @@ def test_apply_two_eligible_prs_both_merged(
     assert rc == EXIT_OK
     assert fake.call_count["merge_pr"] == 2
     assert not sentinel.has_attention()
-    # Both calls used squash + delete_branch=True per Phase 5 defaults.
+    # Both calls used the default merge method (`merge`, true merge commit
+    # per gji4dyze) and delete_branch=True (remote PR branch cleanup).
     for call in fake.merge_calls:
-        assert call["method"] == "squash"
+        assert call["method"] == "merge"
         assert call["delete_branch"] is True
     latest = paths.latest_run_symlink("merge").resolve()
     summary = (latest / "summary.md").read_text()
@@ -604,17 +605,27 @@ def test_dry_run_skipped_repo_exit_skipped(
 def test_age_threshold_filters_recent_pr(
     monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
 ):
-    """A PR pushed today with min_business_days=3 is not eligible."""
+    """A PR pushed today with min_business_days=3 is not eligible.
+
+    Uses ci-only + review_decision=None to exercise the time path of
+    age_threshold rather than the APPROVED short-circuit (which would
+    fast-track an approved PR straight through the gate per zk3r4nqp).
+    """
     write_config(
         repos_slugs=["dhh1128/alpha"],
-        defaults_extra={"min_business_days": 3},
+        defaults_extra={"merge_policy": "ci-only", "min_business_days": 3},
     )
     fresh_org_cache("provenant-dev", ["dhh1128"])
     # Pin "now" so the age check is deterministic.
     now = datetime(2026, 5, 25, 12, 0, 0, tzinfo=timezone.utc)
     pushed = datetime(2026, 5, 25, 9, 0, 0, tzinfo=timezone.utc)
     monkeypatch.setattr(_catalog, "_utc_now", lambda: now)
-    pr = _make_pr(slug="dhh1128/alpha", number=1, last_pushed_at=pushed)
+    pr = _make_pr(
+        slug="dhh1128/alpha",
+        number=1,
+        last_pushed_at=pushed,
+        review_decision=None,
+    )
     fake = FakeGHClient(
         user={"login": "dhh1128"},
         org_members={"provenant-dev": ["dhh1128"]},
@@ -627,6 +638,79 @@ def test_age_threshold_filters_recent_pr(
     rc = merge_handler(_make_args(apply=True, code_root=code_root))
     assert rc == EXIT_OK
     assert fake.call_count["merge_pr"] == 0
+
+
+# ─── per-repo merge_method override ───────────────────────────────────────
+
+
+def test_per_repo_merge_method_override_passed_to_gh(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """If the policy has repos.<slug>.merge_method = "squash" and the
+    default is "merge", the override must flow to gh.merge_pr(method=...).
+    """
+    write_config(
+        repos_slugs=["dhh1128/alpha", "dhh1128/beta"],
+        defaults_extra={"merge_method": "merge"},
+        repo_overrides={"dhh1128/beta": {"merge_method": "squash"}},
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr_alpha = _make_pr(slug="dhh1128/alpha", number=1)
+    pr_beta = _make_pr(slug="dhh1128/beta", number=2)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={
+            "dhh1128/alpha": "main",
+            "dhh1128/beta": "main",
+        },
+        my_open_prs={
+            "dhh1128/alpha": [pr_alpha],
+            "dhh1128/beta": [pr_beta],
+        },
+        merge_responses={
+            ("dhh1128/alpha", 1): {"merged": True},
+            ("dhh1128/beta", 2): {"merged": True},
+        },
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+
+    rc = merge_handler(_make_args(apply=True, code_root=code_root))
+    assert rc == EXIT_OK
+    by_slug = {(c["slug"], c["number"]): c["method"] for c in fake.merge_calls}
+    assert by_slug[("dhh1128/alpha", 1)] == "merge"  # default
+    assert by_slug[("dhh1128/beta", 2)] == "squash"  # override
+
+
+def test_dry_run_shows_per_repo_method_when_different_from_default(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """Dry-run summary should annotate a PR with [method=`X`] when its
+    repo's effective method differs from the default, so the user can
+    eyeball overrides before flipping --apply."""
+    write_config(
+        repos_slugs=["dhh1128/alpha"],
+        defaults_extra={"merge_method": "merge"},
+        repo_overrides={"dhh1128/alpha": {"merge_method": "rebase"}},
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr = _make_pr(slug="dhh1128/alpha", number=1)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+
+    merge_handler(_make_args(code_root=code_root))
+    summary = (paths.latest_run_symlink("merge").resolve() / "summary.md").read_text()
+    assert "Default merge method: `merge`" in summary
+    assert "[method=`rebase`]" in summary
 
 
 # ─── CLI smoke through main() ──────────────────────────────────────────────
