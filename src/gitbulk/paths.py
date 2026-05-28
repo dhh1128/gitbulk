@@ -13,7 +13,16 @@ from datetime import datetime, timezone
 from os import environ
 from pathlib import Path
 
-_SLUG_PATTERN = re.compile(r"^[^/]+/[^/]+$")
+# Slug shape per security-hawk F1 (2026-05-28) — defense-in-depth against
+# malicious config files. Owner: GitHub-style 1-39 chars, alphanumeric +
+# hyphen, no leading hyphen. Repo: 1-100 chars, [A-Za-z0-9._-]. The
+# `_FORBIDDEN_SEGMENTS` check after the regex match is the path-traversal
+# defense: `..` and `.` as full segments are rejected even though the
+# character class would otherwise permit them.
+_SLUG_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$"
+)
+_FORBIDDEN_SEGMENTS: frozenset[str] = frozenset({".", ".."})
 _RUNID_FORMAT = "%Y%m%dT%H%M%SZ"
 
 
@@ -59,6 +68,13 @@ def locks_dir() -> Path:
 def _normalize_slug(slug: str) -> str:
     if not _SLUG_PATTERN.match(slug):
         raise ValueError(f"malformed slug: {slug!r} (expected exactly 'owner/repo')")
+    # Defense-in-depth: even though the regex disallows path metacharacters,
+    # explicitly reject `.` and `..` as full segments so a future regex
+    # relaxation does not silently re-open the security-hawk F1 traversal.
+    if any(part in _FORBIDDEN_SEGMENTS for part in slug.split("/")):
+        raise ValueError(
+            f"malformed slug: {slug!r} (contains forbidden path segment)"
+        )
     return slug.replace("/", "__")
 
 

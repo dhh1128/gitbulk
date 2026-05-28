@@ -113,6 +113,25 @@ def test_configerror_message_includes_file_and_line(tmp_path):
     assert "broken-line" in msg
 
 
+def test_double_dot_segment_in_repos_raises(tmp_path):
+    """Security-hawk F1 (2026-05-28): a malicious repos.txt entry with a
+    `..` segment is rejected with a clear ConfigError."""
+    # `aa/..` passes the regex (`..` matches the repo character class) but
+    # the forbidden-segments check rejects it.
+    path = _write_repos(tmp_path, "aa/..\n")
+    with pytest.raises(ConfigError, match="forbidden path segment"):
+        load_repos(path, code_root=tmp_path / "code")
+
+
+def test_security_hardened_slug_regex_rejects_in_repos(tmp_path):
+    """Security-hawk F1: the tightened regex rejects shapes the original
+    `[^/\\s]+/[^/\\s]+` accepted (leading hyphen owner, @ in owner)."""
+    for bad in ("-leading/ok", "owner@bad/ok"):
+        path = _write_repos(tmp_path, f"{bad}\n")
+        with pytest.raises(ConfigError, match="malformed slug"):
+            load_repos(path, code_root=tmp_path / "code")
+
+
 # ─── Duplicate slugs ───────────────────────────────────────────────────────
 
 

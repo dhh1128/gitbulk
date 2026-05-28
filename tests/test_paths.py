@@ -128,6 +128,39 @@ def test_malformed_slug_raises(bad_slug):
         paths.repo_lock_file(bad_slug)
 
 
+@pytest.mark.parametrize(
+    "bad_slug",
+    [
+        "-leading-hyphen/repo",  # owner can't start with -
+        "owner@bad/repo",        # @ not in allowed set
+        "owner/repo with space", # space not in allowed set
+        "owner/repo\nnewline",
+    ],
+)
+def test_security_hardened_slug_regex_rejects(bad_slug):
+    """Security-hawk F1 (2026-05-28): the tightened slug regex rejects
+    inputs the original `[^/]+/[^/]+` pattern accepted."""
+    with pytest.raises(ValueError, match="malformed slug"):
+        paths.repo_lock_file(bad_slug)
+
+
+def test_slug_with_double_dot_segment_rejected():
+    """Security-hawk F1: `..` as a path segment is the path-traversal
+    vector; explicitly rejected even though it would otherwise pass the
+    regex (`..` is a valid 2-char repo name shape under the regex)."""
+    # Pattern-wise `aa/..` matches (`aa` valid owner, `..` valid 2-char repo
+    # given the [A-Za-z0-9._-] class for repo position). The explicit
+    # forbidden-segments check is what stops it.
+    with pytest.raises(ValueError, match="forbidden path segment"):
+        paths.repo_lock_file("aa/..")
+
+
+def test_slug_with_single_dot_segment_rejected():
+    """Same defense as for `..`."""
+    with pytest.raises(ValueError, match="forbidden path segment"):
+        paths.repo_lock_file("aa/.")
+
+
 # ─── ensure_directories ─────────────────────────────────────────────────────
 
 

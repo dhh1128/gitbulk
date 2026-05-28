@@ -28,6 +28,7 @@ import json
 import subprocess
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Protocol, runtime_checkable
 
 from gitbulk.pr_info import PRInfo
@@ -273,13 +274,20 @@ class ProductionGHClient:
     rate-limit headers, or org membership. Each call shells out fresh.
 
     Constructor knobs (all keyword-only):
-      - ``gh_path``: path to the ``gh`` executable. Default ``"gh"`` so
-        we pick it up from PATH (which includes ``.agent-bin`` when an
-        agent shim is configured).
+      - ``gh_path``: path to the ``gh`` executable. Default ``"gh"`` is
+        resolved through ``shutil.which`` at construction time to an
+        absolute path; that absolute path is then used for every
+        subsequent invocation. This closes the security-hawk F2 PATH-
+        hijack risk: a later ``PATH``-prepend cannot substitute ``gh``
+        once the client has been constructed. (A passed absolute path
+        is used as-is, without ``which`` lookup.)
       - ``default_timeout``: per-call timeout in seconds when the caller
         passes ``timeout=None``. Default 30s, matching node ghclmp7n.d.
       - ``max_retries``: max attempts (including the initial try) for
         transient failures. Default 3.
+
+    Raises :class:`GHError` immediately if ``gh_path`` does not resolve
+    to an executable.
     """
 
     def __init__(
@@ -289,7 +297,19 @@ class ProductionGHClient:
         default_timeout: float = 30.0,
         max_retries: int = 3,
     ) -> None:
-        self._gh_path = gh_path
+        import shutil
+
+        if Path(gh_path).is_absolute():
+            resolved = gh_path
+        else:
+            resolved_path = shutil.which(gh_path)
+            if resolved_path is None:
+                raise GHError(
+                    f"could not find {gh_path!r} on PATH; "
+                    "set gh_path to an absolute path or install gh"
+                )
+            resolved = resolved_path
+        self._gh_path = resolved
         self._default_timeout = default_timeout
         self._max_retries = max_retries
 

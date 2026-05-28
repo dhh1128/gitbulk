@@ -254,9 +254,22 @@ def _apply_config_root(config_root: str | None) -> None:
     os.environ["XDG_CONFIG_HOME"] = parent
 
 
+def _set_private_umask() -> None:
+    """Apply ``os.umask(0o077)`` so every file gitbulk creates is owner-only.
+
+    Resolves security-hawk F3 (2026-05-28): default umask leaves
+    ``~/.cache/gitbulk/`` artifacts world-readable, which is acceptable on
+    a single-user dev box but exposed on shared hosts / bind-mounted
+    containers. The umask is process-global so this is the right and only
+    place to set it: once, at CLI startup.
+    """
+    os.umask(0o077)
+
+
 def main(argv: list[str] | None = None) -> int:
     _check_python_version()
     _configure_logging()
+    _set_private_umask()
     parser = build_parser()
     args = parser.parse_args(argv)
     if not args.subcommand:

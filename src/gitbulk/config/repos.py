@@ -14,8 +14,14 @@ from gitbulk import paths
 
 _log = logging.getLogger("gitbulk.config")
 
-# A slug must match exactly owner/repo: two non-empty, non-slash segments.
-_SLUG_PATTERN = re.compile(r"^[^/\s]+/[^/\s]+$")
+# Slug shape per security-hawk F1 (2026-05-28) — must match paths._SLUG_PATTERN
+# to prevent path-traversal via repos.txt. Owner: GitHub-style 1-39 chars,
+# alphanumeric + hyphen, no leading hyphen. Repo: 1-100 chars,
+# [A-Za-z0-9._-]. Path-segment safety enforced by `_FORBIDDEN_SEGMENTS`.
+_SLUG_PATTERN = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9._-]{1,100}$"
+)
+_FORBIDDEN_SEGMENTS: frozenset[str] = frozenset({".", ".."})
 
 
 class ConfigError(ValueError):
@@ -63,6 +69,11 @@ def load_repos(
             raise ConfigError(
                 f"{path}:{lineno}: malformed slug {stripped!r} "
                 f"(expected exactly 'owner/repo')"
+            )
+        if any(part in _FORBIDDEN_SEGMENTS for part in stripped.split("/")):
+            raise ConfigError(
+                f"{path}:{lineno}: malformed slug {stripped!r} "
+                f"(contains forbidden path segment)"
             )
         if stripped in seen_slugs:
             _log.warning(

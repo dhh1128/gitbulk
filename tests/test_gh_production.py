@@ -35,6 +35,22 @@ from gitbulk.gh import (
 from gitbulk.pr_info import PRInfo
 
 
+@pytest.fixture(autouse=True)
+def _mock_shutil_which(monkeypatch):
+    """Make ``shutil.which`` resolve every name to itself.
+
+    ProductionGHClient resolves ``gh_path`` through ``shutil.which`` at
+    construction (security-hawk F2 fix, 2026-05-28). For unit tests we
+    don't want the host's ``/usr/bin/gh`` presence to leak into argv
+    assertions, so we stub the resolver to be the identity function.
+    The dedicated F2-behavior tests below override this fixture per
+    test as needed.
+    """
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda name: name)
+
+
 # ─── shared fakes ──────────────────────────────────────────────────────────
 
 
@@ -123,6 +139,40 @@ def test_constructor_overrides():
     assert client._gh_path == "/opt/gh/bin/gh"
     assert client._default_timeout == 5.0
     assert client._max_retries == 7
+
+
+def test_constructor_resolves_bare_name_via_shutil_which(monkeypatch):
+    """Security-hawk F2 (2026-05-28): bare-name gh_path is resolved to
+    absolute via shutil.which at construction so a later PATH-prepend
+    cannot substitute gh."""
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda name: f"/canonical/{name}")
+    client = ProductionGHClient()
+    assert client._gh_path == "/canonical/gh"
+
+
+def test_constructor_absolute_path_skips_which_lookup(monkeypatch):
+    """Absolute paths are taken as-is — shutil.which not called."""
+    import shutil
+
+    called = []
+    monkeypatch.setattr(
+        shutil, "which", lambda name: called.append(name) or "/should/not/use"
+    )
+    client = ProductionGHClient(gh_path="/explicit/path/to/gh")
+    assert client._gh_path == "/explicit/path/to/gh"
+    assert called == []
+
+
+def test_constructor_raises_when_gh_not_found_on_path(monkeypatch):
+    """Security-hawk F2: a bare name that doesn't resolve is a loud
+    failure, not a deferred error at first invocation."""
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    with pytest.raises(GHError, match="could not find"):
+        ProductionGHClient()
 
 
 # ─── authenticated_user ────────────────────────────────────────────────────

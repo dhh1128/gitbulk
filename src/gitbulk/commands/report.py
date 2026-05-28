@@ -234,25 +234,15 @@ def report_handler(args: argparse.Namespace) -> int:
     repos = load_repos(code_root=code_root)
     repos_text = _read_repos_text()
 
-    # 2. Optional org-members refresh (cmdline gesture; runs BEFORE the
-    #    org.members.fresh invariant checks freshness).
-    if args.refresh_org_members and policy.humans.org:
-        refresh_gh = ProductionGHClient()
-        try:
-            refresh_cache(refresh_gh, policy.humans.org)
-        except GHError as e:
-            # Refresh failure is structural; surface to stderr. We do not
-            # have a RunState yet, so write to stderr directly.
-            print(
-                f"gitbulk report: --refresh-org-members failed: {e}",
-                file=sys.stderr,
-            )
-            return EXIT_STRUCTURAL_FAILURE
-
-    # 3. Acquire global lock (shared, 300s timeout per tmlk5pq3). The
+    # 2. Acquire global lock (shared, 300s timeout per tmlk5pq3). The
     # contextmanager raises LockTimeoutError on __enter__; per tmlk5pq3
     # the timeout is surfaced as exit 1 + stderr message, no ATTENTION
     # sentinel.
+    #
+    # NB: --refresh-org-members runs INSIDE the lock per security-hawk
+    # F4 (2026-05-28). The network call + cache write are within the
+    # audit envelope, and a parallel gitbulk run cannot race on the
+    # cache file.
     try:
         with global_lock(
             "shared",
@@ -279,7 +269,8 @@ def _run_under_lock(
     Split out for clarity and so lock-timeout vs in-run errors are
     structurally distinct branches.
     """
-    # 4. Begin RunState.
+    # 3. Begin RunState (must happen before any refresh so the audit
+    # trail captures everything inside the lock per security-hawk F4).
     config_snapshot = _config_snapshot(policy, repos_text)
     rs = RunState.begin(
         "report",
@@ -290,6 +281,29 @@ def _run_under_lock(
     # Build gh client + base context.
     gh = ProductionGHClient()
     ctx_base = InvariantContext(policy=policy, runstate=rs, gh=gh)
+
+    # 4. Optional --refresh-org-members. Runs INSIDE the lock per
+    # security-hawk F4 (2026-05-28): the network call + cache write
+    # are within the audit envelope and another gitbulk process cannot
+    # race on the cache file.
+    if args.refresh_org_members and policy.humans.org:
+        try:
+            refresh_cache(gh, policy.humans.org)
+        except GHError as e:
+            rs.record_error(f"--refresh-org-members failed: {e}")
+            return _finish(
+                rs,
+                EXIT_STRUCTURAL_FAILURE,
+                summary=f"--refresh-org-members failed: {e}",
+                policy=policy,
+                attention=False,
+                all_repos=repos,
+                passing_repos=[],
+                skipped_repos=[],
+                prs_by_repo={},
+                pr_records_by_repo={},
+                attention_count=0,
+            )
 
     # 5/6/8. Partition the report chain.
     report_sub = subcommands_mod.by_name("report")

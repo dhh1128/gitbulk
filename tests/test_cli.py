@@ -23,6 +23,7 @@ from gitbulk.cli import (
     _check_python_version,
     _configure_logging,
     _maybe_set_attention,
+    _set_private_umask,
     build_parser,
     main,
 )
@@ -330,3 +331,38 @@ def test_script_entrypoint_runs_main(monkeypatch):
         runpy.run_path(str(cli_path), run_name="__main__")
     assert exc.value.code == EXIT_OK
     assert __version__ in out.getvalue()
+
+
+# ─── private umask (security-hawk F3 fix, 2026-05-28) ──────────────────────
+
+
+def test_set_private_umask_makes_new_files_owner_only(tmp_path):
+    """After _set_private_umask, newly created files have permissions
+    that exclude group + other access (mode 0o600 / 0o700)."""
+    import os
+
+    prev_umask = os.umask(0o022)  # set a permissive baseline
+    try:
+        _set_private_umask()
+        # Create a file under the new umask; check its mode.
+        target = tmp_path / "private.txt"
+        target.write_text("hello")
+        mode = target.stat().st_mode & 0o777
+        # Owner-only: group and other bits cleared.
+        assert mode & 0o077 == 0, f"expected owner-only mode, got {oct(mode)}"
+        # Owner read+write at minimum.
+        assert mode & 0o600 == 0o600, f"expected owner rw, got {oct(mode)}"
+    finally:
+        os.umask(prev_umask)
+
+
+def test_set_private_umask_returns_none():
+    """Idempotent: the helper has no return value; safe to call repeatedly."""
+    import os
+
+    prev = os.umask(0o022)
+    try:
+        assert _set_private_umask() is None
+        assert _set_private_umask() is None
+    finally:
+        os.umask(prev)

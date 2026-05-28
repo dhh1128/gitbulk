@@ -387,9 +387,17 @@ def test_report_refresh_org_members_triggers_refetch(
 
 
 def test_report_refresh_org_members_failure_exit_1(
-    monkeypatch, isolated_xdg, code_root, write_config, capsys
+    monkeypatch, isolated_xdg, code_root, write_config
 ):
-    """If the refresh call itself errors, surface to stderr + exit 1."""
+    """If the refresh call itself errors, record to the run's errors.log
+    (and the synthesized summary.md) and exit 1.
+
+    Per security-hawk F4 fix (2026-05-28), refresh runs inside the lock
+    with a RunState already begun, so failure is captured in the audit
+    trail rather than printed to stderr.
+    """
+    import json
+
     write_config(repos_slugs=["dhh1128/alpha"])
     fake = FakeGHClient(user={"login": "dhh1128"})  # no org_members config
     monkeypatch.setattr(
@@ -399,8 +407,19 @@ def test_report_refresh_org_members_failure_exit_1(
         _make_args(code_root=code_root, refresh_org_members=True)
     )
     assert rc == EXIT_STRUCTURAL_FAILURE
-    err = capsys.readouterr().err
-    assert "--refresh-org-members failed" in err
+    # The failure should be recorded in the run's errors.log.
+    latest = paths.latest_run_symlink("report").resolve()
+    errors_log = latest / "errors.log"
+    assert errors_log.exists()
+    events = [
+        json.loads(line)
+        for line in errors_log.read_text().splitlines()
+        if line.strip()
+    ]
+    assert any(
+        "--refresh-org-members failed" in e.get("message", "")
+        for e in events
+    )
 
 
 def test_report_refresh_org_members_noop_when_org_unset(
