@@ -1391,3 +1391,102 @@ def test_report_progress_clears_fetching_on_error(
     assert "Fetching open PRs" in err
     # And cleared (the clearing sequence is \r + spaces + \r)
     assert "\r" in err
+
+
+# ─── Flat, greppable Open PRs section ──────────────────────────────────────
+
+
+def test_report_open_prs_section_is_flat_and_greppable(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    """Open PRs render as one self-describing line per PR (URL + fields
+    + status + title), no per-repo ### headers, sorted by (repo, num)."""
+    write_config(repos_slugs=["dhh1128/alpha", "dhh1128/beta"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    # alpha has two PRs (numbers out of order to prove the sort);
+    # beta has one.
+    a2 = _make_pr(slug="dhh1128/alpha", number=2, title="second")
+    a1 = _make_pr(slug="dhh1128/alpha", number=1, title="first")
+    b9 = _make_pr(slug="dhh1128/beta", number=9, title="bee")
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main", "dhh1128/beta": "main"},
+        my_open_prs={"dhh1128/alpha": [a2, a1], "dhh1128/beta": [b9]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+    report_handler(_make_args(code_root=code_root))
+    summary = (paths.latest_run_symlink("report").resolve() / "summary.md").read_text()
+
+    # No per-repo headers.
+    assert "### " not in summary
+    # Section header carries a count.
+    assert "## Open PRs (3)" in summary
+
+    # Extract the PR lines (those starting with the GitHub URL).
+    pr_lines = [ln for ln in summary.splitlines() if ln.startswith("https://github.com/")]
+    assert len(pr_lines) == 3
+    # Sorted by (slug, number): alpha#1, alpha#2, beta#9.
+    assert "/alpha/pull/1 " in pr_lines[0] + " "
+    assert "/alpha/pull/2 " in pr_lines[1] + " "
+    assert "/beta/pull/9 " in pr_lines[2] + " "
+    # Each line is self-describing: URL + base + checks + review + status.
+    for ln in pr_lines:
+        assert "base=" in ln
+        assert "checks=" in ln
+        assert "review=" in ln
+        assert "mergeable=" in ln
+        assert "ATTENTION" in ln  # all are eligible in this fixture
+
+
+def test_report_open_prs_skip_reason_inline_on_pr_line(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    """A PR skipped by an invariant carries its skip reason inline as
+    SKIP(invariant: reason) on the same line — greppable, no sub-bullets."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    # base != default → pr.base_is_default skips it.
+    pr = _make_pr(slug="dhh1128/alpha", number=1, base_ref="feature-branch")
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+    report_handler(_make_args(code_root=code_root))
+    summary = (paths.latest_run_symlink("report").resolve() / "summary.md").read_text()
+    pr_line = next(
+        ln for ln in summary.splitlines() if ln.startswith("https://github.com/")
+    )
+    assert "SKIP(" in pr_line
+    assert "pr.base_is_default" in pr_line
+
+
+def test_report_draft_marker_on_pr_line(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr = _make_pr(slug="dhh1128/alpha", number=1)
+    pr = PRInfo(**{**pr.__dict__, "is_draft": True})
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+    report_handler(_make_args(code_root=code_root))
+    summary = (paths.latest_run_symlink("report").resolve() / "summary.md").read_text()
+    pr_line = next(
+        ln for ln in summary.splitlines() if ln.startswith("https://github.com/")
+    )
+    assert "[DRAFT]" in pr_line

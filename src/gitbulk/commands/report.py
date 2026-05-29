@@ -243,31 +243,49 @@ def _build_summary_md(
             lines.append(f"- line {entry.lineno} (`{entry.raw}`): {entry.reason}")
         lines.append("")
 
-    lines.append("## Open PRs")
-    any_pr = False
+    # Open PRs — flat, one fully self-describing line per PR, sorted by
+    # (repo, number). No per-repo ### headers: the grouping made it hard
+    # to grep across repo + status + number combinations. Each line
+    # carries the URL (which encodes repo + number), the structured
+    # fields, a STATUS tag, and the title last. So:
+    #   grep ATTENTION          → the triage subset
+    #   grep checks=FAILURE     → red CI
+    #   grep provenant-dev/     → one org
+    #   grep 'base=dev'         → PRs targeting dev
+    # all work without the headers getting in the way.
+    flat: list[tuple[PRInfo, dict]] = []
     for repo in passing_repos:
         repo_prs = prs_by_repo.get(repo.slug, [])
-        if not repo_prs:
-            continue
-        any_pr = True
-        lines.append(f"### `{repo.slug}`")
-        for pr, record in zip(repo_prs, pr_records_by_repo.get(repo.slug, [])):
-            tag = "ATTENTION" if record["invariants_passed"] else "skipped"
-            draft = " [DRAFT]" if pr.is_draft else ""
-            lines.append(
-                f"- #{pr.number}{draft} *{pr.title}* "
-                f"by @{pr.author} — base={pr.base_ref} "
-                f"checks={pr.checks_status or 'n/a'} "
-                f"review={pr.review_decision or 'n/a'} "
-                f"({tag})"
-            )
-            if not record["invariants_passed"] and record["invariants_skips"]:
-                for inv_name, reason in record["invariants_skips"]:
-                    lines.append(f"    - skip {inv_name}: {reason}")
-        lines.append("")
-    if not any_pr:
+        records = pr_records_by_repo.get(repo.slug, [])
+        for pr, record in zip(repo_prs, records):
+            flat.append((pr, record))
+    flat.sort(key=lambda pair: (pair[0].slug, pair[0].number))
+
+    lines.append(f"## Open PRs ({len(flat)})")
+    if not flat:
         lines.append("(no open PRs across the reachable repos)")
         lines.append("")
+        return "\n".join(lines)
+    for pr, record in flat:
+        if record["invariants_passed"]:
+            status = "ATTENTION"
+        else:
+            skips = record.get("invariants_skips") or []
+            status = (
+                "SKIP(" + "; ".join(f"{n}: {r}" for n, r in skips) + ")"
+                if skips
+                else "SKIP"
+            )
+        draft = " [DRAFT]" if pr.is_draft else ""
+        lines.append(
+            f"{pr.url}  "
+            f"base={pr.base_ref} "
+            f"checks={pr.checks_status or 'n/a'} "
+            f"review={pr.review_decision or 'n/a'} "
+            f"mergeable={pr.mergeable_state or 'n/a'}{draft}  "
+            f"{status}  — {pr.title}"
+        )
+    lines.append("")
     return "\n".join(lines)
 
 
