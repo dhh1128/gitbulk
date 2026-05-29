@@ -2259,7 +2259,17 @@ Gitbulk Triage Tool = goal:
         STILL MISSING, by chain:
           - Mutating-baseline: local.no_uncommitted_in_pr_branch,
             local.recent_push_quiescence, repo.not_in_deny_list.
+            ** repo.not_in_deny_list is a SAFETY gate, not a nicety: a
+            per-repo kill-switch to exclude a repo from ALL mutation. The
+            review-panel (2026-05-29, MNT-F5) flagged it as something to
+            decide on BEFORE running --apply on a schedule against the
+            real fleet — a misconfigured target with no opt-out is the
+            failure mode. design-notes §7 lists it with no "not landed"
+            marker, which misleads a maintainer into thinking it's active.
           - Merge-only: pr.no_blocking_label.
+            ** Also SAFETY-relevant (MNT-F5): honor a do-not-merge /
+            blocking label so a human can veto an otherwise-eligible PR
+            out-of-band. Same "decide before scheduled --apply" caveat.
           - Rebase-only: pr.no_automerge_pending, pr.force_push_allowed
             (pr.author_is_me intentionally absent — see dieug50n/flt7arg2).
           - Close-stale-only: pr.inactive / pr.previously_warned are
@@ -2281,8 +2291,14 @@ Gitbulk Triage Tool = goal:
             read-only ``gitbulk humans`` or a report section would close
             the loop.
 
-        Priority: pick these up opportunistically when touching the
-        relevant chain; none is worth a dedicated push at current scale.
+        Priority: most are pick-up-opportunistically when touching the
+        relevant chain. EXCEPTION (review-panel 2026-05-29): the two
+        safety gates above (repo.not_in_deny_list, pr.no_blocking_label)
+        should be decided — implement, or consciously waive and record
+        why — before --apply runs unattended on a cron schedule against
+        the full fleet. At today's run-by-hand cadence they are not
+        blocking; the trigger is "moving merge/rebase-pr/close-stale
+        --apply into cron" (see opd3ny5k item 3).
 
     Operational Deployment Backlog = tension:
       id: opd3ny5k
@@ -2324,3 +2340,84 @@ Gitbulk Triage Tool = goal:
         Recommended order: #4 (trivial) → #1 (unblocks everything) → #2 →
         #3. All are deferred until the user decides to move gitbulk from
         "I run it by hand" to "it runs itself."
+
+    Per-Repo Lock vs Global Exclusive Lock = tension:
+      id: rlkrcn3p
+      why: >
+        Surfaced by the review-panel 2026-05-29 (finding MNT-F1).
+        Binding decision lj5pqn4kr says per-repo locks are held for the
+        duration of any mutating op, so "a merge on repo A can run
+        concurrently with a report on repo B," and it EXPLICITLY REJECTS a
+        single global exclusive lock ("would serialize everything"). But
+        the shipped Phase 5 mutators (merge.py:274, rebase_pr.py:205,
+        close_stale.py) take ONLY global_lock('exclusive') — the rejected
+        design — and locks.py:169 repo_lock() is dead code with no caller.
+
+        This is an UNRECORDED divergence from a binding resolution, which
+        AGENTS.md/methodology treats as a defect. Recording it here makes
+        the divergence visible (resolving the "unrecorded" part); the
+        substantive decision is still OPEN. Two honest exits:
+
+          A. SUPERSEDE lj5pqn4kr: ratify global-exclusive-only as the
+             intentional Phase 5 model (simplest; one mutating run blocks
+             all reads, which at run-by-hand / nightly-cron cadence on a
+             single machine is fine — runs are short and serial anyway),
+             write a decision: node that supersedes lj5pqn4kr, and either
+             delete repo_lock() or mark it reserved with a comment.
+          B. HONOR lj5pqn4kr: wire repo_lock() into the mutators so
+             per-repo concurrency actually works. Only worth it if a real
+             need for concurrent cross-repo report+mutate emerges.
+
+        Recommendation: A. The original concurrency goal (lj5pqn4kr) was
+        speculative; nothing today needs repo-B-reads-during-repo-A-merge,
+        and global-exclusive is the safer default for an unattended tool
+        (no interleaving of mutating runs at all). But this is the user's
+        call — do not silently pick one. Whichever wins, the dead
+        repo_lock() code and the locks.py comment must be reconciled with
+        the chosen node. See reviews/review-panel-2026-05-29.md (MNT-F1).
+
+    Fork-Origin PR Handling For Mutating Pushes = tension:
+      id: frkpr5kq
+      why: >
+        Surfaced by the review-panel 2026-05-29 (findings ARC-F1 HIGH,
+        ARC-F4 LOW). gitbulk's mutating push paths assume a PR's head
+        branch lives on origin, but a PR the user RAISED can still
+        originate from a FORK (the standard "fork an org repo, open a PR"
+        flow — common across a 150-repo fleet). The --author veto
+        (flt7arg2) guarantees the PR is the user's OWN, NOT that its head
+        is on origin.
+
+        TWO SURFACES:
+          - rebase-pr (ARC-F1, the dangerous one): force_push_with_lease
+            (rebase.py:127-156) unconditionally pushes
+            "origin HEAD:<head_ref>". For a fork PR the head lives on the
+            fork remote, not origin (which is the upstream/base). The
+            lease (head_ref:expected_sha) won't match origin's ref state,
+            so the push either fails or — worst case — force-pushes onto
+            an UNRELATED branch on the upstream. This is precisely the
+            "single riskiest thing gitbulk could do unattended" that
+            dieug50n flagged, but dieug50n never addressed the fork
+            dimension and there is no test for it.
+          - merge --delete-branch (ARC-F4, lower stakes): merge.py passes
+            delete_branch=True for every eligible PR; for a fork PR that
+            targets the fork's head branch, behaving differently (may fail
+            or no-op on permissions). Server-side and non-destructive to
+            local clones, and GitHub refuses unsafe deletes, so LOW — but
+            it is the SAME missing abstraction on a second path.
+
+        ROOT CAUSE: PRInfo carries no head-repository signal and the
+        my_open_prs GraphQL query (gh.py:648-700) never requests
+        isCrossRepository / headRepositoryOwner. So no handler CAN make a
+        fork-aware choice today.
+
+        FIX (decide the shape): add isCrossRepository (+ head-repo owner)
+        to the GraphQL query and a head_repo field to PRInfo — fix the
+        data model ONCE rather than per-command. Then the open product
+        decision: for cross-repo PRs, does rebase-pr (a) Skip them in
+        pr.needs_rebase (safest — refuse to touch fork PRs unattended), or
+        (b) learn to push to the fork remote (more capable, much riskier)?
+        v1 should almost certainly be (a) Skip-and-report; (b) is a future
+        enhancement gated on real need. Until the data model carries the
+        fork dimension, the conservative stop-gap is to treat ANY rebase-pr
+        --apply as suspect on repos where the user uses fork PRs. See
+        reviews/review-panel-2026-05-29.md (ARC-F1, ARC-F4).
