@@ -1994,3 +1994,80 @@ Gitbulk Triage Tool = goal:
         deferred to a later phase; the execk7nm kernel now exists, so
         this tension is no longer blocked on the multiprompt
         integration decision.
+
+    GitHub API Rate Limiting At Fleet Scale = tension:
+      id: urr56mrs
+      status: deferred
+      why: >
+        gitbulk hits the GitHub API on every run, scaling with fleet
+        size. As the configured repo count or run frequency grows, or
+        as we add API-heavier features, we could eventually bump into
+        one of GitHub's rate limits. Recording the shape of the risk
+        now so a future maintainer (human or AI) does not have to
+        rediscover it.
+
+        MEASURED HEADROOM (2026-05-29, 205-repo fleet, gitbulk report):
+          - GraphQL: ~23 points per cold run, ~21 warm, against a
+            5,000-points/HOUR budget. ≈217 cold runs/hour before the
+            ceiling; hourly cron is ~550 points/DAY. Effectively free.
+          - REST core: ~3 requests/run against 5,000/hour.
+          - The REST search limit (30/min) does NOT apply: we use
+            GraphQL search (node ghclmp7n / the my_open_prs query),
+            which draws from the GraphQL point pool instead. This was a
+            fortunate side effect of the GraphQL-first design, not a
+            deliberate rate-limit hedge — note it so nobody "optimizes"
+            my_open_prs back onto REST search and silently reintroduces
+            the 30/min ceiling.
+        Conclusion at current scale: no danger, by 2-3 orders of
+        magnitude. That is why this is deferred, not resolved.
+
+        WHY IT COULD STILL BITE LATER — the primary point/request
+        budgets are not the real exposure; GitHub's SECONDARY (abuse-
+        detection) limits are. Those trip on BURST PATTERNS regardless
+        of how small total consumption is:
+          - too many CONCURRENT requests, or
+          - too many requests per minute to one endpoint, or
+          - (writes) >80 content-creating requests/min, >500/hour.
+        gitbulk is safe today only because it is fully SERIAL: a report
+        is ~8 sequential requests over ~20s, no burst. The mutating
+        paths (merge / close-stale --apply) are serial too and gated
+        (one-merge-per-repo-per-run kdgmyj7o; a handful of stale closes
+        per run), well under the write limits.
+
+        REOPEN THIS TENSION WHEN any of:
+          1. We parallelize API calls. The deferred "parallel chunks"
+             speedup for the default-branch prefetch (and any future
+             concurrent my_open_prs chunking) would fire simultaneous
+             requests and is the single most likely trigger of a
+             secondary limit — even though total points stay tiny.
+             Parallelism MUST ship with a concurrency cap + throttle,
+             not bolted on after.
+          2. The fleet grows past ~1,000 repos, or run frequency goes
+             sub-5-minute, such that primary GraphQL points become a
+             real fraction of 5,000/hour.
+          3. We add per-PR API-heavy features (e.g. fetching full
+             review threads, file diffs, or CI logs per PR) that
+             multiply point cost by PR count.
+          4. A run ever actually observes a secondary-limit response
+             ("You have exceeded a secondary rate limit").
+
+        WHAT WE MIGHT DO WHEN REOPENED (menu, not a commitment):
+          - Honor the ``Retry-After`` header on 403/429 secondary-limit
+            responses. The current retry policy (ghclmp7n.d) uses fixed
+            exponential backoff capped at ~2s over 3 attempts; a
+            secondary limit can ask for 60s, which we would currently
+            ignore. This is the cheapest hardening and the most likely
+            first step.
+          - Add a concurrency semaphore + token-bucket throttle in the
+            gh client if/when any call path goes parallel.
+          - Log ``rateLimit { cost remaining resetAt }`` (one extra
+            GraphQL field) into each run's state so consumption trend
+            is observable before it becomes a problem — cheap
+            telemetry appropriate for an unattended cron tool.
+          - Back off run frequency or shard the fleet across cron slots
+            if primary budget ever tightens.
+
+        Not doing any of these now: at ~0.5% of the hourly GraphQL
+        budget and fully serial, the cost of the machinery exceeds the
+        risk it would mitigate. The trigger conditions above are the
+        signal to revisit.
