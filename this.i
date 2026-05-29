@@ -2421,3 +2421,167 @@ Gitbulk Triage Tool = goal:
         fork dimension, the conservative stop-gap is to treat ANY rebase-pr
         --apply as suspect on repos where the user uses fork PRs. See
         reviews/review-panel-2026-05-29.md (ARC-F1, ARC-F4).
+
+    # ─── INSTALL & DISTRIBUTION (Phase 6) ────────────────────────────────────
+
+    Install And Distribution Strategy = decision:
+      id: dstbr5kq
+      why: >
+        Adopt a hybrid distribution model ported from agentprep: gitbulk
+        stays pip-installable (contributors, pipx users) AND ships a single
+        self-contained zipapp executable fetched from a GitHub release.
+        This SUPERSEDES the design-notes §10 "out of scope for v1" line that
+        deferred a bundled executable — end-user install friction (clone +
+        venv + pip) is the thing stopping gitbulk from being usable on a
+        fresh machine or by anyone but its author, and the agentprep model
+        is already proven and maintained by the same author, so the
+        marginal cost is a near-mechanical port. Cost: two distribution
+        channels to keep coherent; mitigated by a single version source
+        (node vsrc4pn3). The §10 entry is amended to reference this node.
+      approved-by: daniel, 2026-05-29
+      children:
+
+        Single-File Zipapp Artifact = decision:
+          id: zpapb4n7
+          why: >
+            The end-user artifact is a stdlib `zipapp` (shebang
+            /usr/bin/env python3) named `gitbulk`, built by a `bundle`
+            subcommand — same mechanism as agentprep's bundle.py. Chosen
+            over PyInstaller/shiv/pex because it needs no per-platform build
+            matrix and no compiler: it is a portable archive that runs on
+            any POSIX box with Python 3.10+, which the user already has
+            everywhere. Cost: not a truly static binary (system Python
+            required) and the zipapp has no .dist-info, so the version must
+            be baked at build time (node vsrc4pn3); both accepted because
+            the target audience always has a modern Python.
+
+        PyYAML Vendored Into The Zipapp = decision:
+          id: pyvnd6kz
+          why: >
+            gitbulk's one runtime third-party dependency (PyYAML, used only
+            via yaml.safe_load) is vendored into the zipapp by copying the
+            installed `yaml` package out of the build environment at bundle
+            time and dropping the libyaml C extension (*.so) — the
+            pure-Python SafeLoader is sufficient. Chosen over committing a
+            static PyYAML source copy (avoids third-party code + license
+            churn in the repo, and the vendored version always tracks the
+            pinned dependency) and over dropping PyYAML for stdlib
+            tomllib/json (which would change the user-authored gitbulk.yaml
+            format and touch six modules). Cost: bundling requires PyYAML
+            installed in the build env — already true, it is a declared
+            dependency, and the release workflow pip-installs before
+            bundling.
+
+        Gh-Authenticated Bootstrap And Self-Install = decision:
+          id: bootp4mq
+          why: >
+            Bootstrap is `gh release download --repo dhh1128/gitbulk
+            --pattern gitbulk … && ./gitbulk install`; the `install`
+            subcommand copies the running binary into ~/.local/bin, marks
+            it executable, and prints a shell-specific PATH hint if that dir
+            is not on PATH. Reuses `gh` (already a hard runtime dependency,
+            node hp4nck2v) so the same authenticated path works whether the
+            repo is public or (as now) private — no second credential
+            channel, and no anonymous-curl story to document while the
+            repo's public release is still pending (node 6xp4kq2n records
+            the eventual public intent; "private for now" is only the
+            current status). ~/.local/bin is the XDG user-bin convention and
+            is exactly what bin/gitbulk-cron's default-PATH branch already
+            searches, so cron keeps working with no change. Cost: end users
+            must have `gh` installed and authed — already required to use
+            gitbulk at all.
+
+        Update Is Notice-Only And Never Mid-Run = decision:
+          id: updnc5kr
+          why: >
+            `gitbulk update` is explicit and the only thing that replaces
+            the binary; no command ever auto-replaces it mid-run. A passive
+            "newer version available" notice is printed before a normal
+            subcommand but ONLY when stderr.isatty() and the check is not
+            suppressed (--no-update-check / GITBULK_NO_UPDATE_CHECK=1), and
+            bin/gitbulk-cron sets that env var belt-and-suspenders; the
+            self-management commands (update/install/bundle) skip the notice
+            since it is pointless before them. This is stricter than
+            agentprep (which prints the notice even non-interactively)
+            BECAUSE gitbulk's primary runtime is a 3 a.m. cron job: a nightly
+            notice is log noise, and swapping a running zipapp underneath a
+            long cron run risks lazy-import failures. apply_update still
+            verifies sha256 and replaces atomically (tempfile -> fsync ->
+            os.replace) so an interrupted update can never leave a
+            half-written binary. Cost: the user must run `gitbulk update`
+            (or add a separate weekly cron line) rather than getting silent
+            updates — deliberate, for a tool with this blast radius. The
+            TTY gate also keeps the offline-tests rule (no network in tests)
+            intact: pytest runs non-TTY, so the check never fires.
+
+        Update Refuses To Clobber A Pip Install = decision:
+          id: updtg6qn
+          why: >
+            Because gitbulk is also pip-installable (node dstbr5kq),
+            `update` first determines whether the running artifact is the
+            zipapp or a pip/console-script install (the latter resolves
+            inside a site-packages tree / is not a zip). If it looks
+            pip-installed it refuses to self-replace and tells the user to
+            `pip install -U` / `pipx upgrade gitbulk` instead. Chosen over
+            agentprep's unconditional "replace sys.argv[0]" because
+            overwriting a venv entry-point shim with a downloaded zipapp
+            would corrupt that install. Cost: a little detection logic and
+            an extra branch to test; cheap insurance against bricking a
+            contributor's venv.
+
+        Release Manifest Authenticity Is Sha256-Only = decision:
+          id: shano4kp
+          why: >
+            update.json carries the binary's sha256 and apply_update rejects
+            a mismatch; the optional HMAC manifest signature agentprep
+            supports (AGENTPREP_UPDATE_SECRET) is intentionally NOT ported.
+            For a single-user tool fetched over authenticated gh from the
+            author's own repo, the residual threat HMAC addresses — a
+            tampered release asset whose transport is nonetheless trusted —
+            requires compromising the author's own GitHub repo, at which
+            point the attacker could re-sign anyway unless the secret is
+            held offline, which is not worth the operational burden here.
+            Cost: no defense against a tampered-but-correctly-hashed release
+            if GitHub itself is compromised; deferred as a tension
+            (schardn7) rather than built speculatively.
+
+        Supply-Chain Hardening Of Releases = tension:
+          id: schardn7
+          why: >
+            OPEN: sha256-only (node shano4kp) trusts GitHub + gh transport.
+            If gitbulk ever ships to third parties or the repo gains
+            contributors with release rights, revisit: HMAC-signed manifest,
+            Sigstore/cosign, or GitHub release attestations. Not resolved
+            now because the current threat model (single author,
+            private/personal repo) does not justify the key-management cost.
+            Do not silently add signing without resolving this node.
+
+        Version Single Source Of Truth = decision:
+          id: vsrc4pn3
+          why: >
+            pyproject.toml is the single source of version truth.
+            __init__.py stops hard-coding "0.0.1" and instead derives the
+            version from importlib.metadata when pip-installed, falling back
+            to a dev sentinel; bundle.py bakes the resolved version into the
+            zipapp's __init__.py because a zipapp has no .dist-info for
+            importlib.metadata to read at runtime. Chosen over the current
+            duplicated literal (which silently drifts between pyproject and
+            __init__.py) — this is exactly agentprep's pattern and removes a
+            class of "reported version is wrong" bugs. Cost: __version__ is
+            no longer a grep-able literal in source; accepted.
+
+        Release Automation Pipeline = decision:
+          id: reldst7q
+          why: >
+            scripts/release.py (clean-tree + in-sync-with-origin/main +
+            tests-pass gates -> bump pyproject -> commit -> tag -> push tag)
+            triggers .github/workflows/release.yml on the tag, which
+            pip-installs, builds the bundle, generates update.json
+            (latest_version / script_url / sha256), and publishes both as
+            release assets. Chosen as a direct port of agentprep's proven
+            release path so the author maintains one mental model across
+            both tools. release.py is human-run (AGENTS.md reserves pushes
+            to main and tags for humans; AI never runs it). Workflow actions
+            are pinned to node24-runtime versions per the standing
+            GitHub-Actions deprecation rule. Cost: couples releasing to
+            GitHub Actions availability; acceptable, CI already lives there.

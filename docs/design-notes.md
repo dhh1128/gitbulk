@@ -254,8 +254,13 @@ discipline per phase.
 - A web UI.
 - External notification adapters (ntfy, slack, desktop). Layers 5+ in
   the design — explicitly deferred.
-- A bundled single-file executable like agentprep ships. `pip install
-  -e .` is fine for v1.
+- ~~A bundled single-file executable like agentprep ships. `pip install
+  -e .` is fine for v1.~~ **Superseded 2026-05-29** (`this.i` node
+  `dstbr5kq`): gitbulk now ships a hybrid distribution — it stays
+  pip-installable AND ships a single self-contained zipapp fetched from a
+  GitHub release, with a `gitbulk install` self-installer and a
+  notice-only `gitbulk update`. See the Install & Distribution subtree in
+  `this.i`.
 - A GitHub remote for this repo. Local-only until the user runs
   `gh repo create` themselves.
 - Cron file installation. The user wires their own crontab around
