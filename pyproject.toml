@@ -18,6 +18,11 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=7.0", "pytest-cov>=4.0"]
 
+[project.urls]
+Homepage = "https://github.com/dhh1128/gitbulk"
+Repository = "https://github.com/dhh1128/gitbulk"
+Issues = "https://github.com/dhh1128/gitbulk/issues"
+
 [project.scripts]
 gitbulk = "gitbulk.cli:main"
 
