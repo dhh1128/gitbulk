@@ -39,6 +39,40 @@ def get(cmd):
     return run(cmd, capture=True).stdout.strip()
 
 
+def readme_url():
+    """Return the GitHub '#releasing' README URL, derived from the git remote,
+    or None.
+
+    Derived from ``git remote get-url origin`` (never hard-coded) so it stays
+    correct if the repo is renamed or moved. Returns None for a non-GitHub
+    remote, a missing remote, or a non-repo checkout — the caller then omits
+    the epilog. Unlike agentprep's version we do NOT consult
+    importlib.metadata: this script lives in scripts/, is never shipped in the
+    package or placed on PATH, and only ever runs from this source checkout,
+    so the git remote is the one reliable source.
+    """
+    try:
+        remote = get(["git", "remote", "get-url", "origin"])
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+    m = re.match(
+        r"(?:git@github\.com:|ssh://git@github\.com/|https://github\.com/)"
+        r"([^/]+/[^/]+?)(?:\.git)?/?$",
+        remote,
+    )
+    if not m:
+        return None
+    return f"https://github.com/{m.group(1)}/blob/main/README.md#releasing"
+
+
+def hyperlink(url, text):
+    """An OSC 8 clickable terminal hyperlink when stdout is a TTY; otherwise
+    the plain URL, so piped or redirected --help stays readable."""
+    if sys.stdout.isatty():
+        return f"\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\"
+    return url
+
+
 def current_version():
     m = re.search(r'^version\s*=\s*"([^"]+)"', PYPROJECT.read_text(), re.MULTILINE)
     if not m:
@@ -138,8 +172,11 @@ def prompt_message(part):
 
 
 def main():
+    url = readme_url()
+    epilog = f"For more details see: {hyperlink(url, url)}" if url else None
     parser = argparse.ArgumentParser(
         description="Cut a release. Defaults to --patch if no bump flag is given.",
+        epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     group = parser.add_mutually_exclusive_group(required=False)
