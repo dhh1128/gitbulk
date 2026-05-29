@@ -2331,17 +2331,17 @@ Gitbulk Triage Tool = goal:
         question so much as undone setup — but tracked here because they
         gate "actually relying on it."
 
-        1. INSTALL / DISTRIBUTION (the big one; also in auto-memory as a
-           gap). README documents only ``pip install -e ".[test]"`` (dev
-           mode). Reality: gitbulk runs on MULTIPLE machines (laptop, cron
-           host, possibly more) and each needs a clean install, not a
-           clone-and-editable-install. The editable install at
-           ~/.local/bin/gitbulk silently breaks if the source clone moves
-           or is deleted — subtle cron-tick breakage. Options: publish to
-           PyPI (repo is public; ``pipx install gitbulk`` is the natural
-           CLI UX), or at minimum a documented fresh-machine procedure +
-           a per-release wheel. Prerequisite: a versioning + release
-           process must exist before any PyPI publish makes sense.
+        1. INSTALL / DISTRIBUTION. RESOLVED 2026-05-29 (node dstbr5kq +
+           the v0.5.0 release). The original gap: README documented only
+           ``pip install -e ".[test]"``, and the editable install at
+           ~/.local/bin/gitbulk silently broke if the source clone moved.
+           Now gitbulk ships a single-file zipapp via ``gh release
+           download … && gitbulk install`` — a STANDALONE binary in
+           ~/.local/bin that no longer depends on a source clone staying
+           put — plus ``gitbulk update``. PyPI/pipx is deliberately NOT
+           used while the repo is private: node bootp4mq routes
+           distribution through authenticated ``gh`` instead. Revisit
+           pipx only if/when the repo actually goes public.
 
         2. BRANCH PROTECTION + CODEOWNERS (security-hawk F5, node
            shawk7nq). main has commits and the public repo exists, so
@@ -2359,12 +2359,11 @@ Gitbulk Triage Tool = goal:
            file added at the repo root and declared in pyproject (SPDX
            `Apache-2.0`, PEP 639).
 
-        Recommended order: #4 (done) → #1 (unblocks everything) → #2 →
-        #3. #2/#3 remain deferred until the user decides to move gitbulk
-        from "I run it by hand" to "it runs itself." (NB: #1
-        install/distribution is itself now substantially resolved by the
-        dstbr5kq subtree and the v0.5.0 release; this tension's #1 text
-        predates that and should be reconciled separately.)
+        Status: #1 and #4 are done. #2 (branch protection / CODEOWNERS)
+        and #3 (real cron deployment) remain deferred until the user
+        decides to move gitbulk from "I run it by hand" to "it runs
+        itself." #3 was originally blocked on #1 (a stable install to
+        point cron at); that prerequisite is now satisfied.
 
     Per-Repo Lock vs Global Exclusive Lock = tension:
       id: rlkrcn3p
