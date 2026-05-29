@@ -328,8 +328,17 @@ def _run_under_lock(
     # PER_REPO preflight.
     skipped_repos: list[tuple[str, str]] = []
     passing_repos: list[RepoEntry] = []
-    # Batch default-branch lookups (see report.py for rationale).
-    gh.prefetch_default_branches([r.slug for r in repos])
+    # Batch default-branch lookups (see report.py for rationale). The
+    # prefetch reports its own progress — it's multi-second for a big
+    # fleet and otherwise looks like a hang.
+    prefetch_prog = Progress(
+        len(repos), prefix="prefetching default branches: "
+    )
+    gh.prefetch_default_branches(
+        [r.slug for r in repos],
+        on_progress=lambda done, total: prefetch_prog.update(done),
+    )
+    prefetch_prog.done()
     progress = Progress(len(repos), prefix="per-repo checks: ")
     for i, repo in enumerate(repos, start=1):
         progress.update(i, repo.slug)

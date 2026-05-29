@@ -1315,6 +1315,29 @@ def test_prefetch_populates_cache_so_default_branch_hits_memory():
     assert mock_run.call_count == 1
 
 
+def test_prefetch_reports_progress_per_chunk():
+    """on_progress is called after each chunk with (done, total). With
+    3 slugs and chunk size 100 there's one chunk → one callback at
+    (3, 3). The contract is cumulative-completed, so the final call
+    always equals (total, total)."""
+    payload = {
+        "data": {
+            "r0": {"defaultBranchRef": {"name": "main"}},
+            "r1": {"defaultBranchRef": {"name": "main"}},
+            "r2": {"defaultBranchRef": {"name": "main"}},
+        }
+    }
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    calls: list[tuple[int, int]] = []
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        client.prefetch_default_branches(
+            ["a/one", "a/two", "a/three"],
+            on_progress=lambda done, total: calls.append((done, total)),
+        )
+    assert calls == [(3, 3)]
+
+
 def test_default_branch_cache_miss_falls_back_to_rest():
     """A slug NOT in the cache falls through to the per-slug REST call."""
     payload = {"data": {"r0": {"defaultBranchRef": {"name": "main"}}}}

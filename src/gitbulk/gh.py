@@ -29,7 +29,15 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, Literal, Mapping, Protocol, runtime_checkable
+from typing import (
+    Any,
+    Callable,
+    Iterable,
+    Literal,
+    Mapping,
+    Protocol,
+    runtime_checkable,
+)
 
 from gitbulk.pr_info import CheckRun, PRComment, PRInfo, TimelineEvent
 
@@ -74,17 +82,23 @@ class GHClient(Protocol):
         slugs: Iterable[str],
         *,
         timeout: float | None = None,
+        on_progress: "Callable[[int, int], None] | None" = None,
     ) -> None:
         """Batch-fetch default branches for ``slugs`` into an in-process
         cache so subsequent ``default_branch`` calls hit memory.
 
-        Issues one GraphQL query with aliased ``repository()`` nodes
-        instead of one REST call per slug — for a 175-repo fleet that
-        turns a 60-second sequential wait into a ~2-second single
-        call. If the batch call fails (network, rate limit, GraphQL
-        complexity), the cache is left empty and ``default_branch``
-        falls back to the per-slug REST path. No-op when called
-        before any cache surface exists (FakeGHClient).
+        Issues GraphQL queries with aliased ``repository()`` nodes
+        (chunked, because GitHub 502s past ~150 nodes) instead of one
+        REST call per slug — cuts a 200-repo fleet's per-repo phase
+        from ~60s of sequential REST to a handful of batched round-
+        trips. If a chunk fails (network, rate limit, unresolvable
+        repo), its slugs are left uncached and ``default_branch`` falls
+        back to the per-slug REST path for them.
+
+        ``on_progress`` (if given) is called after each chunk with
+        ``(slugs_completed, slugs_total)`` so callers can render a
+        progress indicator — the fetch is multi-second for large
+        fleets and otherwise looks like a hang.
         """
         ...
 
@@ -369,11 +383,16 @@ class FakeGHClient:
         slugs: Iterable[str],
         *,
         timeout: float | None = None,
+        on_progress: "Callable[[int, int], None] | None" = None,
     ) -> None:
         """No-op in the fake: the configured ``default_branches`` map IS
         the cache. We still count the call so tests can assert the
-        handler invoked the prefetch path."""
+        handler invoked the prefetch path, and fire ``on_progress`` once
+        at completion so the handler's progress wiring is exercised."""
         self.call_count["prefetch_default_branches"] += 1
+        if on_progress is not None:
+            n = len(list(slugs))
+            on_progress(n, n)
 
     def my_open_prs(
         self,
@@ -801,21 +820,26 @@ class ProductionGHClient:
         slugs: Iterable[str],
         *,
         timeout: float | None = None,
+        on_progress: "Callable[[int, int], None] | None" = None,
     ) -> None:
         # verified non-deprecated against gh CLI 2026-05-28
         # GraphQL with aliased repository() nodes lets us look up N
-        # default branches per round-trip. We chunk at _CHUNK below
-        # because empirically GitHub returns HTTP 502 around 200 nodes
-        # in a single query (smaller chunks are reliable; tested
-        # 2026-05-29 against a 205-repo fleet).
+        # default branches per round-trip. We chunk at _CHUNK because
+        # empirically (2026-05-29, 205-repo fleet) GitHub returns
+        # HTTP 502 at ~150 nodes; 100 is reliable (~8s) and 50 also
+        # works (~5s). 100 means fewer round-trips for big fleets.
         slug_list = [s for s in slugs if "/" in s]
-        if not slug_list:
+        total = len(slug_list)
+        if total == 0:
             return
-        _CHUNK = 50
-        for start in range(0, len(slug_list), _CHUNK):
-            self._prefetch_default_branches_chunk(
-                slug_list[start : start + _CHUNK], timeout=timeout
-            )
+        _CHUNK = 100
+        done = 0
+        for start in range(0, total, _CHUNK):
+            chunk = slug_list[start : start + _CHUNK]
+            self._prefetch_default_branches_chunk(chunk, timeout=timeout)
+            done += len(chunk)
+            if on_progress is not None:
+                on_progress(done, total)
 
     def _prefetch_default_branches_chunk(
         self,

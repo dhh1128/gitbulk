@@ -78,6 +78,7 @@ from gitbulk.invariants.base import Invariant, InvariantKind
 from gitbulk.locks import LockTimeoutError, global_lock
 from gitbulk.pr_info import PRInfo
 from gitbulk.runstate import RunState
+from gitbulk.util.progress import Progress
 from gitbulk import subcommands as subcommands_mod
 from gitbulk.worktree import (
     WorktreeError,
@@ -407,8 +408,16 @@ def _run_under_lock(
         )
 
     # 5. PER_REPO preflight; same Skip-vs-Skip discrimination as report.
-    # Batch default-branch lookups (see report.py for rationale).
-    gh.prefetch_default_branches([r.slug for r in repos])
+    # Batch default-branch lookups (see report.py for rationale), with
+    # progress since the prefetch is multi-second for a big fleet.
+    prefetch_prog = Progress(
+        len(repos), prefix="prefetching default branches: "
+    )
+    gh.prefetch_default_branches(
+        [r.slug for r in repos],
+        on_progress=lambda done, total: prefetch_prog.update(done),
+    )
+    prefetch_prog.done()
     skipped_repos: list[tuple[str, str]] = []
     passing_repos: list[RepoEntry] = []
     for repo in repos:

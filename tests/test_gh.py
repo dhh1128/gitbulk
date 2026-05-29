@@ -352,6 +352,38 @@ def test_close_pr_raises_configured_exception():
         fake.close_pr("a/b", 1)
 
 
+# ─── FakeGHClient.prefetch_default_branches ────────────────────────────────
+
+
+def test_fake_prefetch_default_branches_counts_and_is_noop():
+    """The fake's default_branches map already serves as the cache, so
+    prefetch is a no-op beyond counting the call."""
+    fake = FakeGHClient(default_branches={"a/b": "main"})
+    fake.prefetch_default_branches(["a/b", "c/d"])
+    assert fake.call_count["prefetch_default_branches"] == 1
+    # Still resolves from the configured map.
+    assert fake.default_branch("a/b") == "main"
+
+
+def test_fake_prefetch_fires_on_progress_once_at_completion():
+    """The fake invokes on_progress(total, total) once so a handler's
+    progress wiring is exercised even against the fake."""
+    fake = FakeGHClient(default_branches={"a/b": "main"})
+    calls: list[tuple[int, int]] = []
+    fake.prefetch_default_branches(
+        ["a/b", "c/d", "e/f"],
+        on_progress=lambda done, total: calls.append((done, total)),
+    )
+    assert calls == [(3, 3)]
+
+
+def test_fake_prefetch_without_on_progress_is_silent():
+    """on_progress=None path: no callback, no error."""
+    fake = FakeGHClient(default_branches={"a/b": "main"})
+    fake.prefetch_default_branches(["a/b"])  # no on_progress
+    assert fake.call_count["prefetch_default_branches"] == 1
+
+
 # ─── FakeGHClient.fetch_merge_commit_sha ───────────────────────────────────
 
 
