@@ -10,6 +10,9 @@ Usage:
     python scripts/release.py -m "add foo feature"  # patch bump, custom message
     python scripts/release.py --minor -m "new API"  # minor bump, custom message
     python scripts/release.py --major -m "rewrite"  # major bump, custom message
+    python scripts/release.py --set 0.5.0 -m "..."  # set an explicit version
+                                                    #   (e.g. a starting point;
+                                                    #    must be > current)
 
 After the tag reaches GitHub, .github/workflows/release.yml builds the
 single-file bundle + update.json and publishes them as release assets.
@@ -47,6 +50,18 @@ def bump(version, part):
     if part == "minor":
         return f"{major}.{minor + 1}.0"
     return f"{major}.{minor}.{patch + 1}"
+
+
+def parse_explicit_version(value, current):
+    """Validate an explicit --set version: X.Y.Z and strictly greater than
+    current (release.yml only checks tag==version, not monotonicity, so the
+    downgrade guard lives here)."""
+    if not re.fullmatch(r"\d+\.\d+\.\d+", value):
+        sys.exit(f"--set expects X.Y.Z (got {value!r}).")
+    as_tuple = lambda v: tuple(int(p) for p in v.split("."))  # noqa: E731
+    if as_tuple(value) <= as_tuple(current):
+        sys.exit(f"--set {value} is not greater than current {current}; refusing to downgrade.")
+    return value
 
 
 def check_branch():
@@ -114,27 +129,36 @@ def main():
     group.add_argument("--major", dest="part", action="store_const", const="major")
     group.add_argument("--minor", dest="part", action="store_const", const="minor")
     group.add_argument("--patch", dest="part", action="store_const", const="patch")
+    group.add_argument(
+        "--set", dest="explicit", metavar="X.Y.Z", default=None,
+        help="set an explicit version (e.g. a starting point) instead of bumping; must be > current",
+    )
     parser.add_argument("-m", dest="message", default=None, help="commit message")
     args = parser.parse_args()
 
-    part = args.part or "patch"
+    old = current_version()
+    if args.explicit:
+        new = parse_explicit_version(args.explicit, old)
+        label = "set"
+    else:
+        label = args.part or "patch"
+        new = bump(old, label)
+
     if args.message:
         message = args.message
-    elif part == "patch":
+    elif label == "patch":
         message = "misc fixes/enhancements"
     else:
-        message = prompt_message(part)
+        message = prompt_message(label)
 
     check_branch()
     check_clean()
     check_in_sync()
     run_tests()
 
-    old = current_version()
-    new = bump(old, part)
     tag = f"v{new}"
-
-    print(f"Bumping {old} -> {new}")
+    verb = "Setting" if args.explicit else "Bumping"
+    print(f"{verb} {old} -> {new}")
     set_version(new)
 
     run(["git", "add", str(PYPROJECT.relative_to(REPO_ROOT))])
