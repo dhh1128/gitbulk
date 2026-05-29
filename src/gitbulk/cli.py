@@ -153,6 +153,13 @@ def _close_stale_handler(args: argparse.Namespace) -> int:
     return close_stale_handler(args)
 
 
+def _rebase_pr_handler(args: argparse.Namespace) -> int:
+    # Lazy import — keeps the worktree/rebase machinery out of --help.
+    from gitbulk.commands.rebase_pr import rebase_pr_handler
+
+    return rebase_pr_handler(args)
+
+
 def _show_handler(args: argparse.Namespace) -> int:
     # Lazy import for the same reason as the other handlers — keeps the
     # locks / paths / runstate-reading machinery out of the --help path.
@@ -169,6 +176,7 @@ _SPECIAL_HANDLERS = {
     "dispatch": _dispatch_handler,
     "merge": _merge_handler,
     "close-stale": _close_stale_handler,
+    "rebase-pr": _rebase_pr_handler,
     "show": _show_handler,
 }
 
@@ -396,6 +404,48 @@ def _add_close_stale_args(sp: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_rebase_pr_args(sp: argparse.ArgumentParser) -> None:
+    """Argparse flags for ``rebase-pr``. Mirrors merge/close-stale:
+    --apply opt-in, --code-root, --skip-check, --refresh-org-members."""
+    sp.add_argument(
+        "--apply",
+        action="store_true",
+        default=False,
+        help=(
+            "Actually rebase eligible PRs and force-push (with lease). "
+            "Without this flag, rebase-pr is a dry run and prints what "
+            "it WOULD rebase (per AGENTS.md 'Mutating subcommands default "
+            "to dry-run')."
+        ),
+    )
+    sp.add_argument(
+        "--code-root",
+        metavar="PATH",
+        default=None,
+        help="Override default ~/code/ where local clones live.",
+    )
+    sp.add_argument(
+        "--skip-check",
+        metavar="NAME",
+        action="append",
+        default=None,
+        help=(
+            "Skip the named invariant for this run (may be passed more "
+            "than once). Logs a WARNING and triggers exit-code 4 if no "
+            "other concern fires."
+        ),
+    )
+    sp.add_argument(
+        "--refresh-org-members",
+        action="store_true",
+        default=False,
+        help=(
+            "Force a fresh fetch of the configured humans.org members "
+            "before running rebase-pr."
+        ),
+    )
+
+
 def _add_merge_args(sp: argparse.ArgumentParser) -> None:
     """Argparse flags specific to the ``merge`` subcommand.
 
@@ -473,6 +523,8 @@ def build_parser() -> argparse.ArgumentParser:
             _add_merge_args(sp)
         elif sc.name == "close-stale":
             _add_close_stale_args(sp)
+        elif sc.name == "rebase-pr":
+            _add_rebase_pr_args(sp)
         elif sc.name == "show":
             _add_show_args(sp)
     return parser

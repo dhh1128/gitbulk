@@ -47,6 +47,7 @@ from gitbulk.invariants.catalog import (
     PrAuthorKnownInvariant,
     PrBaseIsDefaultInvariant,
     PrInactiveInvariant,
+    PrNeedsRebaseInvariant,
     PrMergeableStateCleanInvariant,
     PrNoUnresolvedThreadsInvariant,
     PrRequiredChecksGreenInvariant,
@@ -168,6 +169,7 @@ def test_all_phase2_invariants_registered():
         "pr.no_unresolved_threads",
         "pr.age_threshold",
         "pr.inactive",
+        "pr.needs_rebase",
     }
     registered = set(all_invariants().keys())
     missing = expected - registered
@@ -209,7 +211,7 @@ def test_clone_subcommand_membership():
         LocalDefaultBranchInSyncInvariant,
     ):
         assert cls.subcommands == frozenset(
-            {"dispatch", "rebase-onto-default"}
+            {"dispatch", "rebase-pr"}
         )
 
 
@@ -220,7 +222,7 @@ def test_universal_subcommand_membership_covers_six():
             "summarize",
             "dispatch",
             "merge",
-            "rebase-onto-default",
+            "rebase-pr",
             "close-stale",
         }
     )
@@ -1191,4 +1193,45 @@ def test_pr_inactive_fail_no_repo(runstate):
 def test_pr_inactive_is_close_stale_only():
     inv = PrInactiveInvariant()
     assert inv.subcommands == frozenset({"close-stale"})
+    assert inv.kind == InvariantKind.PER_PR
+
+
+# ─── pr.needs_rebase (rebase-pr-only) ──────────────────────────────────────
+
+
+def test_pr_needs_rebase_pass_on_behind(runstate, repo):
+    pr = _real_pr(mergeable_state="BEHIND")
+    ctx = _ctx(runstate, repo=repo, pr=pr)
+    assert PrNeedsRebaseInvariant().check(ctx) == Pass()
+
+
+def test_pr_needs_rebase_pass_on_dirty(runstate, repo):
+    pr = _real_pr(mergeable_state="DIRTY")
+    ctx = _ctx(runstate, repo=repo, pr=pr)
+    assert PrNeedsRebaseInvariant().check(ctx) == Pass()
+
+
+@pytest.mark.parametrize("state", ["CLEAN", "BLOCKED", "UNKNOWN", "UNSTABLE", "HAS_HOOKS"])
+def test_pr_needs_rebase_skip_on_other_states(runstate, repo, state):
+    pr = _real_pr(mergeable_state=state)
+    ctx = _ctx(runstate, repo=repo, pr=pr)
+    result = PrNeedsRebaseInvariant().check(ctx)
+    assert isinstance(result, Skip)
+    assert "does not warrant a rebase" in result.reason
+
+
+def test_pr_needs_rebase_skip_on_none_state(runstate, repo):
+    pr = _real_pr(mergeable_state=None)
+    ctx = _ctx(runstate, repo=repo, pr=pr)
+    assert isinstance(PrNeedsRebaseInvariant().check(ctx), Skip)
+
+
+def test_pr_needs_rebase_fail_no_pr(runstate, repo):
+    ctx = _ctx(runstate, repo=repo, pr=None)
+    assert isinstance(PrNeedsRebaseInvariant().check(ctx), Fail)
+
+
+def test_pr_needs_rebase_is_rebase_pr_only():
+    inv = PrNeedsRebaseInvariant()
+    assert inv.subcommands == frozenset({"rebase-pr"})
     assert inv.kind == InvariantKind.PER_PR

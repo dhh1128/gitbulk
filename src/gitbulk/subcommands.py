@@ -75,6 +75,26 @@ _CLOSE_STALE_CHAIN: tuple[str, ...] = (
     "pr.inactive",
 )
 
+# Chain for ``rebase-pr``. Clone-touching (it force-pushes a rebased
+# head branch from a disposable worktree), so it layers the local.*
+# preflights onto the gh baseline, then gates on ``pr.needs_rebase``
+# (only BEHIND/DIRTY PRs warrant a rebase). pr.author_is_me is NOT a
+# separate invariant: my_open_prs already searches ``author:@me``, so
+# every PR the handler sees is mine by construction; an always-passing
+# invariant that re-fetches the user per PR would be wasted work.
+_REBASE_PR_CHAIN: tuple[str, ...] = (
+    "gh.authenticated",
+    "config.parseable",
+    "org.members.fresh",
+    "local.exists",
+    "local.remote_matches",
+    "local.default_branch_in_sync",
+    "github.reachable",
+    "pr.base_is_default",
+    "pr.author_known",
+    "pr.needs_rebase",
+)
+
 
 @dataclass(frozen=True)
 class Subcommand:
@@ -131,12 +151,12 @@ KNOWN: tuple[Subcommand, ...] = (
         invariant_chain=_MERGE_CHAIN,
     ),
     Subcommand(
-        name="rebase-onto-default",
-        help="Rebase your PRs onto their repo's default branch.",
+        name="rebase-pr",
+        help="Rebase your behind/conflicting PRs onto their current base.",
         mutating=True,
         lock_mode="exclusive",
         needs_clone=True,
-        invariant_chain=_CLONE_TOUCHING_CHAIN,
+        invariant_chain=_REBASE_PR_CHAIN,
     ),
     Subcommand(
         name="close-stale",

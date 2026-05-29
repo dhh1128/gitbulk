@@ -1860,6 +1860,57 @@ Gitbulk Triage Tool = goal:
       approved-by: daniel, 2026-05-28
       # was: tension fw5kq6np (Multiprompt Packaging Future, deferred at Phase 0)
 
+    Rebase PR Subcommand = decision:
+      id: dieug50n
+      why: >
+        ``rebase-pr`` (renamed from the original ``rebase-onto-default``
+        — shorter, and it rebases onto the PR's CURRENT base, which is
+        usually but not necessarily the repo default) handles the common
+        case where PR A merges and PR B goes BEHIND or DIRTY. Designed
+        in a speculative interview 2026-05-29; four decisions:
+
+        1. NAME: rebase-pr, no alias kept (brand-new tool, no muscle
+           memory or external docs to preserve).
+
+        2. CONFLICT HANDLING (v1): clean-rebase-only. In a disposable
+           worktree, ``git rebase`` onto the fresh base. CLEAN →
+           force-push. CONFLICT → DO NOT push; leave the worktree
+           mid-rebase with a CONFLICT.md (node vp7n2krq) so the user
+           finishes by hand. The grounding run showed the motivating
+           PRs are genuinely CONFLICTING (not just BEHIND), so "abort
+           and report" wouldn't actually help — but auto-AI-resolution
+           then force-push is the single riskiest thing gitbulk could
+           do unattended, so v1 stops at preparing the worktree. AI
+           conflict resolution via the existing dispatch/exec kernel is
+           the natural v2 and is deliberately deferred.
+
+        3. FORCE-PUSH SAFETY: ``--force-with-lease=<head>:<expected_sha>``
+           where expected_sha is the PR's last-observed head. An
+           intervening push (by anyone) makes the lease fail and that
+           PR aborts rather than clobbering. Never plain --force.
+
+        4. TARGETING: fleet-wide, dry-run by default (the 2vqp4nk6
+           gate), consistent with merge/close-stale. A future --pr
+           filter (and the broader filter-args work) can narrow it.
+
+        Eligibility gate: ``pr.needs_rebase`` (rebase-pr-only invariant)
+        Passes only for mergeable_state in {BEHIND, DIRTY}. CLEAN needs
+        nothing; BLOCKED is gated on review/checks not base-staleness;
+        UNKNOWN/UNSTABLE/HAS_HOOKS don't indicate a stale base. There is
+        NO separate pr.author_is_me invariant: my_open_prs already
+        searches author:@me, so every PR the handler sees is mine by
+        construction (revisit if filter-args ever let rebase-pr target
+        other people's PRs — see the open filter-design discussion).
+
+        Mechanics live in two modules to keep the gh client a pure
+        network boundary and worktree.py focused on lifecycle:
+        ``rebase.py`` (rebase_onto_base / force_push_with_lease, pure
+        git subprocess) and the handler in commands/rebase_pr.py, which
+        reuses worktree.create_worktree/remove_worktree and the
+        is_worktree_in_conflict detector. The main clone is never
+        touched; all git work happens in the worktree.
+      approved-by: daniel, 2026-05-29
+
     Default Branch Rename Handling = tension:
       id: rj7p4kqn
       why: >

@@ -36,6 +36,7 @@ _IMPLEMENTED_SUBCOMMANDS = {
     "dispatch",
     "merge",
     "close-stale",
+    "rebase-pr",
     "show",
 }
 _STUB_SUBCOMMANDS = [n for n, _ in SUBCOMMANDS if n not in _IMPLEMENTED_SUBCOMMANDS]
@@ -392,3 +393,19 @@ def test_config_error_prints_clean_message_no_stack_trace(
     assert "Traceback" not in err
     assert "repos.txt not found" in err
     assert err.startswith("gitbulk report:")
+
+
+def test_not_implemented_handler_returns_99():
+    """No subcommand is a stub anymore, but _not_implemented remains as
+    the fallback for any future KNOWN subcommand added without a handler.
+    Exercise it directly so the safety net stays covered + documented."""
+    import argparse as _argparse
+    from gitbulk.cli import _not_implemented
+
+    handler = _not_implemented("future-cmd")
+    err = io.StringIO()
+    with redirect_stderr(err):
+        rc = handler(_argparse.Namespace())
+    assert rc == EXIT_NOT_IMPLEMENTED
+    assert "future-cmd" in err.getvalue()
+    assert "not yet implemented" in err.getvalue()

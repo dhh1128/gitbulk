@@ -66,13 +66,21 @@ _ALL_SUBS: frozenset[str] = frozenset(
         "summarize",
         "dispatch",
         "merge",
-        "rebase-onto-default",
+        "rebase-pr",
         "close-stale",
     }
 )
-_CLONE_SUBS: frozenset[str] = frozenset({"dispatch", "rebase-onto-default"})
+_CLONE_SUBS: frozenset[str] = frozenset({"dispatch", "rebase-pr"})
 _MERGE_ONLY: frozenset[str] = frozenset({"merge"})
 _CLOSE_STALE_ONLY: frozenset[str] = frozenset({"close-stale"})
+_REBASE_PR_ONLY: frozenset[str] = frozenset({"rebase-pr"})
+
+#: mergeable_state values that mean a rebase would help: BEHIND (base
+#: advanced, clean fast-forward available) or DIRTY (real conflict — the
+#: rebase will stop and the worktree is preserved for manual fix-up).
+#: CLEAN needs nothing; BLOCKED is gated on review/checks not conflicts;
+#: UNKNOWN/UNSTABLE/HAS_HOOKS don't indicate a base-staleness problem.
+_REBASEABLE_MERGEABLE_STATES: frozenset[str] = frozenset({"BEHIND", "DIRTY"})
 
 
 # ─── UNIVERSAL ────────────────────────────────────────────────────────────
@@ -581,3 +589,39 @@ class PrInactiveInvariant(Invariant):
                 f"(updated {age.days} days ago)"
             )
         return Pass()
+
+
+@register
+class PrNeedsRebaseInvariant(Invariant):
+    """Pass only when the PR would actually benefit from a rebase.
+
+    "Benefits" = ``mergeable_state`` is BEHIND (base advanced, a clean
+    rebase brings it current) or DIRTY (a real conflict — rebase-pr
+    will stop at the conflict and preserve the worktree for manual
+    resolution). Every other state Skips:
+
+      - CLEAN: already up to date, nothing to do.
+      - BLOCKED: blocked on review/checks, not on base staleness — a
+        rebase wouldn't change anything.
+      - UNKNOWN: GitHub is still computing mergeability; can't tell, so
+        skip conservatively (the next run will know).
+      - UNSTABLE / HAS_HOOKS: mergeable; not a base-staleness problem.
+
+    rebase-pr-only. The clone-touching baseline (local.*, base_is_default,
+    author_known) runs ahead of this in the chain.
+    """
+
+    name = "pr.needs_rebase"
+    kind = InvariantKind.PER_PR
+    subcommands = _REBASE_PR_ONLY
+
+    def check(self, ctx: InvariantContext) -> Result:
+        if ctx.pr is None:
+            return Fail("per-PR invariant called without ctx.pr")
+        state = ctx.pr.mergeable_state
+        if state in _REBASEABLE_MERGEABLE_STATES:
+            return Pass()
+        return Skip(
+            f"mergeable_state={state!r} does not warrant a rebase "
+            f"(only {sorted(_REBASEABLE_MERGEABLE_STATES)} do)"
+        )
