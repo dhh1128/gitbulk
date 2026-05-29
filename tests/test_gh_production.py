@@ -481,23 +481,18 @@ def test_my_open_prs_with_slugs_emits_empty_list_for_unknown_slug():
     assert pr.created_at == datetime(2026, 5, 27, 10, 0, 0, tzinfo=timezone.utc)
 
 
-def test_my_open_prs_with_empty_slug_list_returns_empty_dict():
-    """Empty iterable → still issues a query with no repo: terms, and
-    the resulting dict has no slug keys (because none were requested) and
-    no PR rows would land outside that set... but per FakeGHClient
-    semantics, when slugs is given as []  the result dict is empty."""
-    side_effect = _make_run_mock(
-        _CompletedFake(0, stdout=json.dumps({"data": {"search": {"nodes": []}}}))
-    )
-    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+def test_my_open_prs_with_empty_slug_list_makes_no_network_call():
+    """Empty iterable → zero chunks → no search call at all, returns {}.
+
+    The old single-query implementation wastefully searched all-my-PRs
+    (no repo filter) then discarded everything for lack of slug keys.
+    The chunked implementation correctly does nothing for an empty list."""
+    with patch("gitbulk.gh.subprocess.run") as mock_run:
         client = ProductionGHClient()
         result = client.my_open_prs(slugs=[])
 
     assert result == {}
-    args, _ = mock_run.call_args
-    argv = args[0]
-    q_value = argv[argv.index("-F") + 1]
-    assert q_value == "q=author:@me is:open is:pr"
+    assert mock_run.call_count == 0
 
 
 def test_my_open_prs_groups_by_repository_name_with_owner():
@@ -552,6 +547,161 @@ def test_my_open_prs_skips_null_nodes_in_search_result():
         client = ProductionGHClient()
         result = client.my_open_prs()
 
+    assert len(result["dhh1128/gitbulk"]) == 1
+
+
+# ─── pagination + repo-chunking ────────────────────────────────────────────
+
+
+def _search_page(nodes, *, has_next=False, end_cursor=None):
+    """Build a search-page payload with explicit pageInfo."""
+    return {
+        "data": {
+            "search": {
+                "pageInfo": {
+                    "hasNextPage": has_next,
+                    "endCursor": end_cursor,
+                },
+                "nodes": nodes,
+            }
+        }
+    }
+
+
+def test_my_open_prs_paginates_until_no_next_page():
+    """>100 results across pages: the loop follows endCursor until
+    hasNextPage is false, accumulating all nodes."""
+    n1 = dict(_GRAPHQL_FIXTURE["data"]["search"]["nodes"][0], number=1)
+    n2 = dict(_GRAPHQL_FIXTURE["data"]["search"]["nodes"][0], number=2)
+    n3 = dict(_GRAPHQL_FIXTURE["data"]["search"]["nodes"][0], number=3)
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps(
+            _search_page([n1], has_next=True, end_cursor="CURSOR1"))),
+        _CompletedFake(0, stdout=json.dumps(
+            _search_page([n2], has_next=True, end_cursor="CURSOR2"))),
+        _CompletedFake(0, stdout=json.dumps(
+            _search_page([n3], has_next=False))),
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        result = client.my_open_prs(slugs=["dhh1128/gitbulk"])
+
+    assert mock_run.call_count == 3  # three pages
+    assert [p.number for p in result["dhh1128/gitbulk"]] == [1, 2, 3]
+
+
+def test_my_open_prs_passes_cursor_on_subsequent_pages():
+    """Page 2's argv carries `-f after=<endCursor>` from page 1; page 1
+    carries no `after`."""
+    n1 = dict(_GRAPHQL_FIXTURE["data"]["search"]["nodes"][0], number=1)
+    n2 = dict(_GRAPHQL_FIXTURE["data"]["search"]["nodes"][0], number=2)
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps(
+            _search_page([n1], has_next=True, end_cursor="ABC123"))),
+        _CompletedFake(0, stdout=json.dumps(
+            _search_page([n2], has_next=False))),
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.my_open_prs(slugs=["dhh1128/gitbulk"])
+
+    call1_argv = mock_run.call_args_list[0][0][0]
+    call2_argv = mock_run.call_args_list[1][0][0]
+    assert "after=ABC123" not in " ".join(call1_argv)
+    assert "after=ABC123" in call2_argv
+
+
+def test_my_open_prs_stops_when_next_page_but_no_cursor():
+    """Defensive: hasNextPage=true with an empty endCursor must not loop
+    forever — we stop after that page."""
+    n1 = dict(_GRAPHQL_FIXTURE["data"]["search"]["nodes"][0], number=1)
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps(
+            _search_page([n1], has_next=True, end_cursor=None))),
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        result = client.my_open_prs(slugs=["dhh1128/gitbulk"])
+    assert mock_run.call_count == 1
+    assert len(result["dhh1128/gitbulk"]) == 1
+
+
+def test_my_open_prs_chunks_repo_qualifiers_at_50():
+    """>50 slugs → multiple search calls, each with ≤50 repo: terms.
+    GitHub silently caps qualifiers, so coalescing all into one query
+    would drop repos."""
+    slugs = [f"owner/repo{i}" for i in range(120)]  # → 3 chunks (50,50,20)
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps(_search_page([]))),
+        _CompletedFake(0, stdout=json.dumps(_search_page([]))),
+        _CompletedFake(0, stdout=json.dumps(_search_page([]))),
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        result = client.my_open_prs(slugs=slugs)
+
+    # 3 chunks → 3 search calls.
+    assert mock_run.call_count == 3
+    # Each chunk's q has at most 50 repo: terms.
+    for call in mock_run.call_args_list:
+        argv = call[0][0]
+        q = argv[argv.index("-F") + 1]
+        assert q.count("repo:") <= 50
+    # All requested slugs are still pre-seeded as keys.
+    assert len(result) == 120
+
+
+def test_my_open_prs_chunk_results_merge_across_chunks():
+    """A PR found in chunk 2 lands in the result alongside chunk-1 PRs."""
+    slugs = [f"owner/repo{i}" for i in range(60)]  # 2 chunks (50 + 10)
+    pr_in_chunk1 = dict(
+        _GRAPHQL_FIXTURE["data"]["search"]["nodes"][0],
+        number=1, repository={"nameWithOwner": "owner/repo0"},
+    )
+    pr_in_chunk2 = dict(
+        _GRAPHQL_FIXTURE["data"]["search"]["nodes"][0],
+        number=2, repository={"nameWithOwner": "owner/repo55"},
+    )
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps(_search_page([pr_in_chunk1]))),
+        _CompletedFake(0, stdout=json.dumps(_search_page([pr_in_chunk2]))),
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        result = client.my_open_prs(slugs=slugs)
+    assert [p.number for p in result["owner/repo0"]] == [1]
+    assert [p.number for p in result["owner/repo55"]] == [2]
+
+
+def test_my_open_prs_runaway_guard_caps_at_100_pages():
+    """Pathological backend: every page says hasNextPage=true with a
+    valid cursor. The hard 100-page cap stops the loop rather than
+    spinning forever."""
+    n = dict(_GRAPHQL_FIXTURE["data"]["search"]["nodes"][0], number=1)
+    # _make_run_mock repeats its last outcome indefinitely, so this one
+    # "always hasNext" page drives the loop to its 100-iteration cap.
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps(
+            _search_page([n], has_next=True, end_cursor="STUCK"))),
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        result = client.my_open_prs(slugs=["dhh1128/gitbulk"])
+    # Exactly 100 page fetches, then the guard fires.
+    assert mock_run.call_count == 100
+    assert len(result["dhh1128/gitbulk"]) == 100
+
+
+def test_my_open_prs_missing_pageinfo_treated_as_single_page():
+    """A payload with no pageInfo (older backend / fixture) is one page."""
+    payload = {"data": {"search": {"nodes": [
+        _GRAPHQL_FIXTURE["data"]["search"]["nodes"][0],
+    ]}}}
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        result = client.my_open_prs(slugs=["dhh1128/gitbulk"])
+    assert mock_run.call_count == 1
     assert len(result["dhh1128/gitbulk"]) == 1
 
 

@@ -629,9 +629,17 @@ _TIMELINE_WINDOW = 50
 #: more than enough for any normal PR.
 _REVIEW_THREADS_WINDOW = 100
 
+#: Repos per coalesced search query. GitHub's search silently caps how
+#: many ``repo:`` qualifiers it honors in one query (and may truncate
+#: rather than error), so we chunk to stay well clear of the limit.
+#: 50 matches the default-branch prefetch chunk size and is comfortably
+#: under any observed ceiling.
+_OPEN_PRS_REPO_CHUNK = 50
+
 _MY_OPEN_PRS_GRAPHQL = """\
-query($q: String!) {
-  search(query: $q, type: ISSUE, first: 100) {
+query($q: String!, $after: String) {
+  search(query: $q, type: ISSUE, first: 100, after: $after) {
+    pageInfo { hasNextPage endCursor }
     nodes {
       ... on PullRequest {
         number
@@ -961,6 +969,51 @@ class ProductionGHClient:
             if isinstance(name, str) and name:
                 self._default_branch_cache[slug] = name
 
+    def _search_all_pages(
+        self,
+        search_terms: list[str],
+        *,
+        timeout: float | None,
+    ) -> list[dict[str, Any]]:
+        """Run a search query, following ``pageInfo`` until exhausted.
+
+        Returns the flat list of result nodes across all pages. Each
+        page is ``first: 100``; without this loop a fleet with >100
+        matching PRs would silently lose the overflow (the original
+        single-page bug). A missing ``pageInfo`` (older fixtures, or a
+        backend that omits it) is treated as a single page.
+        """
+        search_string = " ".join(search_terms)
+        nodes: list[dict[str, Any]] = []
+        cursor: str | None = None
+        # Hard page cap as a runaway guard: 100 pages × 100 = 10k PRs,
+        # far beyond any real fleet. Prevents an infinite loop if the
+        # backend ever returns hasNextPage=true with a stuck cursor.
+        for _ in range(100):
+            argv = [
+                "api",
+                "graphql",
+                "-F",
+                f"q={search_string}",
+            ]
+            if cursor is not None:
+                # Raw string (-f): cursors are opaque base64 and must
+                # not be type-coerced by -F.
+                argv.extend(["-f", f"after={cursor}"])
+            argv.extend(["-f", f"query={_MY_OPEN_PRS_GRAPHQL}"])
+            stdout = self._run(tuple(argv), timeout=timeout)
+            search = json.loads(stdout).get("data", {}).get("search", {}) or {}
+            nodes.extend(search.get("nodes", []) or [])
+            page_info = search.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            cursor = page_info.get("endCursor")
+            if not cursor:
+                # hasNextPage true but no cursor — backend inconsistency;
+                # stop rather than loop forever.
+                break
+        return nodes
+
     def my_open_prs(
         self,
         slugs: Iterable[str] | None = None,
@@ -968,47 +1021,39 @@ class ProductionGHClient:
         timeout: float | None = None,
     ) -> dict[str, list[PRInfo]]:
         # verified non-deprecated against gh CLI 2026-05-28
-        # Build the search string per node ghclmp7n.c (coalescing): one
-        # GraphQL call regardless of how many slugs are requested.
-        slug_list: list[str] | None
+        base_terms = ["author:@me", "is:open", "is:pr"]
+        grouped: dict[str, list[PRInfo]] = {}
+
         if slugs is None:
-            slug_list = None
-            search_terms = ["author:@me", "is:open", "is:pr"]
+            # No repo filter: one paginated search across all my PRs.
+            node_batches = [self._search_all_pages(base_terms, timeout=timeout)]
         else:
             slug_list = list(slugs)
-            search_terms = ["author:@me", "is:open", "is:pr"]
-            search_terms.extend(f"repo:{s}" for s in slug_list)
-        search_string = " ".join(search_terms)
-
-        stdout = self._run(
-            (
-                "api",
-                "graphql",
-                "-F",
-                f"q={search_string}",
-                "-f",
-                f"query={_MY_OPEN_PRS_GRAPHQL}",
-            ),
-            timeout=timeout,
-        )
-        payload = json.loads(stdout)
-        nodes = payload.get("data", {}).get("search", {}).get("nodes", [])
-
-        grouped: dict[str, list[PRInfo]] = {}
-        if slug_list is not None:
-            # Ensure every requested slug appears, even when no PRs exist,
-            # matching FakeGHClient.my_open_prs semantics.
+            # Pre-seed every requested slug so repos with no PRs still
+            # appear (matches FakeGHClient.my_open_prs semantics).
             for slug in slug_list:
                 grouped.setdefault(slug, [])
+            # Chunk the repo: qualifiers. GitHub silently caps how many
+            # it honors in one query, so coalescing all 200+ into one
+            # search would drop repos without any error. Each chunk is
+            # independently paginated.
+            node_batches = []
+            for start in range(0, len(slug_list), _OPEN_PRS_REPO_CHUNK):
+                chunk = slug_list[start : start + _OPEN_PRS_REPO_CHUNK]
+                terms = base_terms + [f"repo:{s}" for s in chunk]
+                node_batches.append(
+                    self._search_all_pages(terms, timeout=timeout)
+                )
 
-        for node in nodes:
-            if not node:
-                # GraphQL returns nulls for non-PullRequest items in the
-                # search results (defensive — our query filters with is:pr,
-                # but the field is still nullable).
-                continue
-            pr = _pr_info_from_graphql_node(node)
-            grouped.setdefault(pr.slug, []).append(pr)
+        for nodes in node_batches:
+            for node in nodes:
+                if not node:
+                    # GraphQL returns nulls for non-PullRequest items
+                    # (defensive — is:pr filters them, but the field is
+                    # still nullable).
+                    continue
+                pr = _pr_info_from_graphql_node(node)
+                grouped.setdefault(pr.slug, []).append(pr)
 
         return grouped
 
