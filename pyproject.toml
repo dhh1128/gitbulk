@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gitbulk"
-version = "0.0.1"
+version = "0.5.0"
 description = "Nightly PR triage and fleet maintenance across many GitHub repositories."
 readme = "README.md"
 requires-python = ">=3.10"
