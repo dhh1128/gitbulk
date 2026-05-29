@@ -384,6 +384,34 @@ def test_fake_prefetch_without_on_progress_is_silent():
     assert fake.call_count["prefetch_default_branches"] == 1
 
 
+def test_fake_seed_creates_map_when_unset():
+    """seed_default_branches into a fake with no default_branches map
+    (the constructor default of None) creates the map."""
+    fake = FakeGHClient()  # default_branches is None
+    fake.seed_default_branches({"a/b": "main"})
+    assert fake.default_branch("a/b") == "main"
+
+
+def test_fake_seed_merges_into_existing_map():
+    fake = FakeGHClient(default_branches={"a/b": "main"})
+    fake.seed_default_branches({"c/d": "develop"})
+    assert fake.default_branch("a/b") == "main"
+    assert fake.default_branch("c/d") == "develop"
+
+
+def test_fake_cached_default_branches_returns_copy():
+    fake = FakeGHClient(default_branches={"a/b": "main"})
+    snap = fake.cached_default_branches()
+    assert snap == {"a/b": "main"}
+    snap["a/b"] = "MUTATED"
+    assert fake.default_branch("a/b") == "main"  # internal unaffected
+
+
+def test_fake_cached_default_branches_empty_when_unset():
+    fake = FakeGHClient()  # None
+    assert fake.cached_default_branches() == {}
+
+
 # ─── FakeGHClient.fetch_merge_commit_sha ───────────────────────────────────
 
 

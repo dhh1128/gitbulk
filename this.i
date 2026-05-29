@@ -1872,6 +1872,63 @@ Gitbulk Triage Tool = goal:
         gitbulk grows a "rebase onto current default" helper for the
         rename case, or whether the user re-bases those by hand once.
 
+        Interaction with the default-branch cache (dbcttl7d): a renamed
+        default could be served stale from the cache for up to the TTL
+        (7 days). This only ever causes gitbulk to be MORE conservative
+        — pr.base_is_default compares the PR's base against a cached
+        default that might lag reality, so the failure mode is "skip a
+        PR that's actually fine," never "act on a wrong base." Acceptable
+        given renames are rare and the next refresh self-heals.
+
+    Default Branch Cache = decision:
+      id: dbcttl7d
+      why: >
+        The per-repo invariant chain calls gh.default_branch(slug) for
+        every repo (github.reachable, pr.base_is_default,
+        local.default_branch_in_sync). Against a 205-repo fleet that was
+        ~60s of sequential REST. Two-stage fix:
+
+        STAGE 1 (node-less, shipped first): batch the lookups into one
+        chunked GraphQL query (aliased repository() nodes, chunked at
+        100 because GitHub 502s past ~150). Populates an in-process dict
+        on the gh client; default_branch() reads it, falls back to
+        per-slug REST on miss. ~60s → ~15-21s cold. The floor is
+        GitHub's ~50ms/repo server cost.
+
+        STAGE 2 (this node): persist resolved branches to
+        ~/.cache/gitbulk/default-branches.yaml, keyed by slug with a
+        per-entry fetched_at. prime_default_branches() seeds the gh
+        in-process cache from fresh file entries (no network) and only
+        GraphQL-prefetches stale/missing slugs. Measured 15s cold → 1.3s
+        warm (12x) on the 205-repo fleet; the residual 1.3s is the
+        prefetch for ~3 deleted/renamed repos that never cache.
+
+        TTL = 7 days. Default branches change closer to never than to
+        daily; a week balances cache savings against rename lag. Every
+        staleness failure mode is "operate too conservatively" (see
+        rj7p4kqn) — never destructive — so a generous TTL is safe.
+
+        Per-entry fetched_at (not one file-level timestamp) so adding a
+        repo to repos.txt fetches only that repo, and entries expire
+        independently. The file is preserved across runs even when a
+        run uses a different repos.txt subset (a different cron entry
+        might), and an unresolvable slug (deleted repo) is dropped from
+        the cache rather than served as a dead branch forever.
+
+        Cache lives in a separate module (default_branch_cache.py), not
+        in the gh client, mirroring org_members_cache: the gh client
+        stays a pure network boundary (node ghclmp7n). The client gains
+        only seed_default_branches() / cached_default_branches() so the
+        cache module can hand it warm data and read back what a prefetch
+        resolved.
+
+        No invalidation command in v1 (parallel to org-members having
+        --refresh-org-members but default branches being lower-stakes):
+        if a rename causes a wrong skip, the user waits out the TTL or
+        deletes the cache file. Add --refresh-default-branches if that
+        becomes a real annoyance.
+      approved-by: daniel, 2026-05-29
+
     Repo Cleanup Subcommand Scope = tension:
       id: jw3kpn4q
       why: >

@@ -44,6 +44,7 @@ import yaml
 from gitbulk import paths, sentinel
 from gitbulk.config.policy import Policy, load_policy
 from gitbulk.config.repos import RepoEntry, SkippedEntry, load_repos
+from gitbulk.default_branch_cache import prime_default_branches
 from gitbulk.gh import GHClient, GHError, ProductionGHClient
 from gitbulk.invariants import (
     InvariantContext,
@@ -603,16 +604,17 @@ def _run_under_lock(
     # caller's skip_set.
     skipped_repos: list[tuple[str, str]] = []
     passing_repos: list[RepoEntry] = []
-    # Batch the default-branch lookups into chunked GraphQL calls before
-    # the per-repo loop runs. github.reachable + pr.base_is_default both
-    # call gh.default_branch(slug); without the prefetch a big fleet
-    # pays ~300ms per call sequentially. The prefetch is itself multi-
-    # second (GitHub GraphQL is ~50ms/repo server-side, chunked at 100),
-    # so it reports its own progress — otherwise it looks like a hang.
+    # Prime the default-branch cache before the per-repo loop. This
+    # seeds gh's in-process cache from the on-disk cache (warm entries
+    # cost nothing) and only GraphQL-prefetches the stale/missing slugs.
+    # github.reachable + pr.base_is_default both call gh.default_branch.
+    # The cold prefetch reports progress (multi-second for a big fleet);
+    # an all-warm run does no network and shows nothing.
     prefetch_prog = Progress(
         len(repos), prefix="prefetching default branches: "
     )
-    gh.prefetch_default_branches(
+    prime_default_branches(
+        gh,
         [r.slug for r in repos],
         on_progress=lambda done, total: prefetch_prog.update(done),
     )

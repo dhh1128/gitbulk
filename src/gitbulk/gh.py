@@ -102,6 +102,26 @@ class GHClient(Protocol):
         """
         ...
 
+    def seed_default_branches(self, mapping: dict[str, str]) -> None:
+        """Populate the in-process default-branch cache from an external
+        source (the on-disk cache) WITHOUT any network call.
+
+        Lets :mod:`gitbulk.default_branch_cache` hand gitbulk a warm
+        cache so ``default_branch`` hits memory for slugs that were
+        fetched on a prior run. Existing entries are overwritten by
+        ``mapping``.
+        """
+        ...
+
+    def cached_default_branches(self) -> dict[str, str]:
+        """Return a copy of the current in-process default-branch cache.
+
+        Used by :mod:`gitbulk.default_branch_cache` to read back what a
+        prefetch resolved (so it can be persisted to disk) without
+        triggering any per-slug network fallback.
+        """
+        ...
+
     def my_open_prs(
         self,
         slugs: Iterable[str] | None = None,
@@ -393,6 +413,17 @@ class FakeGHClient:
         if on_progress is not None:
             n = len(list(slugs))
             on_progress(n, n)
+
+    def seed_default_branches(self, mapping: dict[str, str]) -> None:
+        """Merge ``mapping`` into the fake's default-branches map (which
+        doubles as its cache). Creates the map if it was unset."""
+        if self._default_branches is None:
+            self._default_branches = {}
+        self._default_branches.update(mapping)
+
+    def cached_default_branches(self) -> dict[str, str]:
+        """Return a copy of the fake's configured default-branches map."""
+        return dict(self._default_branches or {})
 
     def my_open_prs(
         self,
@@ -814,6 +845,12 @@ class ProductionGHClient:
             timeout=timeout,
         )
         return stdout.strip()
+
+    def seed_default_branches(self, mapping: dict[str, str]) -> None:
+        self._default_branch_cache.update(mapping)
+
+    def cached_default_branches(self) -> dict[str, str]:
+        return dict(self._default_branch_cache)
 
     def prefetch_default_branches(
         self,

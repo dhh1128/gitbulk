@@ -41,6 +41,7 @@ from typing import Iterable
 from gitbulk import paths, sentinel
 from gitbulk.config.policy import Policy, load_policy, policy_for
 from gitbulk.config.repos import RepoEntry, SkippedEntry, load_repos
+from gitbulk.default_branch_cache import prime_default_branches
 from gitbulk.gh import GHError, ProductionGHClient
 from gitbulk.invariants import InvariantContext, get, run_chain
 from gitbulk.invariants.base import Invariant, InvariantKind
@@ -328,13 +329,14 @@ def _run_under_lock(
     # PER_REPO preflight.
     skipped_repos: list[tuple[str, str]] = []
     passing_repos: list[RepoEntry] = []
-    # Batch default-branch lookups (see report.py for rationale). The
-    # prefetch reports its own progress — it's multi-second for a big
-    # fleet and otherwise looks like a hang.
+    # Prime default-branch cache (see report.py / default_branch_cache
+    # for rationale). Warm entries cost nothing; cold prefetch shows
+    # progress.
     prefetch_prog = Progress(
         len(repos), prefix="prefetching default branches: "
     )
-    gh.prefetch_default_branches(
+    prime_default_branches(
+        gh,
         [r.slug for r in repos],
         on_progress=lambda done, total: prefetch_prog.update(done),
     )

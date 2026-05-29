@@ -130,6 +130,17 @@ def dashboard_file() -> Path:
     return cache_dir() / "dashboard.md"
 
 
+def default_branch_cache_file() -> Path:
+    """Path to the default-branch cache YAML.
+
+    A single file mapping repo slug → (default branch, fetched_at), read
+    and written by ``gitbulk.default_branch_cache``. Lets warm runs skip
+    the GraphQL prefetch entirely (default branches rarely change). See
+    the cache module docstring for the schema and TTL discipline.
+    """
+    return cache_dir() / "default-branches.yaml"
+
+
 def org_members_cache_dir() -> Path:
     return cache_dir() / "org-members"
 

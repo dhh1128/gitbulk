@@ -1315,6 +1315,29 @@ def test_prefetch_populates_cache_so_default_branch_hits_memory():
     assert mock_run.call_count == 1
 
 
+def test_seed_default_branches_populates_in_process_cache():
+    """seed_default_branches lets default_branch hit memory with no
+    network call (the warm-cache path from default_branch_cache)."""
+    with patch("gitbulk.gh.subprocess.run") as mock_run:
+        client = ProductionGHClient()
+        client.seed_default_branches({"a/b": "main", "c/d": "develop"})
+        assert client.default_branch("a/b") == "main"
+        assert client.default_branch("c/d") == "develop"
+    # No subprocess calls — both were seeded.
+    assert mock_run.call_count == 0
+
+
+def test_cached_default_branches_returns_copy():
+    with patch("gitbulk.gh.subprocess.run"):
+        client = ProductionGHClient()
+        client.seed_default_branches({"a/b": "main"})
+        snap = client.cached_default_branches()
+    assert snap == {"a/b": "main"}
+    # Mutating the snapshot doesn't affect the client's cache.
+    snap["a/b"] = "MUTATED"
+    assert client._default_branch_cache["a/b"] == "main"
+
+
 def test_prefetch_reports_progress_per_chunk():
     """on_progress is called after each chunk with (done, total). With
     3 slugs and chunk size 100 there's one chunk → one callback at
