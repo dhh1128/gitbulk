@@ -12,7 +12,10 @@ Usage:
     python scripts/release.py --major -m "rewrite"  # major bump, custom message
     python scripts/release.py --set 0.5.0 -m "..."  # set an explicit version
                                                     #   (e.g. a starting point;
-                                                    #    must be > current)
+                                                    #    must be > current, and
+                                                    #    may not jump the major
+                                                    #    by >1 without
+                                                    #    --allow-major-jump)
 
 After the tag reaches GitHub, .github/workflows/release.yml builds the
 single-file bundle + update.json and publishes them as release assets.
@@ -52,15 +55,29 @@ def bump(version, part):
     return f"{major}.{minor}.{patch + 1}"
 
 
-def parse_explicit_version(value, current):
-    """Validate an explicit --set version: X.Y.Z and strictly greater than
-    current (release.yml only checks tag==version, not monotonicity, so the
-    downgrade guard lives here)."""
+def parse_explicit_version(value, current, *, allow_major_jump=False):
+    """Validate an explicit --set version.
+
+    Guards (release.yml only checks tag==version, not sanity, so the sanity
+    lives here):
+      * shape X.Y.Z;
+      * strictly greater than current (no downgrade);
+      * the major component rises by at most one step — a jump of two or more
+        is almost always a typo (e.g. ``--set 5.0.0`` for ``0.5.0``), so it is
+        refused unless ``--allow-major-jump`` is passed.
+    """
     if not re.fullmatch(r"\d+\.\d+\.\d+", value):
         sys.exit(f"--set expects X.Y.Z (got {value!r}).")
     as_tuple = lambda v: tuple(int(p) for p in v.split("."))  # noqa: E731
-    if as_tuple(value) <= as_tuple(current):
+    new, cur = as_tuple(value), as_tuple(current)
+    if new <= cur:
         sys.exit(f"--set {value} is not greater than current {current}; refusing to downgrade.")
+    if new[0] - cur[0] > 1 and not allow_major_jump:
+        sys.exit(
+            f"--set {value} raises the major version from {cur[0]} to {new[0]} "
+            f"(more than one step) — almost always a typo. "
+            f"If it is intentional, re-run with --allow-major-jump."
+        )
     return value
 
 
@@ -133,12 +150,17 @@ def main():
         "--set", dest="explicit", metavar="X.Y.Z", default=None,
         help="set an explicit version (e.g. a starting point) instead of bumping; must be > current",
     )
+    parser.add_argument(
+        "--allow-major-jump", action="store_true",
+        help="permit --set to raise the major version by more than one step "
+             "(default: refused as a likely typo)",
+    )
     parser.add_argument("-m", dest="message", default=None, help="commit message")
     args = parser.parse_args()
 
     old = current_version()
     if args.explicit:
-        new = parse_explicit_version(args.explicit, old)
+        new = parse_explicit_version(args.explicit, old, allow_major_jump=args.allow_major_jump)
         label = "set"
     else:
         label = args.part or "patch"
