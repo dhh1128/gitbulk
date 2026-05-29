@@ -1634,9 +1634,10 @@ Gitbulk Triage Tool = goal:
         subcommands.py / catalog.py / cli.py. No code change
         possible from gitbulk side.
 
-        Sub-threshold items (no LICENSE, no actions pinned by SHA,
-        no secret-scanning hook, gh round-trip slug filtering) are
-        deferred and known.
+        Sub-threshold items (no actions pinned by SHA, no
+        secret-scanning hook, gh round-trip slug filtering) are
+        deferred and known. (LICENSE: resolved 2026-05-29, node
+        vn4kq7pr — Apache-2.0 added.)
       approved-by: orchestrator-claude on user's behalf, 2026-05-28
       stage-status: in-progress
 
@@ -2300,6 +2301,27 @@ Gitbulk Triage Tool = goal:
         blocking; the trigger is "moving merge/rebase-pr/close-stale
         --apply into cron" (see opd3ny5k item 3).
 
+    License Is Apache 2.0 = decision:
+      id: vn4kq7pr
+      why: >
+        gitbulk is licensed Apache-2.0, resolving backlog item opd3ny5k #4
+        (the user had stated Apache-2.0 as the intended license). Chosen
+        over MIT/BSD because Apache-2.0 adds an explicit patent grant and a
+        clear contribution/NOTICE framework while staying permissive —
+        appropriate for a tool others may run and adapt across the fleet and
+        beyond, and consistent with the public-by-intent stance of node
+        6xp4kq2n. Chosen over copyleft (GPL) because gitbulk is a standalone
+        CLI, not a library kept open by reciprocity, and permissive
+        licensing maximizes reuse. Mechanics: a verbatim LICENSE file at the
+        repo root (canonical Apache-2.0 text, appendix copyright filled with
+        "2026 Daniel Hardman"); pyproject declares the SPDX expression
+        `Apache-2.0` with license-files = ["LICENSE"] per PEP 639 (which
+        requires setuptools>=77, so build-system.requires is bumped to
+        match). Per-file source headers and a NOTICE file are intentionally
+        omitted for now (single author, low-ceremony personal tool); either
+        can be added if external contribution grows.
+      approved-by: daniel, 2026-05-29
+
     Operational Deployment Backlog = tension:
       id: opd3ny5k
       why: >
@@ -2333,13 +2355,16 @@ Gitbulk Triage Tool = goal:
            never actually been installed on the cron host. Blocked in
            practice on #1 (a stable install to point cron at).
 
-        4. LICENSE. User has stated Apache 2.0 eventually; the repo has no
-           LICENSE file yet. Trivial mechanically; tracked so it isn't
-           forgotten before any external use.
+        4. LICENSE. RESOLVED 2026-05-29 (node vn4kq7pr): Apache-2.0 LICENSE
+           file added at the repo root and declared in pyproject (SPDX
+           `Apache-2.0`, PEP 639).
 
-        Recommended order: #4 (trivial) → #1 (unblocks everything) → #2 →
-        #3. All are deferred until the user decides to move gitbulk from
-        "I run it by hand" to "it runs itself."
+        Recommended order: #4 (done) → #1 (unblocks everything) → #2 →
+        #3. #2/#3 remain deferred until the user decides to move gitbulk
+        from "I run it by hand" to "it runs itself." (NB: #1
+        install/distribution is itself now substantially resolved by the
+        dstbr5kq subtree and the v0.5.0 release; this tension's #1 text
+        predates that and should be reconciled separately.)
 
     Per-Repo Lock vs Global Exclusive Lock = tension:
       id: rlkrcn3p
