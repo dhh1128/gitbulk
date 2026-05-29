@@ -43,22 +43,8 @@ jobs:
             exit 1
           fi
 
-      - name: Build release bundle
-        run: uv run gitbulk bundle dist/gitbulk
-
-      - name: Prepare update manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          sha256="$(sha256sum dist/gitbulk | awk '{print $1}')"
-          cat > dist/update.json <<EOF
-          {
-            "latest_version": "${version}",
-            "script_url": "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/gitbulk",
-            "sha256": "${sha256}"
-          }
-          EOF
+      - name: Build release assets (zipapp + update.json)
+        run: uv run python scripts/build_release_assets.py "${GITHUB_REF_NAME#v}" dist --repo "$GITHUB_REPOSITORY"
 
       - name: Publish GitHub release
         env:

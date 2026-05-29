@@ -9,7 +9,42 @@ permissions:
   contents: read
 
 jobs:
+  # Test on the advertised floor (3.10) AND the dev version (3.12); the 100%
+  # branch-coverage gate runs on both. See this.i node cidvp4kr.
   test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up uv (with cache)
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package from lockfile
+        run: uv sync --frozen --extra test --python ${{ matrix.python-version }}
+
+      - name: Run tests with branch coverage gate
+        run: |
+          uv run --python ${{ matrix.python-version }} pytest -v \
+            --cov=src/gitbulk \
+            --cov-branch \
+            --cov-report=term-missing \
+            --cov-fail-under=100
+
+  # Exercise the release-asset construction (shared with release.yml) on every
+  # push/PR, without publishing — so the release path is validated pre-tag.
+  release-assets:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -28,10 +63,33 @@ jobs:
       - name: Install package from lockfile
         run: uv sync --frozen --extra test
 
-      - name: Run tests with branch coverage gate
+      - name: Build release assets (no publish)
+        run: uv run python scripts/build_release_assets.py "0.0.0+ci" dist --repo "${GITHUB_REPOSITORY:-dhh1128/gitbulk}"
+
+      - name: Validate the assets
         run: |
-          uv run pytest -v \
-            --cov=src/gitbulk \
-            --cov-branch \
-            --cov-report=term-missing \
-            --cov-fail-under=100
+          set -euo pipefail
+          test -f dist/gitbulk
+          test -f dist/update.json
+          # The zipapp boots and reports the baked version.
+          ./dist/gitbulk --version | grep -qF "0.0.0+ci"
+          # update.json's sha256 matches the built binary.
+          want="$(python -c "import json; print(json.load(open('dist/update.json'))['sha256'])")"
+          got="$(sha256sum dist/gitbulk | awk '{print $1}')"
+          if [ "$want" != "$got" ]; then
+            echo "update.json sha256 ($want) != binary sha256 ($got)" >&2
+            exit 1
+          fi
+
+  actionlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Run actionlint
+        run: |
+          set -euo pipefail
+          version=1.7.12
+          curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz" -o /tmp/actionlint.tgz
+          tar -xzf /tmp/actionlint.tgz -C /tmp actionlint
+          /tmp/actionlint -color
