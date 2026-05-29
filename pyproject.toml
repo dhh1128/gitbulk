@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77"]  # PEP 639 SPDX license metadata
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,6 +8,8 @@ version = "0.5.0"
 description = "Nightly PR triage and fleet maintenance across many GitHub repositories."
 readme = "README.md"
 requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "Daniel Hardman", email = "daniel@provenant.net" }]
 dependencies = [
     "PyYAML>=6.0",

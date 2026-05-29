@@ -217,4 +217,5 @@ gitbulk bundle ./dist/gitbulk
 
 ## License
 
-TODO — to be decided before the first remote push.
+Licensed under the Apache License, Version 2.0 — see [`LICENSE`](LICENSE).
+Copyright 2026 Daniel Hardman.
