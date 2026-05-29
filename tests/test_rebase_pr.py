@@ -23,6 +23,7 @@ from gitbulk.commands.rebase_pr import (
     EXIT_STRUCTURAL_FAILURE,
     rebase_pr_handler,
 )
+from gitbulk.config.repos import ConfigError
 from gitbulk.gh import FakeGHClient
 from gitbulk.org_members_cache import CachedMembers, save_cache
 from gitbulk.pr_info import PRInfo
@@ -137,13 +138,21 @@ def _make_pr(*, slug, number, mergeable_state="BEHIND", base_ref="main"):
     )
 
 
-def _args(*, apply=False, code_root=None, skip_check=None):
+def _args(*, apply=False, code_root=None, skip_check=None,
+          org=None, repo=None, base=None, mergeable_state=None, author=None,
+          filter=None):
     return argparse.Namespace(
         subcommand="rebase-pr",
         apply=apply,
         code_root=str(code_root) if code_root else None,
         skip_check=list(skip_check) if skip_check else None,
         refresh_org_members=False,
+        org=org,
+        repo=repo,
+        base=base,
+        mergeable_state=mergeable_state,
+        author=author,
+        filter=filter,
     )
 
 
@@ -198,6 +207,39 @@ def test_dry_run_no_eligible_exit_ok(
     rc = rebase_pr_handler(_args(code_root=code_root))
     assert rc == EXIT_OK
     assert not sentinel.has_attention()
+
+
+# ─── Filters ───────────────────────────────────────────────────────────────
+
+
+def test_dry_run_repo_filter_reports_filter_line(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    write_config(repos_slugs=["dhh1128/alpha", "dhh1128/beta"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    behind = _make_pr(slug="dhh1128/alpha", number=1, mergeable_state="BEHIND")
+    fake = _fake({"dhh1128/alpha": [behind], "dhh1128/beta": []})
+    _patch_gh(monkeypatch, fake)
+
+    rc = rebase_pr_handler(_args(code_root=code_root, repo=["*/alpha"]))
+    assert rc == EXIT_ATTENTION_NEEDED
+    summary = (paths.latest_run_symlink("rebase-pr").resolve() / "summary.md").read_text()
+    assert "Filtered" in summary
+    assert "repo=*/alpha" in summary
+    assert "dhh1128/beta" not in summary
+
+
+def test_author_filter_is_vetoed(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    """rebase-pr can only touch the current user's own PRs (it force-pushes
+    their branches), so --author is rejected up front."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    _patch_gh(monkeypatch, _fake({"dhh1128/alpha": []}))
+
+    with pytest.raises(ConfigError, match="does not support --author"):
+        rebase_pr_handler(_args(code_root=code_root, author=["someone-else"]))
 
 
 # ─── --apply: clean rebase ─────────────────────────────────────────────────

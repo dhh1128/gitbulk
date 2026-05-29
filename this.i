@@ -1911,6 +1911,87 @@ Gitbulk Triage Tool = goal:
         touched; all git work happens in the worktree.
       approved-by: daniel, 2026-05-29
 
+    Fleet Subset Filters = decision:
+      id: flt7arg2
+      why: >
+        Any command can be aimed at a SUBSET of the fleet via filter
+        args. Designed in a riff 2026-05-29. The load-bearing design
+        choice: filters are a SEPARATE SELECTION LAYER, not invariants.
+        Conflating them would be a category error — an invariant Skip
+        means "this target needs human attention" and drives the exit-3
+        attention signal; a filter exclusion means "the user deliberately
+        scoped this target out of THIS run." A repo I globbed away must
+        not show up as a skipped/attention item, and a PR I never asked
+        about must not inflate the attention count. So filtering happens
+        OUTSIDE the invariant machinery, before (repo filters) or after
+        (PR filters) the chain runs, and excluded targets are counted
+        separately ("Filtered [dims]: N repos, M PRs excluded") rather
+        than reported as Skips.
+
+        V1 DIMENSIONS (first slice): org (owner match), repo (fnmatch
+        glob on the full owner/name slug), base (PR target branch),
+        mergeable_state (raw GitHub enum — no friendlier aliases; the
+        user explicitly accepted raw values), author (PR raiser).
+
+        WHERE EACH PRUNES:
+          - Repo filters (org, repo glob) prune the repo list BEFORE the
+            invariant loop and before any per-repo fetch — so excluded
+            repos cost zero API.
+          - author is pushed INTO the my_open_prs search query at fetch
+            time (author:<x>), not filtered after — narrowing server-side
+            keeps the point cost down and is the only way to see OTHER
+            people's PRs at all (the default search is author:@me).
+          - PR filters (base, mergeable_state) prune AFTER fetch, since
+            they read fields only present once the PR is materialized.
+
+        READ-ONLY WIDENS / MUTATING VETOES (the safety asymmetry):
+          - report (read-only) honors --author to survey anyone's PRs.
+          - merge / close-stale / dispatch resolve author via
+            fetch_author(spec) and will act on the resolved author's PRs
+            — acceptable because those gates are still invariant-guarded.
+          - rebase-pr VETOES --author with a ConfigError: it force-pushes
+            the PR's head branch, which only makes sense for your own
+            PRs. Honoring --author there would invite force-pushing over
+            someone else's branch. This veto is the per-command
+            mutating-side check the design promised; see dieug50n's note
+            that there is no separate pr.author_is_me invariant precisely
+            because my_open_prs is author-scoped by construction.
+
+        CONFIG + CLI: named filter sets live under policy `filters:`
+        (each a mapping of dimension→scalar-or-list); --filter NAME loads
+        one. CLI flags (--org/--repo/--base/--mergeable-state/--author)
+        NARROW: a CLI value on a dimension REPLACES the named set's value
+        on that dimension (narrowing, not union — "I typed a flag to
+        focus further" is the intuitive verb). Unknown --filter name is a
+        ConfigError, not a silent empty selection.
+
+        IMPLEMENTATION: a standalone filters.py (FilterSpec frozen
+        dataclass + select_repos/select_prs/apply_pr_filters/
+        fetch_author/filter_summary_line/resolve_filter_spec) so the
+        selection layer is unit-testable in isolation and the five
+        handlers share one code path. No import cycle: policy.py imports
+        FilterSpec from filters.py, not vice versa.
+
+        V2 DEFERRED (do NOT silently build these without revisiting the
+        read-only-widens / mutating-vetoes rule above):
+          1. on-disk location filter (select by where the clone lives —
+             needs the local-path resolution from the local-targeting
+             tension lct4rgp6 to be settled first).
+          2. PR age filter (--older-than / --newer-than) — straightforward
+             but wasn't in the first slice.
+          3. regex repo matching as an alternative to fnmatch glob (glob
+             chosen for v1 as the lower-surprise default).
+          4. negation / exclusion (--not-repo, exclude an org) — the v1
+             dimensions are all inclusive-match.
+          5. single-PR targeting (--pr owner/repo#123) to aim a command
+             at one PR — most useful for rebase-pr; interacts with the
+             author veto (a single --pr that isn't yours should still be
+             refused by rebase-pr).
+          6. if other-people's-PRs targeting ever reaches rebase-pr (via
+             #5 or a future --author lift), revisit the dieug50n note
+             about pr.author_is_me becoming a real invariant.
+      approved-by: daniel, 2026-05-29
+
     Default Branch Rename Handling = tension:
       id: rj7p4kqn
       why: >
@@ -2122,3 +2203,124 @@ Gitbulk Triage Tool = goal:
         budget and fully serial, the cost of the machinery exceeds the
         risk it would mitigate. The trigger conditions above are the
         signal to revisit.
+
+    Local Repo Targeting Flexibility = tension:
+      id: lct4rgp6
+      why: >
+        Reconciled from gaps.md 2026-05-29. gitbulk's targeting model is
+        PR-centric and assumes a tidy ~/code/<repo-basename> layout. Three
+        related open questions about how repos.txt names and resolves
+        local clones. (repos.txt ALREADY accepts slug, full URL, and
+        explicit local-path forms as of the 2026-05-28 onboarding fixes;
+        these are the REMAINING gaps beyond that.)
+
+        1. LOCAL-ONLY REPOS (no GitHub origin). Every subcommand is
+           PR-centric (report→my_open_prs, merge/close-stale→gh API), so a
+           clone with no origin has no PRs and yields silent-empty output —
+           confusing. Decision needed: (a) document that gitbulk operates
+           only on repos with a GitHub origin and validate-and-warn at load
+           when a configured target isn't reachable (recommended — current
+           silent-empty is the worst option), or (b) expand scope to
+           local-only operations (worktree mgmt etc.), a significant pivot.
+           Touches the local-first-class decision xq4npk7r.
+
+        2. REPO-DISCOVERY GLOB. Let repos.txt contain a discovery root
+           like ``~/code/*`` and enumerate matching dirs, extracting each
+           slug from ``git remote get-url origin``. Eliminates list
+           maintenance — new clones auto-join. Open: glob syntax (shell
+           ``*`` vs explicit ``glob:`` prefix); behavior when a discovered
+           dir has no GitHub remote (skip silently vs warn); duplicate
+           slugs across dirs (the intent / intent-old case); mixing globs
+           with explicit slugs in one file.
+
+        3. FLEXIBLE LOCAL-PATH MAPPING. The computed
+           ``<code-root>/<repo-basename>`` path breaks when clones nest in
+           category dirs (~/code/work/foo/bar), when basenames collide
+           across owners, or when basename ≠ repo name. The explicit-path
+           form in repos.txt already covers the manual case; what's
+           deferred is making discovery (#2) infer the slug from the
+           remote so the path→slug mapping stops being positional.
+
+        These cluster because a path/location FILTER (deferred v2 item #1
+        of flt7arg2) can't be specified until how a target maps to an
+        on-disk location is settled here. Resolve this before building
+        that filter dimension.
+
+    Remaining Invariant Backlog = tension:
+      id: ivb5kq3n
+      why: >
+        Reconciled from gaps.md 2026-05-29. design-notes.md §7 specs more
+        invariants than have landed. The load-bearing merge gap
+        (pr.no_unresolved_threads) and timeline-aware ready_since SHIPPED
+        in the 2026-05-29 merge-gate work, so merge --apply is now safe at
+        full strictness; these are the LOWER-priority leftovers. None
+        blocks current operation — recorded so they aren't rediscovered.
+
+        STILL MISSING, by chain:
+          - Mutating-baseline: local.no_uncommitted_in_pr_branch,
+            local.recent_push_quiescence, repo.not_in_deny_list.
+          - Merge-only: pr.no_blocking_label.
+          - Rebase-only: pr.no_automerge_pending, pr.force_push_allowed
+            (pr.author_is_me intentionally absent — see dieug50n/flt7arg2).
+          - Close-stale-only: pr.inactive / pr.previously_warned are
+            effectively realized by the stale-decision logic (2aefqte7,
+            e4yuzip6) rather than as named invariants; revisit only if a
+            chain-level expression is wanted.
+          - Dispatch-only: repo.agentprep_verified,
+            repo.agentprep_initialized, system.resources_available
+            (currently handler-validated, not invariants).
+
+        TWO ADJACENT GAPS from the same gaps.md section:
+          - No ``--require NAME`` CLI flag. Node r4nzp7kq (cmdline wins
+            over config) shipped --skip-check (relaxing, trips exit 4) but
+            not the tightening direction. The asymmetric audit only
+            exercises one side.
+          - humans.exceptions / humans.always_human are honored by the
+            classifier (hbcls4pq) but no subcommand surfaces "org member
+            you've flagged as bot" / "outsider you treat as human." A
+            read-only ``gitbulk humans`` or a report section would close
+            the loop.
+
+        Priority: pick these up opportunistically when touching the
+        relevant chain; none is worth a dedicated push at current scale.
+
+    Operational Deployment Backlog = tension:
+      id: opd3ny5k
+      why: >
+        Reconciled from gaps.md 2026-05-29. gitbulk WORKS but has never
+        been deployed as the unattended cron tool it's designed to be
+        (the 4kp7nb2x primary mode). Four operational gaps, none a design
+        question so much as undone setup — but tracked here because they
+        gate "actually relying on it."
+
+        1. INSTALL / DISTRIBUTION (the big one; also in auto-memory as a
+           gap). README documents only ``pip install -e ".[test]"`` (dev
+           mode). Reality: gitbulk runs on MULTIPLE machines (laptop, cron
+           host, possibly more) and each needs a clean install, not a
+           clone-and-editable-install. The editable install at
+           ~/.local/bin/gitbulk silently breaks if the source clone moves
+           or is deleted — subtle cron-tick breakage. Options: publish to
+           PyPI (repo is public; ``pipx install gitbulk`` is the natural
+           CLI UX), or at minimum a documented fresh-machine procedure +
+           a per-release wheel. Prerequisite: a versioning + release
+           process must exist before any PyPI publish makes sense.
+
+        2. BRANCH PROTECTION + CODEOWNERS (security-hawk F5, node
+           shawk7nq). main has commits and the public repo exists, so
+           applying protection via the user's protect-default-branch
+           script is the natural next step; CODEOWNERS adds the layer
+           that prevents un-reviewed merges to specific paths. The
+           "Bypassed rule violations" seen in push output suggest some
+           protection is configured but currently bypassable.
+
+        3. REAL CRON DEPLOYMENT. README has a crontab example but it has
+           never actually been installed on the cron host. Blocked in
+           practice on #1 (a stable install to point cron at).
+
+        4. LICENSE. User has stated Apache 2.0 eventually; the repo has no
+           LICENSE file yet. Trivial mechanically; tracked so it isn't
+           forgotten before any external use.
+
+        Recommended order: #4 (trivial) → #1 (unblocks everything) → #2 →
+        #3. All are deferred until the user decides to move gitbulk from
+        "I run it by hand" to "it runs itself."

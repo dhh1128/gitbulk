@@ -516,3 +516,50 @@ def test_example_file_loads_cleanly():
     assert policy.defaults.min_business_days == 3
     assert policy.humans.org == "provenant-dev"
     assert "dependabot[bot]" in policy.bots
+
+
+# ─── filters config section (node flt7arg2) ────────────────────────────────
+
+
+def test_filters_section_scalar_and_list(tmp_path):
+    content = """
+filters:
+  svc:
+    org: provenant-dev
+    repo: "origin-*"
+  multi:
+    repo: ["origin-*", "vvp-*"]
+    base: dev
+    mergeable_state: [DIRTY, BEHIND]
+    author: dhh1128
+"""
+    policy = load_policy(_write_policy(tmp_path, content))
+    svc = policy.filters["svc"]
+    assert svc.orgs == ("provenant-dev",)
+    assert svc.repo_globs == ("origin-*",)
+    multi = policy.filters["multi"]
+    assert multi.repo_globs == ("origin-*", "vvp-*")
+    assert multi.bases == ("dev",)
+    assert multi.mergeable_states == ("DIRTY", "BEHIND")
+    assert multi.authors == ("dhh1128",)
+
+
+def test_filters_empty_when_absent(tmp_path):
+    policy = load_policy(_write_policy(tmp_path, "defaults:\n  merge_policy: strict\n"))
+    assert policy.filters == {}
+
+
+def test_filters_section_not_a_mapping_raises(tmp_path):
+    with pytest.raises(ConfigError, match="filters: expected mapping"):
+        load_policy(_write_policy(tmp_path, "filters: [1, 2]\n"))
+
+
+def test_filters_entry_not_a_mapping_raises(tmp_path):
+    with pytest.raises(ConfigError, match="filters.svc: expected mapping"):
+        load_policy(_write_policy(tmp_path, "filters:\n  svc: not-a-map\n"))
+
+
+def test_filters_unknown_key_raises(tmp_path):
+    content = "filters:\n  svc:\n    bogus: x\n"
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_policy(_write_policy(tmp_path, content))

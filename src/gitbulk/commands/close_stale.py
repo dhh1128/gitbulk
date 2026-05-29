@@ -44,6 +44,13 @@ from gitbulk import paths, sentinel
 from gitbulk.config.policy import Policy, load_policy, policy_for
 from gitbulk.config.repos import RepoEntry, SkippedEntry, load_repos
 from gitbulk.default_branch_cache import prime_default_branches
+from gitbulk.filters import (
+    apply_pr_filters,
+    fetch_author,
+    filter_summary_line,
+    resolve_filter_spec,
+    select_repos,
+)
 from gitbulk.gh import GHError, ProductionGHClient
 from gitbulk.invariants import InvariantContext, get, run_chain
 from gitbulk.invariants.base import Invariant, InvariantKind
@@ -241,6 +248,10 @@ def close_stale_handler(args: argparse.Namespace) -> int:
     repos, skipped_entries = load_repos(code_root=code_root)
     repos_text = _read_repos_text()
 
+    # Fleet-subset filter (node flt7arg2): prune repos before the lock.
+    spec = resolve_filter_spec(args, policy)
+    repos, repos_excluded = select_repos(repos, spec)
+
     try:
         with global_lock(
             "exclusive",
@@ -248,7 +259,8 @@ def close_stale_handler(args: argparse.Namespace) -> int:
             subcommand="close-stale",
         ):
             return _run_under_lock(
-                args, policy, repos, repos_text, skipped_entries
+                args, policy, repos, repos_text, skipped_entries,
+                spec, repos_excluded,
             )
     except LockTimeoutError as e:
         print(
@@ -264,6 +276,8 @@ def _run_under_lock(
     repos: list[RepoEntry],
     repos_text: str,
     skipped_entries: list[SkippedEntry],
+    spec,
+    repos_excluded: int,
 ) -> int:
     config_snapshot = _config_snapshot(policy, repos_text, args)
     rs = RunState.begin(
@@ -360,7 +374,11 @@ def _run_under_lock(
     # Coalesced PR fetch.
     if passing_repos:
         try:
-            prs_by_repo = gh.my_open_prs([r.slug for r in passing_repos])
+            # close-stale can act on others' PRs (maintainer flow); the
+            # author filter may widen (node flt7arg2), default @me.
+            prs_by_repo = gh.my_open_prs(
+                [r.slug for r in passing_repos], author=fetch_author(spec)
+            )
         except GHError as e:
             rs.record_error(f"my_open_prs failed: {e}")
             return _finish(
@@ -378,6 +396,10 @@ def _run_under_lock(
             )
     else:
         prs_by_repo = {}
+
+    # Apply PR-level filters (base, mergeable_state) before invariants.
+    prs_by_repo, prs_excluded = apply_pr_filters(prs_by_repo, spec)
+    filter_line = filter_summary_line(spec, repos_excluded, prs_excluded)
 
     # PER_PR invariants → stale candidates.
     stale_candidates: list[tuple[str, PRInfo]] = []
@@ -463,6 +485,7 @@ def _run_under_lock(
             actions=actions,
             apply=False,
             skipped_entries=skipped_entries,
+            filter_line=filter_line,
         )
         rs.write_summary(summary_md)
         warn_or_close = sum(
@@ -486,6 +509,7 @@ def _run_under_lock(
             f"dry-run: {warn_or_close} PR(s) would be warned or closed; "
             f"{len(skipped_repos)} repos skipped; "
             f"{len(skipped_entries)} entries skipped"
+            + (f"; {filter_line}" if filter_line else "")
         )
         for repo in passing_repos:
             rs.record_repo_state(
@@ -585,6 +609,7 @@ def _run_under_lock(
         actions=actions,
         apply=True,
         skipped_entries=skipped_entries,
+        filter_line=filter_line,
     )
     rs.write_summary(summary_md)
 
@@ -592,6 +617,7 @@ def _run_under_lock(
         f"warned {warn_count}, closed {close_count}, "
         f"{failure_count} failed; {len(skipped_repos)} repos skipped; "
         f"{len(skipped_entries)} entries skipped"
+        + (f"; {filter_line}" if filter_line else "")
     )
     return _finish(
         rs,
@@ -618,11 +644,14 @@ def _build_summary_md(
     actions: list[dict],
     apply: bool,
     skipped_entries: list[SkippedEntry] | None = None,
+    filter_line: str | None = None,
 ) -> str:
     lines: list[str] = ["# gitbulk close-stale", ""]
     mode = "APPLY" if apply else "DRY-RUN"
     lines.append(f"Mode: **{mode}**")
     lines.append(f"Default stale policy: `{policy.defaults.stale_policy}`")
+    if filter_line:
+        lines.append(filter_line)
     lines.append(
         f"Configured repos: {len(all_repos)}  "
         f"Reachable: {len(passing_repos)}  "

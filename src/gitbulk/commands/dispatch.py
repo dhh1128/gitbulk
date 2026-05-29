@@ -72,6 +72,12 @@ from gitbulk.claude import ProductionClaudeClient
 from gitbulk.config.policy import Policy, load_policy
 from gitbulk.config.repos import RepoEntry, load_repos
 from gitbulk.default_branch_cache import prime_default_branches
+from gitbulk.filters import (
+    apply_pr_filters,
+    fetch_author,
+    resolve_filter_spec,
+    select_repos,
+)
 from gitbulk.exec import ExecResult, ExecTarget, execute_targets
 from gitbulk.gh import GHError, ProductionGHClient
 from gitbulk.invariants import InvariantContext, get, run_chain
@@ -328,6 +334,10 @@ def dispatch_handler(args: argparse.Namespace) -> int:
     repos, _ = load_repos(code_root=code_root)
     repos_text = _read_repos_text()
 
+    # Fleet-subset filter (node flt7arg2): prune repos before the lock.
+    spec = resolve_filter_spec(args, policy)
+    repos, repos_excluded = select_repos(repos, spec)
+
     # 1b. Validate --prompt BEFORE acquiring the lock. The error is
     # purely structural; nothing else can change between this check
     # and the lock-protected pipeline.
@@ -345,7 +355,7 @@ def dispatch_handler(args: argparse.Namespace) -> int:
             subcommand="dispatch",
         ):
             return _run_under_lock(
-                args, policy, repos, repos_text, prompt_path
+                args, policy, repos, repos_text, prompt_path, spec
             )
     except LockTimeoutError as e:
         print(
@@ -361,6 +371,7 @@ def _run_under_lock(
     repos: list[RepoEntry],
     repos_text: str,
     prompt_path: Path,
+    spec,
 ) -> int:
     """Pipeline body that runs while the global EXCLUSIVE lock is held."""
     config_snapshot = _config_snapshot(policy, repos_text, prompt_path, args)
@@ -453,10 +464,14 @@ def _run_under_lock(
         else:
             passing_repos.append(repo)
 
-    # 6. Coalesced PR fetch.
+    # 6. Coalesced PR fetch. dispatch can run agents against others' PRs
+    # (e.g. reviewing/fixing contributions), so the author filter may
+    # widen (node flt7arg2); default @me.
     if passing_repos:
         try:
-            prs_by_repo = gh.my_open_prs([r.slug for r in passing_repos])
+            prs_by_repo = gh.my_open_prs(
+                [r.slug for r in passing_repos], author=fetch_author(spec)
+            )
         except GHError as e:
             rs.record_error(f"my_open_prs failed: {e}")
             return _finish(
@@ -475,6 +490,10 @@ def _run_under_lock(
             )
     else:
         prs_by_repo = {}
+
+    # Apply PR-level filters (base, mergeable_state) before the per-PR
+    # invariant chain selects dispatch targets.
+    prs_by_repo, _prs_excluded = apply_pr_filters(prs_by_repo, spec)
 
     # 7. PER_PR invariants; build eligible list.
     eligible_prs: list[tuple[str, PRInfo]] = []

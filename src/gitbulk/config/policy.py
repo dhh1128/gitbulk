@@ -17,6 +17,7 @@ import yaml
 
 from gitbulk import paths
 from gitbulk.config.repos import ConfigError
+from gitbulk.filters import FilterSpec
 
 _VALID_MERGE_POLICIES = {"strict", "ci-only", "never"}
 _VALID_UNRESOLVED_BURDENS = {"me", "other", "either"}
@@ -28,9 +29,15 @@ _TOP_LEVEL_KEYS = {
     "humans",
     "bots",
     "repos",
+    "filters",
     "worktree_root",
     "notifications",  # forward-compat placeholder; contents ignored
 }
+
+#: Keys allowed inside one ``filters.<name>`` block. Mirror the v1
+#: filter dimensions (this.i node ``flt7arg2``); singular forms because
+#: a YAML scalar or list is accepted for each.
+_FILTER_KEYS = {"org", "repo", "base", "mergeable_state", "author"}
 
 _DEFAULTS_KEYS = {
     "merge_policy",
@@ -103,6 +110,9 @@ class Policy:
     humans: HumansConfig = field(default_factory=HumansConfig)
     bots: tuple[str, ...] = ()
     repos: dict[str, RepoOverride] = field(default_factory=dict)
+    #: Named fleet-subset filter sets, referenced by ``--filter NAME``.
+    #: Maps name → FilterSpec (see gitbulk.filters / node flt7arg2).
+    filters: dict[str, "FilterSpec"] = field(default_factory=dict)
     worktree_root: Path = field(default_factory=lambda: paths.default_worktree_root())
 
 
@@ -330,6 +340,21 @@ def load_policy(path: Path | None = None) -> Policy:
                 override_raw, f"{path}.repos.{slug}"
             )
         kwargs["repos"] = repo_dict
+    if raw.get("filters") is not None:
+        if not isinstance(raw["filters"], dict):
+            raise ConfigError(
+                f"{path}.filters: expected mapping, "
+                f"got {type(raw['filters']).__name__}"
+            )
+        filters_dict: dict[str, FilterSpec] = {}
+        for name, spec_raw in raw["filters"].items():
+            if not isinstance(spec_raw, dict):
+                raise ConfigError(
+                    f"{path}.filters.{name}: expected mapping, "
+                    f"got {type(spec_raw).__name__}"
+                )
+            filters_dict[name] = _parse_filter(spec_raw, f"{path}.filters.{name}")
+        kwargs["filters"] = filters_dict
     if raw.get("worktree_root") is not None:
         wt = raw["worktree_root"]
         if not isinstance(wt, str):
@@ -339,6 +364,32 @@ def load_policy(path: Path | None = None) -> Policy:
         kwargs["worktree_root"] = Path(wt).expanduser()
     # "notifications" key, if present, is intentionally ignored
     return Policy(**kwargs)
+
+
+def _scalar_or_list(value: Any, where: str) -> tuple[str, ...]:
+    """Accept a single string OR a list of strings → tuple of strings.
+
+    Filter blocks read naturally with a scalar (``org: provenant-dev``)
+    or a list (``repo: ['origin-*', 'vvp-*']``); both normalize here.
+    """
+    if isinstance(value, str):
+        return (value,)
+    return _ensure_str_list(value, where)
+
+
+def _parse_filter(raw: dict[str, Any], where: str) -> FilterSpec:
+    _validate_keys(set(raw.keys()), _FILTER_KEYS, where)
+    return FilterSpec(
+        orgs=_scalar_or_list(raw["org"], f"{where}.org") if "org" in raw else (),
+        repo_globs=_scalar_or_list(raw["repo"], f"{where}.repo") if "repo" in raw else (),
+        bases=_scalar_or_list(raw["base"], f"{where}.base") if "base" in raw else (),
+        mergeable_states=(
+            _scalar_or_list(raw["mergeable_state"], f"{where}.mergeable_state")
+            if "mergeable_state" in raw
+            else ()
+        ),
+        authors=_scalar_or_list(raw["author"], f"{where}.author") if "author" in raw else (),
+    )
 
 
 def policy_for(policy: Policy, slug: str) -> Defaults:

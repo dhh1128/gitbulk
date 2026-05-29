@@ -128,12 +128,24 @@ def _make_args(
     code_root=None,
     skip_check=None,
     refresh_org_members=False,
+    org=None,
+    repo=None,
+    base=None,
+    mergeable_state=None,
+    author=None,
+    filter=None,
 ):
     return argparse.Namespace(
         subcommand="report",
         code_root=str(code_root) if code_root else None,
         skip_check=list(skip_check) if skip_check else None,
         refresh_org_members=refresh_org_members,
+        org=org,
+        repo=repo,
+        base=base,
+        mergeable_state=mergeable_state,
+        author=author,
+        filter=filter,
     )
 
 
@@ -185,6 +197,41 @@ def test_report_happy_path_two_prs(
     assert "completed_at" in manifest
     # Config snapshot is inline.
     assert manifest["config_snapshot"]["repos_txt"]
+
+
+# ─── Filters: repo-glob prunes fleet; filter line in summary ───────────────
+
+
+def test_report_repo_filter_prunes_and_reports_filter_line(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    write_config(repos_slugs=["dhh1128/alpha", "dhh1128/beta"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr_alpha = _make_pr(slug="dhh1128/alpha", number=1)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main", "dhh1128/beta": "main"},
+        my_open_prs={"dhh1128/alpha": [pr_alpha]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    # Glob keeps only alpha; beta is excluded before the invariant loop.
+    args = _make_args(code_root=code_root, repo=["*/alpha"])
+    rc = report_handler(args)
+
+    assert rc == EXIT_ATTENTION_NEEDED
+    latest = paths.latest_run_symlink("report").resolve()
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    assert set(state["repos"].keys()) == {"dhh1128/alpha"}
+    summary = (latest / "summary.md").read_text()
+    assert "Filtered" in summary
+    assert "repo=*/alpha" in summary
+    assert "1 repos" in summary
+    parsed = sentinel.parse_attention()
+    assert "Filtered" in parsed["summary"]
 
 
 # ─── All clean: 0 PRs → exit 0, no sentinel ────────────────────────────────

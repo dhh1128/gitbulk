@@ -334,15 +334,9 @@ def _add_dispatch_args(sp: argparse.ArgumentParser) -> None:
         default=1800.0,
         help="Per-target wall-clock timeout (default 1800s).",
     )
-    sp.add_argument(
-        "--filter",
-        metavar="LABEL",
-        default=None,
-        help=(
-            "Reserved for Phase 5+: filter eligible PRs by label. "
-            "Accepted but currently ignored."
-        ),
-    )
+    # NB: the real --filter / --org / --repo / ... filter flags are added
+    # by the shared _add_filter_args (this.i flt7arg2), which superseded
+    # the old reserved-but-ignored dispatch --filter LABEL placeholder.
     sp.add_argument(
         "--code-root",
         metavar="PATH",
@@ -400,6 +394,46 @@ def _add_close_stale_args(sp: argparse.ArgumentParser) -> None:
         help=(
             "Force a fresh fetch of the configured humans.org members "
             "before running close-stale."
+        ),
+    )
+
+
+def _add_filter_args(sp: argparse.ArgumentParser) -> None:
+    """Shared fleet-subset filter flags (this.i node ``flt7arg2``).
+
+    Applied to every subcommand that fetches + acts on PRs (report,
+    merge, close-stale, rebase-pr, dispatch). Repo filters (--org,
+    --repo) prune the repo set before the invariant loop; PR filters
+    (--base, --mergeable-state) prune after the fetch; --author is
+    pushed into the search. --filter names a config-defined set that
+    CLI flags then narrow.
+    """
+    sp.add_argument(
+        "--filter", metavar="NAME", default=None,
+        help="Use a named filter set from gitbulk.yaml `filters:`; CLI flags narrow it.",
+    )
+    sp.add_argument(
+        "--org", metavar="OWNER", action="append", default=None,
+        help="Limit to repos under this GitHub owner (repeatable).",
+    )
+    sp.add_argument(
+        "--repo", metavar="GLOB", action="append", default=None,
+        help="Limit to repos whose owner/repo slug matches this glob (repeatable).",
+    )
+    sp.add_argument(
+        "--base", metavar="BRANCH", action="append", default=None,
+        help="Limit to PRs targeting this base branch (repeatable).",
+    )
+    sp.add_argument(
+        "--mergeable-state", metavar="STATE", action="append", default=None,
+        help="Limit to PRs with this mergeable_state (CLEAN/DIRTY/BEHIND/BLOCKED/...; repeatable).",
+    )
+    sp.add_argument(
+        "--author", metavar="LOGIN", action="append", default=None,
+        help=(
+            "Limit to PRs by this author (default: you). Widening to other "
+            "authors is read-only on report; mutating commands restrict per "
+            "their own rules (rebase-pr refuses non-self)."
         ),
     )
 
@@ -527,6 +561,9 @@ def build_parser() -> argparse.ArgumentParser:
             _add_rebase_pr_args(sp)
         elif sc.name == "show":
             _add_show_args(sp)
+        # Fleet-subset filters apply to every PR-fetching subcommand.
+        if sc.name in ("report", "dispatch", "merge", "close-stale", "rebase-pr"):
+            _add_filter_args(sp)
     return parser
 
 

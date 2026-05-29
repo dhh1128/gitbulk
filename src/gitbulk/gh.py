@@ -126,16 +126,23 @@ class GHClient(Protocol):
         self,
         slugs: Iterable[str] | None = None,
         *,
+        author: str | None = "@me",
         timeout: float | None = None,
     ) -> dict[str, list[PRInfo]]:
-        """Return open PRs authored by the authenticated user, grouped by repo slug.
+        """Return open PRs grouped by repo slug.
+
+        ``author`` is the GitHub search author qualifier: ``"@me"``
+        (default, the authenticated user — the historical behavior),
+        a specific login, or ``None`` for "any author" (no author:
+        qualifier — used when a filter widens scope beyond the user's
+        own PRs, per node ``flt7arg2``).
 
         If ``slugs`` is given, only PRs against those repos are returned;
         repos with no matching PRs map to an empty list. If ``slugs`` is
-        None, all repos the user has open PRs against are returned.
+        None, all repos with matching PRs are returned.
 
-        Coalesces into a single GraphQL search call per ``ghclmp7n.c``
-        regardless of how many slugs are passed.
+        Chunks/paginates internally (per ``ghclmp7n.c`` + the pagination
+        fix) regardless of how many slugs are passed.
         """
         ...
 
@@ -429,9 +436,11 @@ class FakeGHClient:
         self,
         slugs: Iterable[str] | None = None,
         *,
+        author: str | None = "@me",
         timeout: float | None = None,
     ) -> dict[str, list[PRInfo]]:
         self.call_count["my_open_prs"] += 1
+        self.last_my_open_prs_author = author  # for test assertions
         if self._my_open_prs is None:
             raise GHError("FakeGHClient: my_open_prs not configured")
         if slugs is None:
@@ -1018,10 +1027,17 @@ class ProductionGHClient:
         self,
         slugs: Iterable[str] | None = None,
         *,
+        author: str | None = "@me",
         timeout: float | None = None,
     ) -> dict[str, list[PRInfo]]:
         # verified non-deprecated against gh CLI 2026-05-28
-        base_terms = ["author:@me", "is:open", "is:pr"]
+        # author=None → no author: qualifier (any author); otherwise add
+        # the qualifier. The qualifier goes first so the query reads
+        # naturally and the existing argv-assertion tests still match
+        # when author is the default "@me".
+        base_terms = ["is:open", "is:pr"]
+        if author is not None:
+            base_terms.insert(0, f"author:{author}")
         grouped: dict[str, list[PRInfo]] = {}
 
         if slugs is None:

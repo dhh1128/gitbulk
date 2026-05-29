@@ -45,6 +45,13 @@ from gitbulk import paths, sentinel
 from gitbulk.config.policy import Policy, load_policy
 from gitbulk.config.repos import RepoEntry, SkippedEntry, load_repos
 from gitbulk.default_branch_cache import prime_default_branches
+from gitbulk.filters import (
+    apply_pr_filters,
+    fetch_author,
+    filter_summary_line,
+    resolve_filter_spec,
+    select_repos,
+)
 from gitbulk.gh import GHClient, GHError, ProductionGHClient
 from gitbulk.invariants import (
     InvariantContext,
@@ -191,6 +198,7 @@ def _build_summary_md(
     attention_count: int,
     watchdog_records: list[dict] | None = None,
     skipped_entries: list[SkippedEntry] | None = None,
+    filter_line: str | None = None,
 ) -> str:
     """Human-readable summary.md (this.i tp4kq2nr layer 3)."""
     watchdog_records = watchdog_records or []
@@ -207,6 +215,8 @@ def _build_summary_md(
         f"Skipped: {len(skipped_repos)}  "
         f"PRs needing attention: {attention_count}"
     )
+    if filter_line:
+        lines.append(filter_line)
     if policy.humans.org:
         lines.append(f"Humans org: {policy.humans.org}")
     lines.append("")
@@ -498,6 +508,14 @@ def report_handler(args: argparse.Namespace) -> int:
     repos, skipped_entries = load_repos(code_root=code_root)
     repos_text = _read_repos_text()
 
+    # Resolve the fleet-subset filter (CLI flags narrow a named config
+    # set) and prune the repo list before the lock / invariant loop —
+    # a repo filter makes the run cheaper, not just narrower. A bad
+    # --filter name raises ConfigError here, which main() renders as a
+    # clean one-liner (no half-finished run dir). (node flt7arg2)
+    spec = resolve_filter_spec(args, policy)
+    repos, repos_excluded = select_repos(repos, spec)
+
     # 2. Acquire global lock (shared, 300s timeout per tmlk5pq3). The
     # contextmanager raises LockTimeoutError on __enter__; per tmlk5pq3
     # the timeout is surfaced as exit 1 + stderr message, no ATTENTION
@@ -514,7 +532,8 @@ def report_handler(args: argparse.Namespace) -> int:
             subcommand="report",
         ):
             return _run_under_lock(
-                args, policy, repos, repos_text, skipped_entries
+                args, policy, repos, repos_text, skipped_entries,
+                spec, repos_excluded,
             )
     except LockTimeoutError as e:
         print(
@@ -530,6 +549,8 @@ def _run_under_lock(
     repos: list[RepoEntry],
     repos_text: str,
     skipped_entries: list[SkippedEntry],
+    spec,
+    repos_excluded: int,
 ) -> int:
     """The portion of the pipeline that runs while the lock is held.
 
@@ -689,7 +710,12 @@ def _run_under_lock(
                 flush=True,
             )
         try:
-            prs_by_repo = gh.my_open_prs([r.slug for r in passing_repos])
+            # report is read-only, so the author filter may widen beyond
+            # the user's own PRs (per flt7arg2). fetch_author defaults to
+            # @me when no --author was given.
+            prs_by_repo = gh.my_open_prs(
+                [r.slug for r in passing_repos], author=fetch_author(spec)
+            )
         except GHError as e:
             if sys.stderr.isatty():
                 sys.stderr.write("\r" + " " * 80 + "\r")
@@ -714,6 +740,9 @@ def _run_under_lock(
             sys.stderr.flush()
     else:
         prs_by_repo = {}
+
+    # Apply PR-level filters (base, mergeable_state) after the fetch.
+    prs_by_repo, prs_excluded = apply_pr_filters(prs_by_repo, spec)
 
     # 8. PER_PR invariants + structured state.
     attention_count = 0
@@ -782,6 +811,7 @@ def _run_under_lock(
         )
 
     # 9. Summary markdown.
+    fline = filter_summary_line(spec, repos_excluded, prs_excluded)
     summary_md = _build_summary_md(
         policy,
         repos,
@@ -792,6 +822,7 @@ def _run_under_lock(
         attention_count,
         watchdog_records=watchdog_records,
         skipped_entries=skipped_entries,
+        filter_line=fline,
     )
     rs.write_summary(summary_md)
 
@@ -814,6 +845,8 @@ def _run_under_lock(
         f"{len(skipped_entries)} entries skipped; "
         f"{wd_failed} recent-merge CD failure(s)"
     )
+    if fline:
+        summary_text = f"{summary_text}; {fline}"
     return _finish(
         rs,
         exit_code,

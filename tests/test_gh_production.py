@@ -444,6 +444,35 @@ def test_my_open_prs_argv_no_slugs_uses_open_search():
     assert "timelineItems" in argv[f_index + 1]
 
 
+def test_my_open_prs_argv_custom_author():
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps({"data": {"search": {"nodes": []}}}))
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.my_open_prs(author="octocat")
+
+    args, _ = mock_run.call_args
+    argv = args[0]
+    assert argv[argv.index("-F") + 1] == "q=author:octocat is:open is:pr"
+
+
+def test_my_open_prs_argv_author_none_omits_qualifier():
+    """author=None → search any author (no author: qualifier)."""
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps({"data": {"search": {"nodes": []}}}))
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.my_open_prs(author=None)
+
+    args, _ = mock_run.call_args
+    argv = args[0]
+    q_value = argv[argv.index("-F") + 1]
+    assert q_value == "q=is:open is:pr"
+    assert "author:" not in q_value
+
+
 def test_my_open_prs_argv_includes_repo_terms_for_each_slug():
     side_effect = _make_run_mock(
         _CompletedFake(0, stdout=json.dumps({"data": {"search": {"nodes": []}}}))

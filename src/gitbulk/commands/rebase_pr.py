@@ -45,6 +45,12 @@ from gitbulk import paths, sentinel
 from gitbulk.config.policy import Policy, load_policy, policy_for
 from gitbulk.config.repos import RepoEntry, SkippedEntry, load_repos
 from gitbulk.default_branch_cache import prime_default_branches
+from gitbulk.filters import (
+    apply_pr_filters,
+    filter_summary_line,
+    resolve_filter_spec,
+    select_repos,
+)
 from gitbulk.gh import GHError, ProductionGHClient
 from gitbulk.invariants import InvariantContext, get, run_chain
 from gitbulk.invariants.base import Invariant, InvariantKind
@@ -179,6 +185,22 @@ def rebase_pr_handler(args: argparse.Namespace) -> int:
     repos, skipped_entries = load_repos(code_root=code_root)
     repos_text = _read_repos_text()
 
+    # Fleet-subset filter (node flt7arg2). rebase-pr can only force-push
+    # branches you own, so it REFUSES the --author dimension outright
+    # (the per-command author veto): there's no safe way to rebase
+    # someone else's PR. Other dimensions (org/repo/base/mergeable_state)
+    # are honored normally.
+    spec = resolve_filter_spec(args, policy)
+    if spec.authors:
+        from gitbulk.config.repos import ConfigError
+
+        raise ConfigError(
+            "rebase-pr does not support --author: it can only rebase and "
+            "force-push your own PRs. Drop --author (it already targets "
+            "yours)."
+        )
+    repos, repos_excluded = select_repos(repos, spec)
+
     try:
         with global_lock(
             "exclusive",
@@ -186,7 +208,8 @@ def rebase_pr_handler(args: argparse.Namespace) -> int:
             subcommand="rebase-pr",
         ):
             return _run_under_lock(
-                args, policy, repos, repos_text, skipped_entries
+                args, policy, repos, repos_text, skipped_entries,
+                spec, repos_excluded,
             )
     except LockTimeoutError as e:
         print(
@@ -202,6 +225,8 @@ def _run_under_lock(
     repos: list[RepoEntry],
     repos_text: str,
     skipped_entries: list[SkippedEntry],
+    spec,
+    repos_excluded: int,
 ) -> int:
     config_snapshot = _config_snapshot(policy, repos_text, args)
     rs = RunState.begin(
@@ -310,6 +335,12 @@ def _run_under_lock(
     else:
         prs_by_repo = {}
 
+    # Apply PR-level filters (base, mergeable_state). Author is always
+    # self here (the --author veto above guarantees it), so the fetch
+    # stays the default @me.
+    prs_by_repo, prs_excluded = apply_pr_filters(prs_by_repo, spec)
+    filter_line = filter_summary_line(spec, repos_excluded, prs_excluded)
+
     # PER_PR chain → eligible PRs (those that need a rebase).
     eligible_prs: list[tuple[str, PRInfo]] = []
     for repo in passing_repos:
@@ -338,6 +369,7 @@ def _run_under_lock(
             ],
             apply=False,
             skipped_entries=skipped_entries,
+            filter_line=filter_line,
         )
         rs.write_summary(summary_md)
         if skipped_repos or skipped_entries:
@@ -356,6 +388,7 @@ def _run_under_lock(
             f"dry-run: {len(eligible_prs)} PR(s) would be rebased; "
             f"{len(skipped_repos)} repos skipped; "
             f"{len(skipped_entries)} entries skipped"
+            + (f"; {filter_line}" if filter_line else "")
         )
         return _finish(
             rs,
@@ -498,6 +531,7 @@ def _run_under_lock(
         results=results,
         apply=True,
         skipped_entries=skipped_entries,
+        filter_line=filter_line,
     )
     rs.write_summary(summary_md)
 
@@ -506,6 +540,7 @@ def _run_under_lock(
         f"preserved), {failure_count} failed; "
         f"{len(skipped_repos)} repos skipped; "
         f"{len(skipped_entries)} entries skipped"
+        + (f"; {filter_line}" if filter_line else "")
     )
     return _finish(
         rs,
@@ -550,6 +585,7 @@ def _build_summary_md(
     results: list[dict] | None,
     apply: bool,
     skipped_entries: list[SkippedEntry] | None = None,
+    filter_line: str | None = None,
 ) -> str:
     skipped_entries = skipped_entries or []
     results = results or []
@@ -562,6 +598,8 @@ def _build_summary_md(
         f"Skipped: {len(skipped_repos)}  "
         f"PRs: {len(results)}"
     )
+    if filter_line:
+        lines.append(filter_line)
     lines.append("")
 
     if skipped_repos:

@@ -143,13 +143,21 @@ def _make_pr(
     )
 
 
-def _make_args(*, apply=False, code_root=None, skip_check=None, refresh_org_members=False):
+def _make_args(*, apply=False, code_root=None, skip_check=None, refresh_org_members=False,
+               org=None, repo=None, base=None, mergeable_state=None, author=None,
+               filter=None):
     return argparse.Namespace(
         subcommand="merge",
         apply=apply,
         code_root=str(code_root) if code_root else None,
         skip_check=list(skip_check) if skip_check else None,
         refresh_org_members=refresh_org_members,
+        org=org,
+        repo=repo,
+        base=base,
+        mergeable_state=mergeable_state,
+        author=author,
+        filter=filter,
     )
 
 
@@ -212,6 +220,35 @@ def test_dry_run_no_eligible_prs_exit_ok(
     assert rc == EXIT_OK
     summary = (paths.latest_run_symlink("merge").resolve() / "summary.md").read_text()
     assert "no eligible PRs" in summary
+
+
+def test_dry_run_org_filter_prunes_and_reports_filter_line(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["provenant-dev/alpha", "dhh1128/beta"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr1 = _make_pr(slug="provenant-dev/alpha", number=1)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={
+            "provenant-dev/alpha": "main",
+            "dhh1128/beta": "main",
+        },
+        my_open_prs={"provenant-dev/alpha": [pr1]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+
+    rc = merge_handler(_make_args(code_root=code_root, org=["provenant-dev"]))
+    assert rc == EXIT_OK
+    summary = (paths.latest_run_symlink("merge").resolve() / "summary.md").read_text()
+    assert "Filtered" in summary
+    assert "org=provenant-dev" in summary
+    assert "1 repos" in summary
+    # The excluded repo is absent from the run.
+    assert "dhh1128/beta" not in summary
 
 
 # ─── --apply happy path ────────────────────────────────────────────────────
