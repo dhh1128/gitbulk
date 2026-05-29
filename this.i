@@ -2585,3 +2585,25 @@ Gitbulk Triage Tool = goal:
             are pinned to node24-runtime versions per the standing
             GitHub-Actions deprecation rule. Cost: couples releasing to
             GitHub Actions availability; acceptable, CI already lives there.
+
+        CI Release-Readiness Hardening = decision:
+          id: cidvp4kr
+          why: >
+            Now that a formal release pipeline exists (node reldst7q), CI is
+            extended three ways so a release is validated before a tag, not
+            at release time: (1) the test job runs a Python matrix of 3.10
+            AND 3.12 — 3.10 is the advertised floor (constraint 6jz4n2pq)
+            and was previously never exercised, so a 3.11+ construct could
+            ship broken to a 3.10 user; the 100% coverage gate runs on both
+            (the only version-conditional code is the startup check, whose
+            branches are test-faked, so coverage is identical). (2) A shared
+            scripts/build_release_assets.py builds the zipapp + update.json
+            and is invoked by BOTH release.yml and a push/PR CI job, so the
+            asset-construction logic that otherwise first runs on a tag is
+            exercised every push (build + boot + sha256 round-trip), and the
+            two paths cannot drift. (3) actionlint lints every workflow so
+            YAML/expression/shell errors fail fast rather than on a
+            tag-triggered run that is hard to dry-run. Cost: a second matrix
+            leg and two extra CI jobs (~1-2 min); accepted as cheap
+            insurance for a release path with a damaging blast radius.
+            Provenance/attestation remains deferred to tension schardn7.
