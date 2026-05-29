@@ -38,6 +38,12 @@ LOG_DIR="${CACHE_DIR}/cron"
 LOCK_FILE="${CACHE_DIR}/cron.lock"
 RETAIN_DAYS="${GITBULK_CRON_RETAIN_DAYS:-30}"
 
+# Never advertise (or attempt) a self-update from cron: a nightly notice is
+# log noise and replacing the binary underneath a running job is unsafe.
+# The CLI already TTY-gates the notice (this.i node updnc5kr); this is the
+# belt-and-suspenders that keeps it off even if cron ever attaches a TTY.
+export GITBULK_NO_UPDATE_CHECK=1
+
 # Resolve the gitbulk binary. Priority:
 #   1. GITBULK_BIN explicit absolute path
 #   2. gitbulk found on PATH after prepending ~/.local/bin
