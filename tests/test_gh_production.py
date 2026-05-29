@@ -94,6 +94,12 @@ def _make_run_mock(*outcomes: Any):
         "context deadline exceeded: timeout",
         "could not resolve host: api.github.com",
         "unexpected EOF on connection",
+        # gh emits these on bad-gateway / service-unavailable; the
+        # "http 50" marker catches them — was silently un-retried until
+        # 2026-05-29 when batched GraphQL exposed it.
+        "gh: HTTP 502",
+        "gh: HTTP 503",
+        "gh: HTTP 504",
     ],
 )
 def test_is_retryable_stderr_matches_known_transient_patterns(stderr):
@@ -1262,3 +1268,293 @@ def test_client_is_stateless_between_calls():
     assert mock_run.call_count == 2
     assert a == {"login": "a"}
     assert b == {"login": "b"}
+
+
+# ─── prefetch_default_branches + cache ─────────────────────────────────────
+
+
+def test_prefetch_default_branches_builds_aliased_query():
+    """Each slug becomes a `rN: repository(owner: ..., name: ...) { ... }`
+    aliased node in a single GraphQL query."""
+    payload = {
+        "data": {
+            "r0": {"defaultBranchRef": {"name": "main"}},
+            "r1": {"defaultBranchRef": {"name": "develop"}},
+        }
+    }
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.prefetch_default_branches(["dhh1128/alpha", "provenant-dev/beta"])
+    # One subprocess call regardless of slug count.
+    assert mock_run.call_count == 1
+    args, _ = mock_run.call_args
+    argv = args[0]
+    assert argv[0:3] == ["gh", "api", "graphql"]
+    f_index = argv.index("-f")
+    query = argv[f_index + 1]
+    assert "query=query {" in query
+    assert 'r0: repository(owner: "dhh1128", name: "alpha")' in query
+    assert 'r1: repository(owner: "provenant-dev", name: "beta")' in query
+    assert "defaultBranchRef { name }" in query
+
+
+def test_prefetch_populates_cache_so_default_branch_hits_memory():
+    """After prefetch, default_branch(slug) returns the cached value
+    without issuing another subprocess call."""
+    payload = {
+        "data": {"r0": {"defaultBranchRef": {"name": "main"}}}
+    }
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.prefetch_default_branches(["dhh1128/alpha"])
+        result = client.default_branch("dhh1128/alpha")
+    assert result == "main"
+    # Exactly one subprocess call (the prefetch), default_branch hit cache.
+    assert mock_run.call_count == 1
+
+
+def test_default_branch_cache_miss_falls_back_to_rest():
+    """A slug NOT in the cache falls through to the per-slug REST call."""
+    payload = {"data": {"r0": {"defaultBranchRef": {"name": "main"}}}}
+    rest_response = "develop\n"
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps(payload)),  # prefetch
+        _CompletedFake(0, stdout=rest_response),  # default_branch REST
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.prefetch_default_branches(["dhh1128/alpha"])
+        # alpha is cached, beta is not
+        cached = client.default_branch("dhh1128/alpha")
+        uncached = client.default_branch("dhh1128/beta")
+    assert cached == "main"
+    assert uncached == "develop"
+    assert mock_run.call_count == 2  # prefetch + REST for beta
+
+
+def test_prefetch_empty_slugs_is_noop():
+    """Empty input → no network call, no exception."""
+    with patch("gitbulk.gh.subprocess.run") as mock_run:
+        client = ProductionGHClient()
+        client.prefetch_default_branches([])
+    assert mock_run.call_count == 0
+
+
+def test_prefetch_skips_malformed_slugs_defensively():
+    """A slug without '/' is defensively skipped (should never happen
+    post-load_repos, but the guard is cheap)."""
+    payload = {"data": {"r1": {"defaultBranchRef": {"name": "main"}}}}
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.prefetch_default_branches(["malformed-slug", "good/repo"])
+    # One graphql call; the malformed entry was skipped before query build.
+    assert mock_run.call_count == 1
+    args, _ = mock_run.call_args
+    query = args[0][args[0].index("-f") + 1]
+    assert "malformed-slug" not in query
+    # Aliases are numbered within the post-filter chunk, so "good/repo"
+    # is r0 (not r1 — the malformed one was filtered before chunking).
+    assert 'r0: repository(owner: "good", name: "repo")' in query
+
+
+def test_prefetch_all_malformed_skips_network():
+    """If every input slug is malformed (no '/'), no query is built and
+    no network call is made."""
+    with patch("gitbulk.gh.subprocess.run") as mock_run:
+        client = ProductionGHClient()
+        client.prefetch_default_branches(["malformed", "also-malformed"])
+    assert mock_run.call_count == 0
+
+
+def test_prefetch_gracefully_degrades_on_gh_error():
+    """If the GraphQL call fails (gh exits non-zero), cache stays empty
+    and subsequent default_branch calls fall back to REST."""
+    side_effect = _make_run_mock(
+        _CompletedFake(1, stderr="API rate limit exceeded"),  # prefetch fails
+        _CompletedFake(0, stdout="main\n"),  # REST fallback
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        # No exception raised by prefetch even though gh returned non-zero.
+        client.prefetch_default_branches(["dhh1128/alpha"])
+        result = client.default_branch("dhh1128/alpha")
+    assert result == "main"
+    # 1 attempt failed (non-retryable) + 1 REST = 2
+    assert mock_run.call_count >= 2
+
+
+def test_prefetch_gracefully_degrades_on_bad_json():
+    """If gh returns non-JSON stdout, cache stays empty."""
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout="not valid json"),
+        _CompletedFake(0, stdout="main\n"),
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        client.prefetch_default_branches(["dhh1128/alpha"])
+        result = client.default_branch("dhh1128/alpha")
+    assert result == "main"
+
+
+def test_prefetch_tolerates_null_default_branch_ref():
+    """A repo with no commits has defaultBranchRef=null; just skip it
+    (the per-slug REST fallback returns 'null' string for that case,
+    matching pre-prefetch behavior)."""
+    payload = {
+        "data": {
+            "r0": {"defaultBranchRef": None},
+            "r1": {"defaultBranchRef": {"name": "main"}},
+        }
+    }
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        client.prefetch_default_branches(["a/empty", "a/normal"])
+    # Only the populated one made it into the cache.
+    assert client._default_branch_cache == {"a/normal": "main"}
+
+
+def test_prefetch_tolerates_missing_alias_in_response():
+    """If GitHub returns fewer aliases than we requested (unusual),
+    skip the absent ones — they'll fall back to REST on demand."""
+    payload = {"data": {"r0": {"defaultBranchRef": {"name": "main"}}}}
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        client.prefetch_default_branches(["a/has-it", "a/missing"])
+    assert client._default_branch_cache == {"a/has-it": "main"}
+
+
+def test_prefetch_tolerates_null_data_field():
+    """Some GraphQL error shapes return data=null with an errors array.
+    Cache stays empty; no exception."""
+    payload = {"data": None, "errors": [{"message": "something"}]}
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        client.prefetch_default_branches(["a/b"])
+    assert client._default_branch_cache == {}
+
+
+def test_prefetch_tolerates_non_dict_node():
+    """Defense in depth: a non-dict shape under an alias is skipped."""
+    payload = {"data": {"r0": "unexpected-string-shape"}}
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        client.prefetch_default_branches(["a/b"])
+    assert client._default_branch_cache == {}
+
+
+def test_prefetch_accepts_partial_success_on_nonzero_exit():
+    """Real-world case (discovered 2026-05-29 with a 205-repo fleet):
+    one bad repo (deleted, renamed) makes `gh api graphql` return rc=1
+    AND populated `data` for the other aliases. We must accept the
+    partial data, not discard the whole chunk."""
+    payload = {
+        "data": {
+            "r0": {"defaultBranchRef": {"name": "main"}},
+            "r1": None,  # repository couldn't be resolved
+            "r2": {"defaultBranchRef": {"name": "develop"}},
+        },
+        "errors": [{"message": "Could not resolve to a Repository ..."}],
+    }
+    side_effect = _make_run_mock(
+        _CompletedFake(
+            1,
+            stdout=json.dumps(payload),
+            stderr="Could not resolve to a Repository with the name 'x/y'.",
+        )
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.prefetch_default_branches(["a/good1", "x/missing", "a/good2"])
+    # Single subprocess call (no retry — we got usable stdout).
+    assert mock_run.call_count == 1
+    # The two resolvable repos made it into the cache; the missing one
+    # didn't, and will fall back to per-slug REST on demand.
+    assert client._default_branch_cache == {
+        "a/good1": "main",
+        "a/good2": "develop",
+    }
+
+
+def test_prefetch_retries_on_transient_stderr_when_no_stdout(monkeypatch):
+    """If gh returns rc=1 with no stdout AND retryable stderr (HTTP 502),
+    the chunk retries up to _max_retries before giving up."""
+    side_effect = _make_run_mock(
+        _CompletedFake(1, stdout="", stderr="gh: HTTP 502"),
+        _CompletedFake(1, stdout="", stderr="gh: HTTP 502"),
+        _CompletedFake(0, stdout=json.dumps({
+            "data": {"r0": {"defaultBranchRef": {"name": "main"}}}
+        })),
+    )
+    monkeypatch.setattr("gitbulk.gh.time.sleep", lambda _: None)
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.prefetch_default_branches(["a/b"])
+    # 2 failed attempts + 1 success
+    assert mock_run.call_count == 3
+    assert client._default_branch_cache == {"a/b": "main"}
+
+
+def test_prefetch_gives_up_on_non_retryable_stderr_with_no_stdout():
+    """rc=1, empty stdout, non-retryable stderr (e.g. auth error) →
+    abort the chunk silently. Per-slug REST fallback handles it."""
+    side_effect = _make_run_mock(
+        _CompletedFake(1, stdout="", stderr="HTTP 401: Bad credentials"),
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.prefetch_default_branches(["a/b"])
+    # One attempt, no retry (non-retryable), cache stays empty.
+    assert mock_run.call_count == 1
+    assert client._default_branch_cache == {}
+
+
+def test_prefetch_handles_timeout_with_retry(monkeypatch):
+    """If subprocess.run raises TimeoutExpired on attempt 1, we retry."""
+    payload = {"data": {"r0": {"defaultBranchRef": {"name": "main"}}}}
+    side_effect = _make_run_mock(
+        subprocess.TimeoutExpired(cmd=["gh"], timeout=30.0),
+        _CompletedFake(0, stdout=json.dumps(payload)),
+    )
+    monkeypatch.setattr("gitbulk.gh.time.sleep", lambda _: None)
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.prefetch_default_branches(["a/b"])
+    assert mock_run.call_count == 2
+    assert client._default_branch_cache == {"a/b": "main"}
+
+
+def test_prefetch_exhausts_retries_on_persistent_timeout(monkeypatch):
+    """All attempts time out → stdout stays empty → give up silently."""
+    side_effect = _make_run_mock(
+        subprocess.TimeoutExpired(cmd=["gh"], timeout=30.0),
+        subprocess.TimeoutExpired(cmd=["gh"], timeout=30.0),
+        subprocess.TimeoutExpired(cmd=["gh"], timeout=30.0),
+    )
+    monkeypatch.setattr("gitbulk.gh.time.sleep", lambda _: None)
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.prefetch_default_branches(["a/b"])
+    assert mock_run.call_count == 3
+    assert client._default_branch_cache == {}
+
+
+def test_prefetch_tolerates_non_string_branch_name():
+    """Defensive: defaultBranchRef.name being null or empty is rejected."""
+    payload = {
+        "data": {
+            "r0": {"defaultBranchRef": {"name": None}},
+            "r1": {"defaultBranchRef": {"name": ""}},
+        }
+    }
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        client.prefetch_default_branches(["a/x", "a/y"])
+    assert client._default_branch_cache == {}

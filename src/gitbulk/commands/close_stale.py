@@ -311,6 +311,8 @@ def _run_under_lock(
     # PER_REPO preflight.
     skipped_repos: list[tuple[str, str]] = []
     passing_repos: list[RepoEntry] = []
+    # Batch default-branch lookups (see report.py for rationale).
+    gh.prefetch_default_branches([r.slug for r in repos])
     progress = Progress(len(repos), prefix="per-repo checks: ")
     for i, repo in enumerate(repos, start=1):
         progress.update(i, repo.slug)

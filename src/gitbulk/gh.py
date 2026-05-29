@@ -69,6 +69,25 @@ class GHClient(Protocol):
         """Return the current default-branch name of ``slug`` on GitHub."""
         ...
 
+    def prefetch_default_branches(
+        self,
+        slugs: Iterable[str],
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        """Batch-fetch default branches for ``slugs`` into an in-process
+        cache so subsequent ``default_branch`` calls hit memory.
+
+        Issues one GraphQL query with aliased ``repository()`` nodes
+        instead of one REST call per slug — for a 175-repo fleet that
+        turns a 60-second sequential wait into a ~2-second single
+        call. If the batch call fails (network, rate limit, GraphQL
+        complexity), the cache is left empty and ``default_branch``
+        falls back to the per-slug REST path. No-op when called
+        before any cache surface exists (FakeGHClient).
+        """
+        ...
+
     def my_open_prs(
         self,
         slugs: Iterable[str] | None = None,
@@ -320,6 +339,7 @@ class FakeGHClient:
             "close_pr": 0,
             "fetch_merge_commit_sha": 0,
             "fetch_check_runs": 0,
+            "prefetch_default_branches": 0,
         }
 
     def authenticated_user(self, *, timeout: float | None = None) -> dict[str, Any]:
@@ -343,6 +363,17 @@ class FakeGHClient:
         if self._default_branches is None or slug not in self._default_branches:
             raise GHError(f"FakeGHClient: default_branch({slug!r}) not configured")
         return self._default_branches[slug]
+
+    def prefetch_default_branches(
+        self,
+        slugs: Iterable[str],
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        """No-op in the fake: the configured ``default_branches`` map IS
+        the cache. We still count the call so tests can assert the
+        handler invoked the prefetch path."""
+        self.call_count["prefetch_default_branches"] += 1
 
     def my_open_prs(
         self,
@@ -515,6 +546,12 @@ class FakeGHClient:
 _RETRYABLE_STDERR_MARKERS: tuple[str, ...] = (
     "rate limit",
     "5xx",
+    # gh emits things like "HTTP 502" / "HTTP 503" on bad-gateway and
+    # service-unavailable; the literal "5xx" marker above doesn't catch
+    # those. Discovered 2026-05-29 while batching 200+ default-branch
+    # lookups: ~25% of chunks were silently failing on HTTP 502 without
+    # ever retrying because none of the other markers matched.
+    "http 50",
     "timeout",
     "could not resolve",
     "eof",
@@ -652,6 +689,11 @@ class ProductionGHClient:
         self._gh_path = resolved
         self._default_timeout = default_timeout
         self._max_retries = max_retries
+        #: Populated by :meth:`prefetch_default_branches`. Subsequent
+        #: ``default_branch`` calls consult this first; on miss they
+        #: fall back to a per-slug REST call. Per-process only — not
+        #: persisted to disk in this stage.
+        self._default_branch_cache: dict[str, str] = {}
 
     # ─── private helpers ───────────────────────────────────────────────
 
@@ -742,12 +784,121 @@ class ProductionGHClient:
     def default_branch(
         self, slug: str, *, timeout: float | None = None
     ) -> str:
+        # In-process cache populated by prefetch_default_branches.
+        # Cache miss falls through to the per-slug REST call below.
+        cached = self._default_branch_cache.get(slug)
+        if cached is not None:
+            return cached
         # verified non-deprecated against gh CLI 2026-05-28
         stdout = self._run(
             ("api", f"repos/{slug}", "--jq", ".default_branch"),
             timeout=timeout,
         )
         return stdout.strip()
+
+    def prefetch_default_branches(
+        self,
+        slugs: Iterable[str],
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        # verified non-deprecated against gh CLI 2026-05-28
+        # GraphQL with aliased repository() nodes lets us look up N
+        # default branches per round-trip. We chunk at _CHUNK below
+        # because empirically GitHub returns HTTP 502 around 200 nodes
+        # in a single query (smaller chunks are reliable; tested
+        # 2026-05-29 against a 205-repo fleet).
+        slug_list = [s for s in slugs if "/" in s]
+        if not slug_list:
+            return
+        _CHUNK = 50
+        for start in range(0, len(slug_list), _CHUNK):
+            self._prefetch_default_branches_chunk(
+                slug_list[start : start + _CHUNK], timeout=timeout
+            )
+
+    def _prefetch_default_branches_chunk(
+        self,
+        chunk: list[str],
+        *,
+        timeout: float | None,
+    ) -> None:
+        """One GraphQL round-trip for up to ``_CHUNK`` slugs.
+
+        Bypasses :meth:`_run` because GraphQL's partial-success semantics
+        don't fit it: a chunk with one unknown repo (deleted, renamed,
+        transferred) returns ``data`` with the other aliases populated
+        AND a non-zero exit code AND an ``errors`` field. ``_run`` would
+        raise on the non-zero exit, discarding the good data. We parse
+        whatever stdout gives us. Retries are inlined because we still
+        want to handle transient 5xx, but they're capped at 3 attempts
+        with exponential backoff matching ``_run``'s convention.
+        """
+        aliases: dict[str, str] = {}
+        body_lines: list[str] = []
+        for i, slug in enumerate(chunk):
+            owner, name = slug.split("/", 1)
+            alias = f"r{i}"
+            aliases[alias] = slug
+            # Owner and name are validated by load_repos's slug regex,
+            # so they're safe to interpolate. (Defense in depth: the
+            # regex rejects quotes and backslashes.)
+            body_lines.append(
+                f'  {alias}: repository(owner: "{owner}", name: "{name}") '
+                "{ defaultBranchRef { name } }"
+            )
+        query = "query {\n" + "\n".join(body_lines) + "\n}\n"
+        argv = (self._gh_path, "api", "graphql", "-f", f"query={query}")
+        effective_timeout = (
+            timeout if timeout is not None else self._default_timeout
+        )
+        stdout = ""
+        for attempt in range(self._max_retries):
+            try:
+                completed = subprocess.run(
+                    list(argv),
+                    capture_output=True,
+                    text=True,
+                    timeout=effective_timeout,
+                    check=False,
+                )
+            except subprocess.TimeoutExpired:
+                if attempt < self._max_retries - 1:
+                    time.sleep(2 ** attempt)
+                continue
+            # Partial-success: GraphQL may set rc=1 because some aliases
+            # couldn't be resolved (deleted repo) BUT still return valid
+            # data for the rest. Accept stdout if it parses as JSON
+            # regardless of returncode.
+            if completed.stdout:
+                stdout = completed.stdout
+                break
+            # No stdout at all → check stderr for transient and retry,
+            # else give up on this chunk.
+            if (
+                attempt < self._max_retries - 1
+                and _is_retryable_stderr(completed.stderr or "")
+            ):
+                time.sleep(2 ** attempt)
+                continue
+            return
+        if not stdout:
+            return
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError:
+            return
+        data = payload.get("data") or {}
+        for alias, slug in aliases.items():
+            node = data.get(alias)
+            if not isinstance(node, dict):
+                continue
+            ref = node.get("defaultBranchRef")
+            if not isinstance(ref, dict):
+                continue
+            name = ref.get("name")
+            if isinstance(name, str) and name:
+                self._default_branch_cache[slug] = name
 
     def my_open_prs(
         self,

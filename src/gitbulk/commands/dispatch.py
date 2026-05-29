@@ -407,6 +407,8 @@ def _run_under_lock(
         )
 
     # 5. PER_REPO preflight; same Skip-vs-Skip discrimination as report.
+    # Batch default-branch lookups (see report.py for rationale).
+    gh.prefetch_default_branches([r.slug for r in repos])
     skipped_repos: list[tuple[str, str]] = []
     passing_repos: list[RepoEntry] = []
     for repo in repos:

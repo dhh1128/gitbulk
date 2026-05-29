@@ -603,10 +603,26 @@ def _run_under_lock(
     # caller's skip_set.
     skipped_repos: list[tuple[str, str]] = []
     passing_repos: list[RepoEntry] = []
-    # The per-repo invariant chain runs ``github.reachable`` which makes
-    # one ``gh api repos/<slug>`` call per repo. For a 175-repo fleet
-    # that's a 60-90s silent wait. Progress indicator keeps the user
-    # informed; on a non-TTY (cron) it's a no-op.
+    # Batch the default-branch lookups into one GraphQL call before the
+    # per-repo loop runs. github.reachable + pr.base_is_default both
+    # call gh.default_branch(slug), and a 175-repo fleet was paying
+    # ~300ms per call × 175 = ~60s sequentially. Prefetch populates an
+    # in-process cache so each invariant call hits memory.
+    if sys.stderr.isatty() and len(repos) > 0:
+        print(
+            f"Prefetching default branches for {len(repos)} repos...",
+            file=sys.stderr,
+            end="",
+            flush=True,
+        )
+    gh.prefetch_default_branches([r.slug for r in repos])
+    if sys.stderr.isatty():
+        sys.stderr.write("\r" + " " * 80 + "\r")
+        sys.stderr.flush()
+    # The per-repo invariant chain runs ``github.reachable``. Without
+    # the prefetch above each call was ~300ms; with it each call is
+    # ~0ms (cache hit), so this loop is now bound by Python overhead
+    # rather than network. Progress kept for visibility regardless.
     progress = Progress(len(repos), prefix="per-repo checks: ")
     for i, repo in enumerate(repos, start=1):
         progress.update(i, repo.slug)
