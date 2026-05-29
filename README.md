@@ -34,7 +34,49 @@ today:
 `merge`, `rebase-onto-default`, `close-stale` are scaffolded in the CLI and
 return exit code 99 until Phase 5 lands.
 
-## Install (for development)
+## Install
+
+gitbulk ships two ways (this.i node `dstbr5kq`). Both require the
+[GitHub CLI](https://cli.github.com/) (`gh`) and `git`, authenticated for
+your account — gitbulk shells out to them for everything.
+
+### As a single binary (recommended for using it)
+
+Download the release asset with `gh` (works while the repo is private,
+since `gh` is authenticated) and let it install itself onto your PATH:
+
+```bash
+gh release download --repo dhh1128/gitbulk --pattern gitbulk --dir /tmp \
+  && chmod +x /tmp/gitbulk \
+  && /tmp/gitbulk install
+```
+
+`gitbulk install` copies the binary into `~/.local/bin` (the XDG user-bin
+directory, and exactly where `bin/gitbulk-cron` looks), marks it
+executable, and prints a shell-specific `PATH` hint if that directory is
+not already on your `PATH`. Pass `--dir <path>` to install elsewhere. If
+the one-liner can't run at all, see
+[`src/gitbulk/manual-install-instructions.md`](src/gitbulk/manual-install-instructions.md).
+
+The binary is a self-contained zipapp; it needs only Python 3.10+ on the
+machine (PyYAML is vendored in). It is **not** truly standalone — it runs
+under the system `python3`.
+
+### Updating
+
+```bash
+gitbulk update            # download + verify (sha256) + atomically replace
+gitbulk update --check    # just report whether a newer release exists
+```
+
+`update` never replaces the binary mid-command and never fires from cron:
+a "newer version available" notice only appears on an interactive terminal,
+and is suppressed by `--no-update-check` or `GITBULK_NO_UPDATE_CHECK=1`
+(which `bin/gitbulk-cron` sets). If you installed gitbulk with pip/pipx
+instead of the binary, `gitbulk update` declines to clobber it and points
+you at `pip install -U gitbulk` / `pipx upgrade gitbulk`.
+
+### From source (for development)
 
 ```bash
 cd ~/code/gitbulk
@@ -138,6 +180,32 @@ in CI, with any gap requiring an approved `deviation:` node.
 
 If you are an AI agent or human contributor, [`AGENTS.md`](AGENTS.md) is the
 authoritative behavioral contract — read it before any change.
+
+## Releasing
+
+Releases are cut by a maintainer (never an AI agent — pushes to `main` and
+tags are reserved for humans). From a clean, in-sync `main`:
+
+```bash
+python scripts/release.py --patch   # 0.0.1 -> 0.0.2
+python scripts/release.py --minor -m "new subcommand"
+python scripts/release.py --major -m "rewrite"
+```
+
+The script verifies the tree is clean and in sync with `origin/main`, runs
+the full test suite at the 100% branch-coverage gate, bumps the version in
+`pyproject.toml` (the single source of truth — `__version__` is derived
+from it), commits with sign-off, and pushes the tag. The tag triggers
+[`.github/workflows/release.yml`](.github/workflows/release.yml), which
+builds the single-file bundle, generates `update.json` (`latest_version` /
+`script_url` / `sha256`), and publishes both as release assets — the
+`gitbulk` asset is what the install one-liner downloads.
+
+To build the artifact locally (e.g. to inspect it) without tagging:
+
+```bash
+gitbulk bundle ./dist/gitbulk
+```
 
 ## See also
 

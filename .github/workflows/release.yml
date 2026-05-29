@@ -1,0 +1,70 @@
+name: Release
+
+# Tag-triggered release pipeline (this.i node reldst7q). scripts/release.py
+# bumps + tags; this workflow builds the single-file zipapp and update.json
+# and publishes both as release assets. Actions pinned to node24 runtimes
+# (verified 2026-05-29), matching ci.yml.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up uv (with cache)
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install package from lockfile
+        run: uv sync --frozen --extra test
+
+      - name: Check tagged version matches package version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(uv run python -c 'from importlib.metadata import version; print(version("gitbulk"))')"
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag $tag does not match package version $pkg" >&2
+            exit 1
+          fi
+
+      - name: Build release bundle
+        run: uv run gitbulk bundle dist/gitbulk
+
+      - name: Prepare update manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          sha256="$(sha256sum dist/gitbulk | awk '{print $1}')"
+          cat > dist/update.json <<EOF
+          {
+            "latest_version": "${version}",
+            "script_url": "https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/gitbulk",
+            "sha256": "${sha256}"
+          }
+          EOF
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/gitbulk \
+            dist/update.json \
+            --generate-notes
