@@ -22,5 +22,8 @@ gitbulk = "gitbulk.cli:main"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+gitbulk = ["manual-install-instructions.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
