@@ -607,6 +607,28 @@ def _add_merge_args(sp: argparse.ArgumentParser) -> None:
         ),
     )
     sp.add_argument(
+        "--approve",
+        action="store_true",
+        default=False,
+        help=(
+            "Post an approving review (as you) on eligible bot PRs, then "
+            "merge. Requires --apply to act; in dry-run it only reports "
+            "what it would approve. Auto-approves only bot authors "
+            "(policy.bots) unless --approve-author widens it."
+        ),
+    )
+    sp.add_argument(
+        "--approve-author",
+        metavar="LOGIN",
+        action="append",
+        default=None,
+        help=(
+            "Additional non-bot author login(s) that --approve may "
+            "auto-approve. Repeatable. Without this, only configured "
+            "bots are auto-approved."
+        ),
+    )
+    sp.add_argument(
         "--code-root",
         metavar="PATH",
         default=None,

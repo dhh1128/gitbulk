@@ -183,6 +183,39 @@ class GHClient(Protocol):
         """
         ...
 
+    def approve_pr(
+        self,
+        slug: str,
+        number: int,
+        *,
+        body: str | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Post an APPROVING review on the PR via ``gh pr review --approve``.
+
+        Phase-5+ mutating method (this.i node ``aprmn5kq``). The only
+        legitimate caller is the ``merge`` subcommand's ``--apply
+        --approve`` path: it supplies the maintainer's approval
+        programmatically on an eligible bot PR so a green-but-unapproved
+        PR can auto-merge. ``body`` (if given) is passed as ``--body``.
+
+        Raises :class:`GHError` if gh refuses (e.g. GitHub's 422 on
+        self-approval, or insufficient permission).
+        """
+        ...
+
+    def viewer_repo_permission(
+        self, slug: str, *, timeout: float | None = None
+    ) -> str:
+        """Return the authenticated viewer's permission level on ``slug``.
+
+        One of ``"admin" | "maintain" | "write" | "triage" | "read" |
+        "none"``. Read-only. Used by the ``merge --approve`` maintainer
+        gate (this.i node ``aprmn5kq``): auto-approval only fires when
+        the viewer holds write/maintain/admin.
+        """
+        ...
+
     def fetch_pr_comments(
         self,
         slug: str,
@@ -328,6 +361,10 @@ class FakeGHClient:
         ] | None = None,
         merge_commit_shas: Mapping[tuple[str, int], "str | None"] | None = None,
         check_runs: Mapping[tuple[str, str], list[CheckRun]] | None = None,
+        approve_responses: Mapping[
+            tuple[str, int], "dict[str, Any] | Exception"
+        ] | None = None,
+        repo_permissions: Mapping[str, str] | None = None,
     ) -> None:
         self._user = user
         self._org_members = dict(org_members) if org_members is not None else None
@@ -363,11 +400,19 @@ class FakeGHClient:
             if check_runs is not None
             else None
         )
+        self._approve_responses = (
+            dict(approve_responses) if approve_responses is not None else None
+        )
+        self._repo_permissions = (
+            dict(repo_permissions) if repo_permissions is not None else None
+        )
         # Per-call argument records so tests can assert merge_pr was
         # invoked with the right method / delete_branch flags.
         self.merge_calls: list[dict[str, Any]] = []
         self.post_comment_calls: list[dict[str, Any]] = []
         self.close_calls: list[dict[str, Any]] = []
+        self.approve_calls: list[dict[str, Any]] = []
+        self.viewer_repo_permission_calls: list[dict[str, Any]] = []
         # Track call counts so tests can assert on coalescing
         self.call_count: dict[str, int] = {
             "authenticated_user": 0,
@@ -381,6 +426,8 @@ class FakeGHClient:
             "fetch_merge_commit_sha": 0,
             "fetch_check_runs": 0,
             "prefetch_default_branches": 0,
+            "approve_pr": 0,
+            "viewer_repo_permission": 0,
         }
 
     def authenticated_user(self, *, timeout: float | None = None) -> dict[str, Any]:
@@ -483,6 +530,50 @@ class FakeGHClient:
         if isinstance(outcome, Exception):
             raise outcome
         return dict(outcome)
+
+    def approve_pr(
+        self,
+        slug: str,
+        number: int,
+        *,
+        body: str | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        self.call_count["approve_pr"] += 1
+        self.approve_calls.append(
+            {
+                "slug": slug,
+                "number": number,
+                "body": body,
+                "timeout": timeout,
+            }
+        )
+        if self._approve_responses is None:
+            raise GHError(
+                f"FakeGHClient: approve_pr({slug!r}, {number}) not configured"
+            )
+        key = (slug, number)
+        if key not in self._approve_responses:
+            raise GHError(
+                f"FakeGHClient: approve_pr({slug!r}, {number}) not configured"
+            )
+        outcome = self._approve_responses[key]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return dict(outcome)
+
+    def viewer_repo_permission(
+        self, slug: str, *, timeout: float | None = None
+    ) -> str:
+        self.call_count["viewer_repo_permission"] += 1
+        self.viewer_repo_permission_calls.append(
+            {"slug": slug, "timeout": timeout}
+        )
+        if self._repo_permissions is None or slug not in self._repo_permissions:
+            raise GHError(
+                f"FakeGHClient: viewer_repo_permission({slug!r}) not configured"
+            )
+        return self._repo_permissions[slug]
 
     def fetch_pr_comments(
         self,
@@ -1114,6 +1205,70 @@ class ProductionGHClient:
             return json.loads(stripped)
         except json.JSONDecodeError:
             return {"stdout": stripped}
+
+    def approve_pr(
+        self,
+        slug: str,
+        number: int,
+        *,
+        body: str | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        # verified non-deprecated against gh CLI 2026-05-30
+        # (`gh pr review --help` shows -a/--approve and -b/--body with no
+        # deprecation warnings; `gh pr review --help 2>&1 1>/dev/null |
+        # grep -iE 'warning|deprecat'` is empty. The .agent-bin shim does
+        # NOT block `gh pr review`; only `gh pr merge`/`gh repo delete`.)
+        args: list[str] = [
+            "pr",
+            "review",
+            str(number),
+            "--repo",
+            slug,
+            "--approve",
+        ]
+        if body is not None:
+            args.extend(["--body", body])
+        stdout = self._run(tuple(args), timeout=timeout)
+        stripped = stdout.strip()
+        if not stripped:
+            return {}
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            return {"stdout": stripped}
+
+    def viewer_repo_permission(
+        self, slug: str, *, timeout: float | None = None
+    ) -> str:
+        # verified non-deprecated against gh CLI 2026-05-30
+        # (`gh api repos/<slug> --jq .permissions` returns the current
+        # {admin,maintain,push,triage,pull} boolean shape; verified live
+        # against provenant-dev/origin-sip-policy-lib with no deprecation
+        # warning on stderr.)
+        stdout = self._run(
+            ("api", f"repos/{slug}", "--jq", ".permissions"),
+            timeout=timeout,
+        )
+        try:
+            perms = json.loads(stdout)
+        except json.JSONDecodeError:
+            return "none"
+        if not isinstance(perms, dict):
+            return "none"
+        # Highest-to-lowest: GitHub returns all lower booleans true too,
+        # so we check from the most privileged down and return the first.
+        if perms.get("admin"):
+            return "admin"
+        if perms.get("maintain"):
+            return "maintain"
+        if perms.get("push"):
+            return "write"
+        if perms.get("triage"):
+            return "triage"
+        if perms.get("pull"):
+            return "read"
+        return "none"
 
     def fetch_pr_comments(
         self,

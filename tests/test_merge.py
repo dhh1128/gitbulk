@@ -66,7 +66,7 @@ def write_config(isolated_xdg, code_root):
     the age_threshold invariant doesn't require a freeze-time monkeypatch
     in every test."""
 
-    def _write(*, repos_slugs, defaults_extra=None, repo_overrides=None):
+    def _write(*, repos_slugs, defaults_extra=None, repo_overrides=None, bots=None):
         cfg_dir = paths.config_dir()
         cfg_dir.mkdir(parents=True, exist_ok=True)
         defaults = {
@@ -77,6 +77,8 @@ def write_config(isolated_xdg, code_root):
             defaults.update(defaults_extra)
         policy_yaml: dict = {"defaults": defaults}
         policy_yaml["humans"] = {"org": "provenant-dev", "cache_ttl_hours": 24}
+        if bots:
+            policy_yaml["bots"] = list(bots)
         if repo_overrides:
             policy_yaml["repos"] = repo_overrides
         (cfg_dir / "gitbulk.yaml").write_text(yaml.safe_dump(policy_yaml))
@@ -145,10 +147,12 @@ def _make_pr(
 
 def _make_args(*, apply=False, code_root=None, skip_check=None, refresh_org_members=False,
                org=None, repo=None, base=None, mergeable_state=None, author=None,
-               filter=None):
+               filter=None, approve=False, approve_author=None):
     return argparse.Namespace(
         subcommand="merge",
         apply=apply,
+        approve=approve,
+        approve_author=list(approve_author) if approve_author else None,
         code_root=str(code_root) if code_root else None,
         skip_check=list(skip_check) if skip_check else None,
         refresh_org_members=refresh_org_members,
@@ -1174,3 +1178,529 @@ def test_merge_skipped_entries_surface_in_summary(
     summary = (paths.latest_run_symlink("merge").resolve() / "summary.md").read_text()
     assert "Skipped repos.txt entries" in summary
     assert "line 2" in summary
+
+
+# ─── --approve auto-approve (node aprmn5kq) ────────────────────────────────
+
+
+def _bot_pr(slug, number, *, author="dependabot[bot]", review_decision="REVIEW_REQUIRED",
+            last_pushed_at=None):
+    return _make_pr(
+        slug=slug,
+        number=number,
+        author=author,
+        review_decision=review_decision,
+        last_pushed_at=last_pushed_at,
+    )
+
+
+def test_dry_run_approve_green_unapproved_bot_pr_reports_would_auto_approve(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"], bots=["dependabot[bot]"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr = _bot_pr("dhh1128/alpha", 15)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+        repo_permissions={"dhh1128/alpha": "maintain"},
+    )
+    monkeypatch.setattr("gitbulk.commands.merge.ProductionGHClient", lambda: fake)
+
+    rc = merge_handler(_make_args(code_root=code_root, approve=True))
+    assert rc == EXIT_OK
+    # DRY-RUN posts NOTHING.
+    assert fake.call_count["approve_pr"] == 0
+    assert fake.call_count["merge_pr"] == 0
+    summary = (paths.latest_run_symlink("merge").resolve() / "summary.md").read_text()
+    assert "would auto-approve + merge" in summary
+    assert "dhh1128/alpha" in summary
+
+
+def test_apply_approve_bot_pr_approves_then_merges_in_order(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"], bots=["dependabot[bot]"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr = _bot_pr("dhh1128/alpha", 15)
+
+    order: list[str] = []
+
+    class _RecordingFake(FakeGHClient):
+        def approve_pr(self, slug, number, *, body=None, timeout=None):
+            order.append("approve")
+            return super().approve_pr(slug, number, body=body, timeout=timeout)
+
+        def merge_pr(self, slug, number, *, method="merge", delete_branch=True, timeout=None):
+            order.append("merge")
+            return super().merge_pr(
+                slug, number, method=method, delete_branch=delete_branch, timeout=timeout
+            )
+
+    fake = _RecordingFake(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+        repo_permissions={"dhh1128/alpha": "maintain"},
+        approve_responses={("dhh1128/alpha", 15): {}},
+        merge_responses={("dhh1128/alpha", 15): {"merged": True}},
+        merge_commit_shas={("dhh1128/alpha", 15): "deadbeef"},
+    )
+    monkeypatch.setattr("gitbulk.commands.merge.ProductionGHClient", lambda: fake)
+
+    rc = merge_handler(_make_args(code_root=code_root, apply=True, approve=True))
+    assert rc == EXIT_OK
+    assert order == ["approve", "merge"]
+    assert fake.approve_calls[0]["slug"] == "dhh1128/alpha"
+    assert fake.approve_calls[0]["number"] == 15
+    summary = (paths.latest_run_symlink("merge").resolve() / "summary.md").read_text()
+    assert "auto-approved + merged" in summary
+
+
+def test_apply_approve_records_audit_warning(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"], bots=["dependabot[bot]"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr = _bot_pr("dhh1128/alpha", 15)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+        repo_permissions={"dhh1128/alpha": "write"},
+        approve_responses={("dhh1128/alpha", 15): {}},
+        merge_responses={("dhh1128/alpha", 15): {"merged": True}},
+        merge_commit_shas={("dhh1128/alpha", 15): "abc"},
+    )
+    monkeypatch.setattr("gitbulk.commands.merge.ProductionGHClient", lambda: fake)
+    rc = merge_handler(_make_args(code_root=code_root, apply=True, approve=True))
+    assert rc == EXIT_OK
+    # Audit trail: invariants.log carries an auto-approved WARNING line.
+    err_log = (paths.latest_run_symlink("merge").resolve() / "errors.log").read_text()
+    assert "auto-approved" in err_log
+    assert "dhh1128/alpha#15" in err_log
+
+
+def test_apply_approve_non_bot_without_whitelist_not_approved(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"], bots=["dependabot[bot]"])
+    fresh_org_cache("provenant-dev", ["dhh1128", "alice"])
+    pr = _bot_pr("dhh1128/alpha", 15, author="alice")
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128", "alice"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+        repo_permissions={"dhh1128/alpha": "maintain"},
+    )
+    monkeypatch.setattr("gitbulk.commands.merge.ProductionGHClient", lambda: fake)
+    rc = merge_handler(_make_args(code_root=code_root, apply=True, approve=True))
+    # Nothing approved or merged; the unapproved PR is just a skip → exit 0.
+    assert fake.call_count["approve_pr"] == 0
+    assert fake.call_count["merge_pr"] == 0
+    assert rc == EXIT_OK
+
+
+def test_apply_approve_non_bot_with_whitelist_is_approved(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"], bots=["dependabot[bot]"])
+    fresh_org_cache("provenant-dev", ["dhh1128", "alice"])
+    pr = _bot_pr("dhh1128/alpha", 15, author="alice")
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128", "alice"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+        repo_permissions={"dhh1128/alpha": "maintain"},
+        approve_responses={("dhh1128/alpha", 15): {}},
+        merge_responses={("dhh1128/alpha", 15): {"merged": True}},
+        merge_commit_shas={("dhh1128/alpha", 15): "abc"},
+    )
+    monkeypatch.setattr("gitbulk.commands.merge.ProductionGHClient", lambda: fake)
+    rc = merge_handler(
+        _make_args(code_root=code_root, apply=True, approve=True, approve_author=["alice"])
+    )
+    assert rc == EXIT_OK
+    assert fake.call_count["approve_pr"] == 1
+    assert fake.call_count["merge_pr"] == 1
+
+
+def test_apply_approve_self_authored_never_approved(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"], bots=["dhh1128"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    # viewer == author (dhh1128); even though dhh1128 is in bots, NOT-SELF wins.
+    pr = _bot_pr("dhh1128/alpha", 15, author="dhh1128")
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+        repo_permissions={"dhh1128/alpha": "maintain"},
+    )
+    monkeypatch.setattr("gitbulk.commands.merge.ProductionGHClient", lambda: fake)
+    rc = merge_handler(_make_args(code_root=code_root, apply=True, approve=True))
+    assert fake.call_count["approve_pr"] == 0
+    assert fake.call_count["merge_pr"] == 0
+    assert rc == EXIT_OK
+
+
+@pytest.mark.parametrize("perm", ["read", "none", "triage"])
+def test_apply_approve_insufficient_permission_not_approved(
+    perm, monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"], bots=["dependabot[bot]"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr = _bot_pr("dhh1128/alpha", 15)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+        repo_permissions={"dhh1128/alpha": perm},
+    )
+    monkeypatch.setattr("gitbulk.commands.merge.ProductionGHClient", lambda: fake)
+    rc = merge_handler(_make_args(code_root=code_root, apply=True, approve=True))
+    assert fake.call_count["approve_pr"] == 0
+    assert fake.call_count["merge_pr"] == 0
+    assert rc == EXIT_OK
+    err_log = (paths.latest_run_symlink("merge").resolve() / "errors.log").read_text()
+    assert "insufficient" in err_log
+
+
+@pytest.mark.parametrize("perm", ["write", "maintain", "admin"])
+def test_apply_approve_sufficient_permission_is_approved(
+    perm, monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"], bots=["dependabot[bot]"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr = _bot_pr("dhh1128/alpha", 15)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+        repo_permissions={"dhh1128/alpha": perm},
+        approve_responses={("dhh1128/alpha", 15): {}},
+        merge_responses={("dhh1128/alpha", 15): {"merged": True}},
+        merge_commit_shas={("dhh1128/alpha", 15): "abc"},
+    )
+    monkeypatch.setattr("gitbulk.commands.merge.ProductionGHClient", lambda: fake)
+    rc = merge_handler(_make_args(code_root=code_root, apply=True, approve=True))
+    assert rc == EXIT_OK
+    assert fake.call_count["approve_pr"] == 1
+    assert fake.call_count["merge_pr"] == 1
+
+
+def test_apply_approve_never_repo_not_approved(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(
+        repos_slugs=["dhh1128/alpha"],
+        bots=["dependabot[bot]"],
+        repo_overrides={"dhh1128/alpha": {"merge_policy": "never"}},
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr = _bot_pr("dhh1128/alpha", 15)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+        repo_permissions={"dhh1128/alpha": "admin"},
+    )
+    monkeypatch.setattr("gitbulk.commands.merge.ProductionGHClient", lambda: fake)
+    rc = merge_handler(_make_args(code_root=code_root, apply=True, approve=True))
+    assert fake.call_count["approve_pr"] == 0
+    assert fake.call_count["merge_pr"] == 0
+    # never-repo PR is a skip → exit 0 (no repo skip / no failure).
+    assert rc == EXIT_OK
+
+
+def test_apply_approve_non_approval_blocker_not_auto_approvable(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"], bots=["dependabot[bot]"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    # checks PENDING → required_checks_green Skips → NOT sole-gate.
+    pr = _make_pr(
+        slug="dhh1128/alpha", number=15, author="dependabot[bot]",
+        review_decision="REVIEW_REQUIRED", checks_status="PENDING",
+    )
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+        repo_permissions={"dhh1128/alpha": "admin"},
+    )
+    monkeypatch.setattr("gitbulk.commands.merge.ProductionGHClient", lambda: fake)
+    rc = merge_handler(_make_args(code_root=code_root, apply=True, approve=True))
+    assert fake.call_count["approve_pr"] == 0
+    assert fake.call_count["merge_pr"] == 0
+    assert rc == EXIT_OK
+
+
+def test_apply_approve_age_below_threshold_still_merges_after_approval(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    # Strict + min_business_days=3 + just-pushed bot PR. approved_per_policy
+    # Skips (not APPROVED) AND age_threshold Skips (too young). Both are the
+    # ONLY blockers → auto-approvable; approval merges it.
+    write_config(
+        repos_slugs=["dhh1128/alpha"],
+        bots=["dependabot[bot]"],
+        defaults_extra={"min_business_days": 3},
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    now = datetime(2026, 5, 28, 12, 0, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(_catalog, "_utc_now", lambda: now)
+    pr = _bot_pr("dhh1128/alpha", 15, last_pushed_at=now - timedelta(hours=2))
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+        repo_permissions={"dhh1128/alpha": "maintain"},
+        approve_responses={("dhh1128/alpha", 15): {}},
+        merge_responses={("dhh1128/alpha", 15): {"merged": True}},
+        merge_commit_shas={("dhh1128/alpha", 15): "abc"},
+    )
+    monkeypatch.setattr("gitbulk.commands.merge.ProductionGHClient", lambda: fake)
+    rc = merge_handler(_make_args(code_root=code_root, apply=True, approve=True))
+    assert rc == EXIT_OK
+    assert fake.call_count["approve_pr"] == 1
+    assert fake.call_count["merge_pr"] == 1
+
+
+def test_apply_approve_one_merge_per_repo_only_primary_approved(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"], bots=["dependabot[bot]"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr1 = _bot_pr("dhh1128/alpha", 15)
+    pr2 = _bot_pr("dhh1128/alpha", 16)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr2, pr1]},
+        repo_permissions={"dhh1128/alpha": "maintain"},
+        approve_responses={("dhh1128/alpha", 15): {}},
+        merge_responses={("dhh1128/alpha", 15): {"merged": True}},
+        merge_commit_shas={("dhh1128/alpha", 15): "abc"},
+    )
+    monkeypatch.setattr("gitbulk.commands.merge.ProductionGHClient", lambda: fake)
+    rc = merge_handler(_make_args(code_root=code_root, apply=True, approve=True))
+    # Lowest number (15) is the primary; 16 is deferred and NOT approved.
+    assert fake.call_count["approve_pr"] == 1
+    assert fake.approve_calls[0]["number"] == 15
+    assert fake.call_count["merge_pr"] == 1
+    assert fake.merge_calls[0]["number"] == 15
+    summary = (paths.latest_run_symlink("merge").resolve() / "summary.md").read_text()
+    assert "Deferred" in summary
+
+
+def test_approve_without_apply_posts_nothing(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"], bots=["dependabot[bot]"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr = _bot_pr("dhh1128/alpha", 15)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+        repo_permissions={"dhh1128/alpha": "maintain"},
+    )
+    monkeypatch.setattr("gitbulk.commands.merge.ProductionGHClient", lambda: fake)
+    rc = merge_handler(_make_args(code_root=code_root, approve=True))
+    assert rc == EXIT_OK
+    assert fake.call_count["approve_pr"] == 0
+    assert fake.call_count["merge_pr"] == 0
+
+
+def test_apply_approve_failure_records_error_and_does_not_merge(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"], bots=["dependabot[bot]"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr = _bot_pr("dhh1128/alpha", 15)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+        repo_permissions={"dhh1128/alpha": "maintain"},
+        approve_responses={("dhh1128/alpha", 15): GHError("422 boom")},
+    )
+    monkeypatch.setattr("gitbulk.commands.merge.ProductionGHClient", lambda: fake)
+    rc = merge_handler(_make_args(code_root=code_root, apply=True, approve=True))
+    assert fake.call_count["approve_pr"] == 1
+    assert fake.call_count["merge_pr"] == 0
+    assert rc == EXIT_ATTENTION_NEEDED
+
+
+def test_apply_approve_viewer_lookup_failure_disables_auto_approve(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"], bots=["dependabot[bot]"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr = _bot_pr("dhh1128/alpha", 15)
+
+    class _NoUserFake(FakeGHClient):
+        def authenticated_user(self, *, timeout=None):
+            # gh.authenticated preflight already passed (it uses a different
+            # path); simulate the --approve viewer lookup failing.
+            raise GHError("cannot resolve user")
+
+    # The gh.authenticated preflight calls authenticated_user too, so to
+    # isolate the --approve lookup we let preflight pass via a normal fake
+    # and only fail the SECOND call. Simpler: count calls.
+    calls = {"n": 0}
+
+    class _SecondCallFails(FakeGHClient):
+        def authenticated_user(self, *, timeout=None):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise GHError("cannot resolve user")
+            return super().authenticated_user(timeout=timeout)
+
+    fake = _SecondCallFails(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+        repo_permissions={"dhh1128/alpha": "maintain"},
+    )
+    monkeypatch.setattr("gitbulk.commands.merge.ProductionGHClient", lambda: fake)
+    rc = merge_handler(_make_args(code_root=code_root, apply=True, approve=True))
+    # Viewer login unresolved → auto-approval disabled; nothing approved.
+    assert fake.call_count["approve_pr"] == 0
+    assert fake.call_count["merge_pr"] == 0
+    assert rc == EXIT_OK
+
+
+def test_no_approve_flag_behavior_unchanged(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    # Same green-but-unapproved bot PR, but WITHOUT --approve: not merged,
+    # not approved, and no viewer/permission calls happen.
+    write_config(repos_slugs=["dhh1128/alpha"], bots=["dependabot[bot]"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr = _bot_pr("dhh1128/alpha", 15)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr("gitbulk.commands.merge.ProductionGHClient", lambda: fake)
+    rc = merge_handler(_make_args(code_root=code_root, apply=True))
+    assert fake.call_count["approve_pr"] == 0
+    assert fake.call_count["merge_pr"] == 0
+    assert fake.call_count["viewer_repo_permission"] == 0
+    assert rc == EXIT_OK
+
+
+def test_approve_author_without_approve_has_no_effect(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"], bots=["dependabot[bot]"])
+    fresh_org_cache("provenant-dev", ["dhh1128", "alice"])
+    pr = _bot_pr("dhh1128/alpha", 15, author="alice")
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128", "alice"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr("gitbulk.commands.merge.ProductionGHClient", lambda: fake)
+    rc = merge_handler(
+        _make_args(code_root=code_root, apply=True, approve_author=["alice"])
+    )
+    assert fake.call_count["approve_pr"] == 0
+    assert fake.call_count["merge_pr"] == 0
+    assert rc == EXIT_OK
+
+
+# ─── _classify_auto_approvable unit tests (defensive branches) ─────────────
+
+
+def _policy_with_bots(*bots):
+    from gitbulk.config.policy import Defaults, Policy
+
+    return Policy(defaults=Defaults(merge_policy="strict"), bots=tuple(bots))
+
+
+def test_classify_auto_approvable_fail_blocker_returns_false(isolated_xdg):
+    """A PR whose chain Failed (passed=False) is never auto-approvable."""
+    from gitbulk.invariants.runner import ChainResult
+    from gitbulk.runstate import RunState
+
+    rs = RunState.begin("merge", argv=["x"], config_snapshot={})
+    pr = _bot_pr("a/b", 1)
+    result = ChainResult(passed=False, fail_reason="boom", skips=())
+    assert (
+        merge_mod._classify_auto_approvable(
+            _policy_with_bots("dependabot[bot]"),
+            "a/b", pr, result, [], "dhh1128",
+            frozenset(), FakeGHClient(), rs,
+        )
+        is False
+    )
+    rs.complete(EXIT_OK, retain_runs=5)
+
+
+def test_classify_auto_approvable_no_skips_returns_false(isolated_xdg):
+    """Defensive: a passed PR with no intrinsic skips is not auto-approvable
+    (it would already be eligible)."""
+    from gitbulk.invariants.runner import ChainResult
+    from gitbulk.runstate import RunState
+
+    rs = RunState.begin("merge", argv=["x"], config_snapshot={})
+    pr = _bot_pr("a/b", 1)
+    result = ChainResult(passed=True, fail_reason=None, skips=())
+    assert (
+        merge_mod._classify_auto_approvable(
+            _policy_with_bots("dependabot[bot]"),
+            "a/b", pr, result, [], "dhh1128",
+            frozenset(), FakeGHClient(), rs,
+        )
+        is False
+    )
+    rs.complete(EXIT_OK, retain_runs=5)
+
+
+def test_classify_auto_approvable_permission_lookup_error_returns_false(isolated_xdg):
+    """A GHError from viewer_repo_permission disables auto-approval for that
+    PR and records a WARNING."""
+    from gitbulk.invariants.runner import ChainResult
+    from gitbulk.runstate import RunState
+
+    rs = RunState.begin("merge", argv=["x"], config_snapshot={})
+    pr = _bot_pr("a/b", 1)
+    result = ChainResult(
+        passed=True, fail_reason=None,
+        skips=(("pr.approved_per_policy", "needs APPROVED"),),
+    )
+    fake = FakeGHClient()  # viewer_repo_permission unconfigured → GHError
+    assert (
+        merge_mod._classify_auto_approvable(
+            _policy_with_bots("dependabot[bot]"),
+            "a/b", pr, result, [("pr.approved_per_policy", "needs APPROVED")],
+            "dhh1128", frozenset(), fake, rs,
+        )
+        is False
+    )
+    rs.complete(EXIT_OK, retain_runs=5)
+    err_log = (paths.latest_run_symlink("merge").resolve() / "errors.log").read_text()
+    assert "permission check failed" in err_log

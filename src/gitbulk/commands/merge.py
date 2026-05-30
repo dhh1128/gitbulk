@@ -157,6 +157,7 @@ def _build_summary_md(
     deferred_prs: list[tuple[str, PRInfo]] | None = None,
     skipped_entries: list[SkippedEntry] | None = None,
     filter_line: str | None = None,
+    auto_approve_keys: set[tuple[str, int]] | None = None,
 ) -> str:
     """Human-readable summary.md.
 
@@ -169,6 +170,7 @@ def _build_summary_md(
     guardrail postponed to the next gitbulk run.
     """
     deferred_prs = deferred_prs or []
+    auto_approve_keys = auto_approve_keys or set()
     lines: list[str] = ["# gitbulk merge", ""]
     mode = "APPLY" if apply else "DRY-RUN"
     lines.append(f"Mode: **{mode}**")
@@ -223,9 +225,15 @@ def _build_summary_md(
                 "" if method == policy.defaults.merge_method
                 else f" [method=`{method}`]"
             )
+            approve_note = (
+                " (would auto-approve + merge)"
+                if (slug, pr.number) in auto_approve_keys
+                else ""
+            )
             lines.append(
                 f"- `{slug}` #{pr.number} *{pr.title}* "
                 f"(head={pr.head_ref}@{pr.head_sha[:7]}){method_note}"
+                f"{approve_note}"
             )
     else:
         by_key = {(r["slug"], r["number"]): r for r in (merge_results or [])}
@@ -235,7 +243,11 @@ def _build_summary_md(
             if record is None:
                 status = "no result recorded"
             elif record["merged"]:
-                status = "merged"
+                status = (
+                    "auto-approved + merged"
+                    if record.get("auto_approved")
+                    else "merged"
+                )
             else:
                 status = f"FAILED: {record.get('error', '?')}"
             lines.append(
@@ -252,6 +264,96 @@ def _build_summary_md(
         lines.append("")
 
     return "\n".join(lines)
+
+
+#: Permission levels the viewer must hold for --approve to auto-approve
+#: a PR (this.i node aprmn5kq, gate (c)). read/triage/none are excluded.
+_APPROVE_PERMISSIONS: frozenset[str] = frozenset({"admin", "maintain", "write"})
+
+#: Invariant names whose Skip is forgivable by an --approve auto-approval.
+#: A PR is auto-approvable iff its ONLY non-PASS results are in this set
+#: (approval, and the age that cascades from a missing approval) with no
+#: Fail anywhere. Per node aprmn5kq, gate (d) "sole gate".
+_APPROVABLE_SKIP_NAMES: frozenset[str] = frozenset(
+    {"pr.approved_per_policy", "pr.age_threshold"}
+)
+
+
+def _classify_auto_approvable(
+    policy: Policy,
+    slug: str,
+    pr: PRInfo,
+    pr_result,
+    intrinsic_pr_skips: list[tuple[str, str]],
+    viewer_login: str | None,
+    approve_authors: frozenset[str],
+    gh,
+    rs: RunState,
+) -> bool:
+    """Decide whether ``pr`` qualifies for --approve auto-approval.
+
+    Per this.i node ``aprmn5kq``, ALL gates must hold:
+      1. NOT already eligible — caller only invokes this for non-eligible
+         PRs, so the precondition is satisfied by construction; we still
+         require ``intrinsic_pr_skips`` to be non-empty (it always is in
+         the non-eligible branch).
+      2. SOLE GATE: no Fail, and every non-PASS skip ∈
+         {pr.approved_per_policy, pr.age_threshold}.
+      3. STRICT: the repo's effective merge_policy is ``strict`` (never a
+         ``never`` repo, whose approved_per_policy also Skips).
+      4. AUTHOR GATE: author ∈ (policy.bots ∪ approve_authors).
+      5. NOT SELF: author != viewer login (GitHub blocks self-approval).
+      6. MAINTAINER: viewer holds write/maintain/admin on the repo.
+
+    A failing gate records a legible WARNING reason and returns False.
+    """
+    # Gate 2: sole gate. A Fail is fatal (pr_result.passed is False), and
+    # every intrinsic skip must be an approvable one.
+    if not pr_result.passed:
+        return False
+    if not intrinsic_pr_skips:
+        # Shouldn't happen in the non-eligible branch, but be defensive.
+        return False
+    if any(name not in _APPROVABLE_SKIP_NAMES for name, _ in intrinsic_pr_skips):
+        return False
+
+    effective = policy_for(policy, slug)
+    # Gate 3: strict only. A ``never`` repo's approved_per_policy Skips for
+    # the opposite reason and must NEVER be auto-approved.
+    if effective.merge_policy != "strict":
+        return False
+
+    # Gate 4: author must be a configured bot or an explicitly whitelisted
+    # non-bot login.
+    if pr.author not in policy.bots and pr.author not in approve_authors:
+        return False
+
+    # Gate 5: never auto-approve a PR the viewer authored (GitHub 422).
+    if viewer_login is None or pr.author == viewer_login:
+        return False
+
+    # Gate 6: maintainer permission check (one extra gh call per candidate).
+    try:
+        permission = gh.viewer_repo_permission(slug)
+    except GHError as e:
+        rs.record_error(
+            f"--approve: permission check failed for {slug}#{pr.number}; "
+            f"not auto-approving: {e}",
+            level="WARNING",
+            context={"slug": slug, "pr": pr.number, "error": str(e)},
+        )
+        return False
+    if permission not in _APPROVE_PERMISSIONS:
+        rs.record_error(
+            f"--approve: viewer permission {permission!r} on {slug} is "
+            f"insufficient (need write/maintain/admin); not auto-approving "
+            f"{slug}#{pr.number}",
+            level="WARNING",
+            context={"slug": slug, "pr": pr.number, "permission": permission},
+        )
+        return False
+
+    return True
 
 
 # ─── Public handler ───────────────────────────────────────────────────────
@@ -423,9 +525,33 @@ def _run_under_lock(
     prs_by_repo, prs_excluded = apply_pr_filters(prs_by_repo, spec)
     filter_line = filter_summary_line(spec, repos_excluded, prs_excluded)
 
+    # --approve setup (node aprmn5kq). Only meaningful when --approve is
+    # set; otherwise behavior is unchanged. The viewer login is needed
+    # for the NOT-SELF gate (GitHub rejects self-approval). approve_authors
+    # widens the bots-only default with explicit non-bot logins.
+    viewer_login: str | None = None
+    approve_authors: frozenset[str] = frozenset(args.approve_author or [])
+    if args.approve:
+        try:
+            viewer_login = gh.authenticated_user().get("login")
+        except GHError as e:
+            # Without the viewer login the NOT-SELF gate can't be enforced,
+            # so we disable auto-approval rather than risk a self-approval
+            # 422 (or worse). A WARNING makes the degradation legible.
+            rs.record_error(
+                f"--approve: could not resolve authenticated user; "
+                f"auto-approval disabled this run: {e}",
+                level="WARNING",
+            )
+            viewer_login = None
+
     # PER_PR invariants → eligible_prs.
     eligible_prs: list[tuple[str, PRInfo]] = []
     pr_skips_by_repo: dict[str, list[dict]] = {}
+    # Candidates promoted to mergeable solely by an --approve auto-approval.
+    # Each is a non-eligible PR whose ONLY blockers are the approval gate
+    # (and the age that cascades from it). See _classify_auto_approvable.
+    auto_approvable_prs: list[tuple[str, PRInfo]] = []
     for repo in passing_repos:
         ctx_repo = replace(ctx_base, repo=repo)
         repo_prs = prs_by_repo.get(repo.slug, [])
@@ -453,6 +579,18 @@ def _run_under_lock(
                         "fail_reason": pr_result.fail_reason,
                     }
                 )
+                if args.approve and _classify_auto_approvable(
+                    policy,
+                    repo.slug,
+                    pr,
+                    pr_result,
+                    intrinsic_pr_skips,
+                    viewer_login,
+                    approve_authors,
+                    gh,
+                    rs,
+                ):
+                    auto_approvable_prs.append((repo.slug, pr))
 
     # One-merge-per-repo-per-run guardrail. Same-repo PRs targeting the
     # same base can have domino effects on each other: merging A often
@@ -463,16 +601,42 @@ def _run_under_lock(
     # gitbulk run, when GitHub has settled mergeable_state and any stale
     # approvals have been dismissed for real. Tie-break: lowest PR number
     # wins (oldest, most likely to have been ready longest).
-    eligible_prs.sort(key=lambda t: (t[0], t[1].number))
+    #
+    # The candidate set is the UNION of already-eligible PRs and any
+    # --approve auto-approvable PRs (node aprmn5kq): the guardrail picks
+    # ONE primary per repo across both kinds, so a non-primary auto-
+    # approvable candidate is deferred and must NOT be approved.
+    auto_approve_keys = {(slug, pr.number) for slug, pr in auto_approvable_prs}
+    candidate_prs = eligible_prs + auto_approvable_prs
+    candidate_prs.sort(key=lambda t: (t[0], t[1].number))
     seen_slugs: set[str] = set()
     primary_eligible_prs: list[tuple[str, PRInfo]] = []
     deferred_prs: list[tuple[str, PRInfo]] = []
-    for slug, pr in eligible_prs:
+    for slug, pr in candidate_prs:
         if slug in seen_slugs:
             deferred_prs.append((slug, pr))
         else:
             seen_slugs.add(slug)
             primary_eligible_prs.append((slug, pr))
+    # Which PRIMARY PRs got there only via auto-approval (need approve+merge).
+    primary_auto_approve_keys = {
+        (slug, pr.number)
+        for slug, pr in primary_eligible_prs
+        if (slug, pr.number) in auto_approve_keys
+    }
+    # Auto-approvable PRs were recorded as non-eligible skips during the
+    # PER_PR loop (their approved_per_policy/age_threshold Skips). Now that
+    # they are promoted to candidates, drop those skip records so state.yaml
+    # lists each such PR once (as an actionable PR), not also as a skip — and
+    # so the auto-approval doesn't masquerade as an outstanding skip.
+    if auto_approve_keys:
+        for slug, _pr in auto_approvable_prs:
+            records = pr_skips_by_repo.get(slug)
+            if records:
+                pr_skips_by_repo[slug] = [
+                    r for r in records
+                    if (slug, r["number"]) not in auto_approve_keys
+                ]
 
     # DRY-RUN GATE.
     if not args.apply:
@@ -487,6 +651,7 @@ def _run_under_lock(
             deferred_prs=deferred_prs,
             skipped_entries=skipped_entries,
             filter_line=filter_line,
+            auto_approve_keys=primary_auto_approve_keys,
         )
         rs.write_summary(summary_md)
         if skipped_repos or skipped_entries:
@@ -539,8 +704,55 @@ def _run_under_lock(
     # ── --apply path ──
     merge_results: list[dict] = []
     failure_count = 0
+    auto_approved_keys: set[tuple[str, int]] = set()
     for slug, pr in primary_eligible_prs:
         method = policy_for(policy, slug).merge_method
+        # --approve (node aprmn5kq): for a primary that only got here via
+        # auto-approval, post the approving review FIRST. A successful
+        # approval deterministically satisfies approved_per_policy and
+        # bypasses age — we do NOT re-fetch. On approve failure we record
+        # an error and skip the merge for this PR.
+        if (slug, pr.number) in primary_auto_approve_keys:
+            try:
+                gh.approve_pr(
+                    slug,
+                    pr.number,
+                    body="Auto-approved by gitbulk (merge --approve).",
+                )
+            except GHError as e:
+                failure_count += 1
+                rs.record_error(
+                    f"approve_pr failed for {slug}#{pr.number}; not merging: {e}",
+                    level="ERROR",
+                    context={"slug": slug, "pr": pr.number, "error": str(e)},
+                )
+                merge_results.append(
+                    {
+                        "slug": slug,
+                        "number": pr.number,
+                        "title": pr.title,
+                        "url": pr.url,
+                        "head_sha": pr.head_sha,
+                        "merged": False,
+                        "error": f"auto-approve failed: {e}",
+                        "method": method,
+                        "auto_approved": False,
+                    }
+                )
+                continue
+            auto_approved_keys.add((slug, pr.number))
+            # AUDIT (node aprmn5kq): each auto-approval must be legible
+            # afterward — it collapses the human review step.
+            rs.record_error(
+                f"{slug}#{pr.number} auto-approved by --approve",
+                level="WARNING",
+                context={
+                    "slug": slug,
+                    "pr": pr.number,
+                    "action": "auto-approved",
+                    "author": pr.author,
+                },
+            )
         try:
             response = gh.merge_pr(
                 slug,
@@ -569,6 +781,7 @@ def _run_under_lock(
                     "merged": False,
                     "error": str(e),
                     "method": method,
+                    "auto_approved": (slug, pr.number) in auto_approved_keys,
                 }
             )
             # CONTINUE — the other PRs still deserve a shot. A single
@@ -597,6 +810,7 @@ def _run_under_lock(
                 "merged": True,
                 "method": method,
                 "response": response,
+                "auto_approved": (slug, pr.number) in auto_approved_keys,
             }
         )
 
@@ -645,6 +859,7 @@ def _run_under_lock(
         deferred_prs=deferred_prs,
         skipped_entries=skipped_entries,
         filter_line=filter_line,
+        auto_approve_keys=primary_auto_approve_keys,
     )
     rs.write_summary(summary_md)
 

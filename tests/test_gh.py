@@ -483,3 +483,87 @@ def test_gherror_carries_command_attribute():
 def test_gherror_command_defaults_to_none():
     err = GHError("oops")
     assert err.command is None
+
+
+# ─── FakeGHClient.approve_pr (node aprmn5kq) ───────────────────────────────
+
+
+def test_approve_pr_records_call_and_returns_response():
+    fake = FakeGHClient(approve_responses={("a/b", 7): {"approved": True}})
+    result = fake.approve_pr("a/b", 7)
+    assert result == {"approved": True}
+    assert fake.call_count["approve_pr"] == 1
+    assert fake.approve_calls == [
+        {"slug": "a/b", "number": 7, "body": None, "timeout": None}
+    ]
+
+
+def test_approve_pr_records_body_and_timeout():
+    fake = FakeGHClient(approve_responses={("a/b", 7): {}})
+    fake.approve_pr("a/b", 7, body="LGTM", timeout=5.0)
+    assert fake.approve_calls[0]["body"] == "LGTM"
+    assert fake.approve_calls[0]["timeout"] == 5.0
+
+
+def test_approve_pr_response_is_a_copy():
+    payload = {"approved": True}
+    fake = FakeGHClient(approve_responses={("a/b", 7): payload})
+    result = fake.approve_pr("a/b", 7)
+    result["mutated"] = 1
+    assert "mutated" not in payload
+
+
+def test_approve_pr_raises_when_no_responses_dict():
+    fake = FakeGHClient()
+    with pytest.raises(GHError, match="approve_pr"):
+        fake.approve_pr("a/b", 7)
+    # Counter still bumped (mirrors merge_pr).
+    assert fake.call_count["approve_pr"] == 1
+
+
+def test_approve_pr_raises_when_pair_unknown():
+    fake = FakeGHClient(approve_responses={("a/b", 1): {}})
+    with pytest.raises(GHError, match="approve_pr"):
+        fake.approve_pr("a/b", 99)
+
+
+def test_approve_pr_propagates_configured_exception():
+    boom = GHError("422 self-approval")
+    fake = FakeGHClient(approve_responses={("a/b", 7): boom})
+    with pytest.raises(GHError, match="self-approval"):
+        fake.approve_pr("a/b", 7)
+
+
+# ─── FakeGHClient.viewer_repo_permission (node aprmn5kq) ───────────────────
+
+
+def test_viewer_repo_permission_returns_configured_value():
+    fake = FakeGHClient(repo_permissions={"a/b": "maintain"})
+    assert fake.viewer_repo_permission("a/b") == "maintain"
+    assert fake.call_count["viewer_repo_permission"] == 1
+
+
+def test_viewer_repo_permission_records_calls():
+    fake = FakeGHClient(repo_permissions={"a/b": "admin"})
+    fake.viewer_repo_permission("a/b", timeout=3.0)
+    assert fake.viewer_repo_permission_calls == [
+        {"slug": "a/b", "timeout": 3.0}
+    ]
+
+
+def test_viewer_repo_permission_raises_when_unconfigured():
+    fake = FakeGHClient()
+    with pytest.raises(GHError, match="viewer_repo_permission"):
+        fake.viewer_repo_permission("a/b")
+    assert fake.call_count["viewer_repo_permission"] == 1
+
+
+def test_viewer_repo_permission_raises_when_slug_unknown():
+    fake = FakeGHClient(repo_permissions={"a/b": "write"})
+    with pytest.raises(GHError, match="viewer_repo_permission"):
+        fake.viewer_repo_permission("c/d")
+
+
+def test_fake_satisfies_protocol_with_new_methods():
+    fake = FakeGHClient()
+    assert isinstance(fake, GHClient)

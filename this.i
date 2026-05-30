@@ -510,6 +510,67 @@ Gitbulk Triage Tool = goal:
         mental model).
       approved-by: daniel, 2026-05-28
 
+    Maintainer Auto-Approve On Merge = decision:
+      id: aprmn5kq
+      why: >
+        Problem surfaced by a 2026-05-30 smoke test against a green
+        Dependabot PR (provenant-dev/origin-sip-policy-lib#15): under the
+        default ``strict`` merge_policy, ``pr.approved_per_policy`` requires
+        an APPROVED review, so a perfectly green bot PR NEVER auto-merges —
+        a maintainer must click "approve" by hand, forever. The user asked
+        for a command-line switch that supplies that approval programmatically
+        when they are a maintainer and everything else already passes.
+
+        Decision: a ``--approve`` flag on ``merge``. On the ``--apply`` path,
+        for a candidate PR whose ONLY merge-chain blockers are
+        ``pr.approved_per_policy`` (strict-needs-APPROVED) and the cascading
+        ``pr.age_threshold``, gitbulk posts an approving review AS THE USER
+        (``gh pr review --approve``) and then merges. Because that approval is
+        real, the existing age bypass (node kjyfc4m5) collapses the
+        3-business-day cooling-off — the user chose "approve ⇒ merge now"
+        (2026-05-30) over "approve but still wait", since an explicit approval
+        is exactly the human signal the wait exists for.
+
+        Scope is deliberately narrow — auto-approval is the strongest single
+        action gitbulk takes, so it must be hard to fire by accident:
+          (a) AUTHOR GATE. Auto-approve only PRs whose author is a configured
+              bot (``policy.bots`` — Dependabot et al.), the safe default the
+              user named ("without [a filter], only dependabot"). A repeatable
+              ``--approve-author LOGIN`` flag explicitly whitelists specific
+              NON-bot logins; absent it, non-bot PRs are never auto-approved
+              (no silent rubber-stamping of human work the maintainer hasn't
+              read). This is the "cmdline filter arg that clarifies scope" the
+              user asked for.
+          (b) NOT SELF. Never auto-approve a PR the viewer authored — GitHub
+              rejects self-approval (422) and it would be meaningless. (Bots
+              are never the viewer, so this only matters for --approve-author.)
+          (c) MAINTAINER. The viewer must hold write/maintain/admin permission
+              on the repo (the "if I'm a maintainer" condition), checked via
+              the repo permissions API (a new gh client method).
+          (d) SOLE GATE + STRICT. Every other invariant must already PASS, and
+              the repo's effective merge_policy must be ``strict`` — NEVER
+              auto-approve a ``never`` repo (whose approved_per_policy also
+              Skips, but for the opposite reason).
+        Requires ``--apply``; in dry-run it posts NOTHING and only reports what
+        it WOULD approve+merge. Each auto-approval is recorded prominently in
+        run state and invariants.log — it collapses the human review step on
+        the user's behalf, so it must be legible after the fact.
+
+        Why a per-invocation FLAG rather than a merge_policy value: auto-approval
+        is a maintainer's act of trust at a moment in time ("I choose to
+        rubber-stamp this class of PR on this run"), not standing config. A flag
+        keeps it off by default and out of unattended cron unless the cron line
+        opts in explicitly. Rejected: (1) an ``auto-approve`` merge_policy (too
+        easy to leave on); (2) approving every fetched PR (would rubber-stamp
+        unread human PRs — hence bots-only default + explicit per-login widen);
+        (3) re-fetching review_decision after approving (needless round-trip — a
+        successful approve deterministically makes approved_per_policy and
+        age_threshold Pass, so the PR is promoted to eligible in-process). New
+        gh client methods required: approve a PR, and read the viewer's repo
+        permission. Composes with ``--author`` (fetch scope) and the
+        one-merge-per-repo guardrail (node 2vqp4nk6 family).
+      approved-by: daniel, 2026-05-30
+
     Unresolved Thread Burden Configurable Default Author = decision:
       id: hj3nq5kp
       why: >

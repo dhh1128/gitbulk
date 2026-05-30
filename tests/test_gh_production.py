@@ -1783,3 +1783,149 @@ def test_prefetch_tolerates_non_string_branch_name():
         client = ProductionGHClient()
         client.prefetch_default_branches(["a/x", "a/y"])
     assert client._default_branch_cache == {}
+
+
+# ─── approve_pr (node aprmn5kq) ────────────────────────────────────────────
+
+
+def test_approve_pr_default_argv():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=""))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        result = client.approve_pr("dhh1128/gitbulk", 15)
+    assert result == {}
+    args, _ = mock_run.call_args
+    assert args[0] == [
+        "gh",
+        "pr",
+        "review",
+        "15",
+        "--repo",
+        "dhh1128/gitbulk",
+        "--approve",
+    ]
+
+
+def test_approve_pr_includes_body_when_given():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=""))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.approve_pr("a/b", 1, body="auto-approved by gitbulk")
+    args, _ = mock_run.call_args
+    assert args[0] == [
+        "gh",
+        "pr",
+        "review",
+        "1",
+        "--repo",
+        "a/b",
+        "--approve",
+        "--body",
+        "auto-approved by gitbulk",
+    ]
+
+
+def test_approve_pr_parses_json_when_present():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout='{"state":"APPROVED"}'))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        result = client.approve_pr("a/b", 1)
+    assert result == {"state": "APPROVED"}
+
+
+def test_approve_pr_returns_stdout_on_unparseable():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout="Approved pull request #1\n"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        result = client.approve_pr("a/b", 1)
+    assert result == {"stdout": "Approved pull request #1"}
+
+
+def test_approve_pr_raises_on_self_approval():
+    """GitHub returns 422 on self-approval; non-retryable stderr → GHError."""
+    side_effect = _make_run_mock(
+        _CompletedFake(1, stderr="422 Can not approve your own pull request")
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        with patch("gitbulk.gh.time.sleep"):
+            client = ProductionGHClient()
+            with pytest.raises(GHError, match="approve your own"):
+                client.approve_pr("a/b", 1)
+    assert mock_run.call_count == 1
+
+
+def test_approve_pr_respects_timeout_kwarg():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=""))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.approve_pr("a/b", 1, timeout=9.0)
+    _, kwargs = mock_run.call_args
+    assert kwargs["timeout"] == 9.0
+
+
+# ─── viewer_repo_permission (node aprmn5kq) ────────────────────────────────
+
+
+def test_viewer_repo_permission_argv():
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps({"admin": False, "maintain": False,
+                                             "push": True, "triage": True,
+                                             "pull": True}))
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        result = client.viewer_repo_permission("dhh1128/gitbulk")
+    assert result == "write"
+    args, _ = mock_run.call_args
+    assert args[0] == [
+        "gh",
+        "api",
+        "repos/dhh1128/gitbulk",
+        "--jq",
+        ".permissions",
+    ]
+
+
+@pytest.mark.parametrize(
+    "perms,expected",
+    [
+        ({"admin": True, "maintain": True, "push": True, "triage": True, "pull": True}, "admin"),
+        ({"admin": False, "maintain": True, "push": True, "triage": True, "pull": True}, "maintain"),
+        ({"admin": False, "maintain": False, "push": True, "triage": True, "pull": True}, "write"),
+        ({"admin": False, "maintain": False, "push": False, "triage": True, "pull": True}, "triage"),
+        ({"admin": False, "maintain": False, "push": False, "triage": False, "pull": True}, "read"),
+        ({"admin": False, "maintain": False, "push": False, "triage": False, "pull": False}, "none"),
+        ({}, "none"),
+    ],
+)
+def test_viewer_repo_permission_mapping(perms, expected):
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(perms)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        assert client.viewer_repo_permission("a/b") == expected
+
+
+def test_viewer_repo_permission_unparseable_returns_none():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout="not json\n"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        assert client.viewer_repo_permission("a/b") == "none"
+
+
+def test_viewer_repo_permission_respects_timeout_kwarg():
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps({"pull": True}))
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.viewer_repo_permission("a/b", timeout=4.0)
+    _, kwargs = mock_run.call_args
+    assert kwargs["timeout"] == 4.0
+
+
+def test_viewer_repo_permission_non_dict_payload_returns_none():
+    """A null/non-dict .permissions payload maps to 'none'."""
+    side_effect = _make_run_mock(_CompletedFake(0, stdout="null\n"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        assert client.viewer_repo_permission("a/b") == "none"
