@@ -121,30 +121,40 @@ gitbulk show report --path         # just the run-dir path (for scripting)
 invocations, captures full stdout/stderr to a timestamped log under
 `~/.cache/gitbulk/cron/`, maintains exit-code-aware symlinks
 (`last-failure.log`, `last-attention.log`, `last-audit.log`), and prunes logs
-older than `$GITBULK_CRON_RETAIN_DAYS` (default 30). The exit code from the
-inner `gitbulk` invocation is preserved so `MAILTO` in your crontab still works.
+older than `$GITBULK_CRON_RETAIN_DAYS` (default 30). The inner `gitbulk` exit
+code is preserved as the wrapper's own exit code, and the wrapper writes its
+status line to stdout — the thing cron mails — **only** on a structural failure
+(exit 1 or an unexpected code). So `MAILTO` is a failure-only channel: routine
+"PRs need attention" nights (exit 2/3) stay quiet on email and surface through
+the `ATTENTION` sentinel instead (see
+[Surfacing attention in your shell](#surfacing-attention-in-your-shell)).
 
 Typical crontab:
 
 ```cron
-# Set MAILTO so non-zero exits actually reach you (cron's default is silent).
+# MAILTO: a structural failure (exit 1 / unexpected) emails you here; quiet
+# nights send nothing. Don't leave it UNSET — cron then mails the bare local
+# user, which a real relay (e.g. msmtp -> Gmail) rejects as an invalid address.
+# Set a real address, or MAILTO="" to disable mail entirely.
 MAILTO=you@example.com
 
-# Tell the wrapper where gitbulk lives. Pick ONE of these per line, e.g.:
+# Tell the wrapper where gitbulk lives only if it isn't on ~/.local/bin:
 #   GITBULK_BIN=/home/you/venvs/gitbulk/bin/gitbulk
-# or rely on ~/.local/bin via the wrapper's default PATH.
+# Otherwise the wrapper finds a ~/.local/bin install via its default PATH.
 
-# Nightly read-only report at 03:00. Safe to run alongside any local work;
-# exit 2 / 3 sets ~/.cache/gitbulk/ATTENTION so your shell prompt can flag it.
-0 3 * * * /home/you/code/gitbulk/bin/gitbulk-cron report
+# Read-only report at 03:00 on weekdays (Mon-Fri here; drop the `1-5` for every
+# day). Safe alongside local work; exit 2/3 refreshes ~/.cache/gitbulk/ATTENTION
+# for your shell prompt to flag.
+0 3 * * 1-5 /home/you/code/gitbulk/bin/gitbulk-cron report
 
 # Weekly Claude-assisted triage at 04:00 Mondays. Reads the latest report,
 # sends it through Claude, writes a prioritized summary.md.
 0 4 * * 1 /home/you/code/gitbulk/bin/gitbulk-cron summarize
 
 # Weekly dispatch at 05:00 Saturdays. --apply is the explicit opt-in; without
-# it the run is a dry-run that prints what it WOULD do. Per-PR worktrees live
-# under ~/.cache/gitbulk/worktrees/<runid>/ and are cleaned up automatically.
+# it the run is a dry-run that prints what it WOULD do. Create the prompt file
+# first. Per-PR worktrees live under ~/.cache/gitbulk/worktrees/<runid>/ and
+# are cleaned up automatically.
 0 5 * * 6 /home/you/code/gitbulk/bin/gitbulk-cron dispatch --apply --prompt ~/.config/gitbulk/prompts/dispatch.md
 ```
 
@@ -159,6 +169,37 @@ Exit-code semantics that drive both your inbox and the `ATTENTION` sentinel
 | 3 | At least one repo skipped by an invariant — `ATTENTION` sentinel set. |
 | 4 | Run with `--skip-check` overrides applied (audit signal only). |
 | 99 | Subcommand not yet implemented. |
+
+Email is reserved for exit 1 / unexpected. Exit 2/3 would fire almost nightly
+for a large fleet, so they don't email; they refresh the `ATTENTION` sentinel,
+which your shell prompt can surface instead.
+
+### Surfacing attention in your shell
+
+Each run writes `~/.cache/gitbulk/ATTENTION` (JSON: exit code, run id, one-line
+summary) when PRs need a look or a run failed. Add a prompt indicator that reads
+it directly — no `gitbulk` process is spawned per prompt. For bash, in
+`~/.bashrc`:
+
+```bash
+__gitbulk_attention() {
+    local f="${XDG_CACHE_HOME:-$HOME/.cache}/gitbulk/ATTENTION"
+    [ -r "$f" ] || return 0
+    local code=""
+    command -v jq >/dev/null 2>&1 && code=$(jq -r '.exit_code // empty' "$f" 2>/dev/null)
+    if [ "$code" = "1" ]; then
+        printf '%s' $'\001\e[1;31m\002✖ gitbulk\001\e[0m\002 '   # exit 1: red
+    else
+        printf '%s' $'\001\e[1;33m\002⚠ gitbulk\001\e[0m\002 '   # attention: yellow
+    fi
+}
+# Prepend once (idempotent if this file is re-sourced).
+case "$PS1" in *__gitbulk_attention*) ;; *) PS1='$(__gitbulk_attention)'"$PS1" ;; esac
+```
+
+A red `✖ gitbulk` means a structural failure (you were also emailed); a yellow
+`⚠ gitbulk` means PRs need attention. Run `gitbulk show report` for the detail
+and `gitbulk ack` to clear the sentinel once you've looked.
 
 ## Local-git safety contract
 
