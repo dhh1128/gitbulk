@@ -77,12 +77,36 @@ if ! flock -n 200; then
     exit 0
 fi
 
+# ─── Env preamble so each log is self-describing for debugging ──────────────
+
+# Written with `>` to create/truncate the log; the gitbulk output below is
+# appended with `>>`. This block must never abort the run under `set -e`
+# (e.g. an optional `gh` probe failing), so each line that could fail is
+# guarded with `|| true` and gh is gated behind a fast, network-free check.
+{
+    echo "--- gitbulk-cron preamble ---"
+    echo "started_utc: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    echo "gitbulk_bin: ${GITBULK}"
+    echo "subcommand:  ${SUBCMD}"
+    echo "argv:        $*"
+    echo "path:        ${PATH}"
+    # gh account is best-effort only: never block, never hit the network, and
+    # never fail the run. We only read an already-cached active account from
+    # `gh auth status` (which is local) and time-box it; on any error we skip.
+    if command -v gh >/dev/null 2>&1; then
+        gh_line="$(timeout 3 gh auth status 2>/dev/null | head -n 1 || true)"
+        [ -n "${gh_line}" ] && echo "gh_account:  ${gh_line}" || true
+    fi
+    echo "--- end gitbulk-cron preamble ---"
+    echo
+} >"${LOG}" 2>&1 || true
+
 # ─── Run the actual command, captured to the log ────────────────────────────
 
 # `set -e` would abort on the gitbulk failure before we can branch on rc;
-# disable it just for this call.
+# disable it just for this call. Output is APPENDED after the preamble.
 set +e
-"${GITBULK}" "$@" >"${LOG}" 2>&1
+"${GITBULK}" "$@" >>"${LOG}" 2>&1
 rc=$?
 set -e
 
@@ -106,6 +130,24 @@ find "${LOG_DIR}" -maxdepth 1 -type f -name '*.log' -mtime "+${RETAIN_DAYS}" -de
 
 # ─── One-line MAILTO-friendly status ────────────────────────────────────────
 
-echo "gitbulk-cron: ${SUBCMD} exit=${rc} log=${LOG}"
+STATUS="gitbulk-cron: ${SUBCMD} exit=${rc} log=${LOG}"
+
+# Always record the status at the end of the log so the log is self-describing
+# and states the exit code explicitly. The `>>` append must not abort the run
+# under `set -e`, hence `|| true`.
+echo "${STATUS}" >>"${LOG}" 2>&1 || true
+
+# Emit to stdout ONLY for structural failures and unexpected codes. cron mails
+# whatever a job writes to stdout, so this makes MAILTO a failure-only channel:
+# silent on clean runs (0), routine attention/skips (2|3) — which fire ~nightly
+# for a large fleet — audit-only (4), and not-implemented (99). An always-on
+# echo would also mail the bare local user (recipient '<daniel>', 553-rejected)
+# whenever MAILTO is unset. Policy node tp4kq2nr; surfaced by the live cron
+# shakedown (node shkd5crn) 2026-05-29. The email set matches the
+# last-failure.log symlink set above (exit 1 + catch-all).
+case "${rc}" in
+    0|2|3|4|99) ;;                  # quiet on stdout: no cron email
+    *)          echo "${STATUS}" ;; # exit 1 and unexpected -> stdout -> email
+esac
 
 exit ${rc}

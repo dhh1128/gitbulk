@@ -127,6 +127,27 @@ to the local-git safety contract above, where an untested fallback could
 be the branch that writes to the main clone instead of a worktree. The
 decision is recorded in `this.i` as node `cn4pk7zq`.
 
+### Unattended-mode changes get a live cron shakedown
+
+The unit suite runs in-process with a rich environment and CANNOT catch the
+failure modes that only appear when cron itself invokes the tool: a missing
+MTA silently discarding output, `gh` credentials unreachable from cron's
+scrubbed environment, a `PATH` lacking `~/.local/bin` or `git`/`gh`,
+`--config-root` defaulting to the wrong place, or the cron daemon not running.
+Any change touching the cron path — `bin/gitbulk-cron`, the exit-code/symlink
+contract, the `ATTENTION` sentinel, config-root resolution, or how a
+subcommand behaves run headless — and any move toward real cron deployment
+MUST be verified with a **live one-shot cron tick** before it is trusted:
+install a crontab line pinned to a specific minute a minute or two out
+(minute+hour+day-of-month+month, so it fires once and does not recur), run a
+read-only subcommand (`report`) first, watch it fire via the system journal,
+then study the produced artifacts (cron log, run dir, exit code, `last-*.log`
+symlink, sentinel) and remove the one-shot. Mutating subcommands graduate to
+this only after the read-only tick is clean, and dry-run before `--apply`.
+Proactively PROPOSE this shakedown whenever a change lands on the cron path —
+don't wait to be asked. Rationale and the first run (2026-05-29) are recorded
+in `this.i` node `shkd5crn` (and tension `opd3ny5k` #3).
+
 ### Sign off every commit
 
 DCO is enforced in repos this tool operates on, and the same discipline

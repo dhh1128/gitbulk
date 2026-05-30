@@ -179,6 +179,41 @@ Gitbulk Triage Tool = goal:
         attention to be safe; it must produce the same artifacts the cron
         path does.
 
+    Live Cron-Tick Shakedown Verifies Unattended-Mode Changes = decision:
+      id: shkd5crn
+      why: >
+        Any change that touches the unattended path is NOT considered
+        verified by the unit suite alone. The unit tests run in-process with
+        a rich environment and cannot reproduce the failure modes that only
+        appear when cron itself invokes the wrapper: a missing MTA silently
+        discarding output, gh credentials unreachable from cron's scrubbed
+        environment, a PATH that lacks ~/.local/bin or git/gh, config-root
+        defaulting to the wrong place, or the cron daemon not running at all.
+        The standing acceptance test for the cron path is therefore a LIVE
+        one-shot cron tick: install a crontab line pinned to a specific
+        minute a minute or two in the future (minute+hour+day-of-month+month,
+        so it fires exactly once and does not recur), run a READ-ONLY
+        subcommand (report) first, watch it fire via the system journal,
+        then study every artifact it produces (cron log, run dir, exit code,
+        the last-*.log symlink per node clip7nm4, the ATTENTION sentinel per
+        node tp4kq2nr) and remove the one-shot. Mutating subcommands graduate
+        to this only after the read-only tick is clean, and dry-run before
+        --apply (node 2vqp4nk6). Scope of "the cron path": bin/gitbulk-cron,
+        the exit-code/symlink contract, the sentinel, config-root resolution
+        under a scrubbed environment, and how any subcommand behaves run
+        headless. This shakedown was first run 2026-05-29 (see tension
+        opd3ny5k #3) and proved exactly the headless-only properties unit
+        tests cannot: config-root defaulted correctly with no --config-root
+        flag, gh auth worked from a scrubbed env, and MAILTO was silently
+        dropped for lack of an MTA. Future agents SHOULD proactively propose
+        this shakedown whenever a change lands on the cron path or before a
+        first real cron deployment; the AGENTS.md hard rule points here for
+        the why so the suggestion is spontaneous and we do not redesign the
+        verification each time. Cost: a few minutes of wall-clock and a
+        transient crontab entry — cheap relative to discovering a
+        headless-only break overnight against ~150 real repos.
+      approved-by: daniel, 2026-05-29
+
     # ─── CLI ARCHITECTURE ────────────────────────────────────────────────────
 
     Subcommand CLI Architecture = decision:
@@ -1187,6 +1222,17 @@ Gitbulk Triage Tool = goal:
         setup beyond the gh CLI the user already has. Shell-prompt or
         tmux-statusline integration consumes the ATTENTION sentinel for
         live visibility without an external service.
+
+        Channel split (implemented in bin/gitbulk-cron, conformance verified
+        by node shkd5crn 2026-05-29): MAILTO is the STRUCTURAL-FAILURE channel
+        only. The wrapper echoes its status line to stdout — which is what
+        cron mails — exclusively on exit 1 + unexpected codes; clean (0),
+        attention/skips (2|3), audit (4), and not-implemented (99) stay silent
+        on stdout (the status is still written to the log). This keeps routine
+        attention, which fires ~nightly for a large fleet, on the sentinel/
+        daily-glyph channel and reserves email for things that are actually
+        broken (consistent with tmlk5pq3's "stuck lock is a structural issue
+        surfaced via cron's failure channel, not the daily attention glyph").
 
     # ─── PHASE 1D FOLLOWUPS (adversarial review 2026-05-27) ─────────────────
 
@@ -2351,19 +2397,45 @@ Gitbulk Triage Tool = goal:
            "Bypassed rule violations" seen in push output suggest some
            protection is configured but currently bypassable.
 
-        3. REAL CRON DEPLOYMENT. README has a crontab example but it has
-           never actually been installed on the cron host. Blocked in
-           practice on #1 (a stable install to point cron at).
+        3. REAL CRON DEPLOYMENT. SHAKEDOWN DONE 2026-05-29 (node shkd5crn):
+           a live one-shot cron tick ran `gitbulk-cron report` headless and
+           the plumbing checked out — the wrapper resolved the ~/.local/bin
+           zipapp, config-root defaulted to ~/.config/gitbulk with NO
+           --config-root flag, gh auth worked from cron's scrubbed
+           environment, all four run artifacts plus the exit-2
+           last-attention.log symlink and the refreshed ATTENTION sentinel
+           were produced, and the cron daemon is confirmed running under
+           systemd. Findings, all addressed: (a) the wrapper's exit code was
+           not recorded inside the log file — fixed the same day by an env
+           preamble + exit-line tee in bin/gitbulk-cron (with a first
+           automated test for the wrapper, tests/test_cron_wrapper.py);
+           (b) no MTA on this host — RESOLVED 2026-05-29 by installing msmtp +
+           msmtp-mta relaying through Gmail/Workspace (app password,
+           ~/.msmtprc), verified end-to-end cron -> sendmail -> msmtp ->
+           inbox; a second shakedown caught that ~ is not expanded in
+           passwordeval under cron's mail-delivery context (absolute paths
+           required); (c) the wrapper echoed its status line to stdout on
+           EVERY run, so with an MTA present cron would email on clean/
+           attention runs too (and 553-reject the bare local user when MAILTO
+           is unset) — fixed to echo to stdout ONLY on exit 1 + unexpected
+           codes, bringing the wrapper into conformance with the tp4kq2nr /
+           tmlk5pq3 channel split (MAILTO = structural-failure channel;
+           ATTENTION sentinel = the daily attention channel). Verified live:
+           a report tick (exit 2) with MAILTO set now sends no email and logs
+           no 553. STILL DEFERRED: the recurring overnight crontab (report
+           nightly, then summarize, then dispatch --apply staged in), gated
+           only on creating the dispatch prompt now that the MTA is live.
 
         4. LICENSE. RESOLVED 2026-05-29 (node vn4kq7pr): Apache-2.0 LICENSE
            file added at the repo root and declared in pyproject (SPDX
            `Apache-2.0`, PEP 639).
 
-        Status: #1 and #4 are done. #2 (branch protection / CODEOWNERS)
-        and #3 (real cron deployment) remain deferred until the user
-        decides to move gitbulk from "I run it by hand" to "it runs
-        itself." #3 was originally blocked on #1 (a stable install to
-        point cron at); that prerequisite is now satisfied.
+        Status: #1 and #4 are done; #3 is shaken down (live one-shot ticks
+        2026-05-29, node shkd5crn) with the MTA now live and the failure-only
+        MAILTO policy verified — only the recurring overnight install remains,
+        gated solely on creating the dispatch prompt. #2 (branch protection /
+        CODEOWNERS) remains deferred until the user decides to move gitbulk
+        from "I run it by hand" to "it runs itself."
 
     Per-Repo Lock vs Global Exclusive Lock = tension:
       id: rlkrcn3p
