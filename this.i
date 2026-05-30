@@ -1950,6 +1950,73 @@ Gitbulk Triage Tool = goal:
       approved-by: daniel, 2026-05-28
       # was: tension mp7kn4qz (Dispatch Execution Kernel, deferred at Phase 0)
 
+    Repo-Level Dispatch Opens A PR = decision:
+      id: dsprp7kq
+      why: >
+        Some fleet work is REPO-level and has no existing PR to act on — the
+        canonical example (user request 2026-05-30): "every repo should have a
+        CODEOWNERS listing every git user with direct-push rights AND a commit
+        in the last 60 days; add the file via a PR where missing/stale." This
+        is explicitly in scope per xq4npk7r ("Local Repos Are First-Class
+        Citizens"; repos that need work no PR yet exists for). But the existing
+        ``dispatch`` (node execk7nm) is PR-CENTRIC: it iterates
+        ``my_open_prs``, creates one detached-HEAD worktree per PR head, and
+        tears it down — it cannot target a repo that has no PR, and has no
+        PR-CREATION path.
+
+        Decision: a NEW ``dispatch-repo`` subcommand (NOT a mode bolted onto
+        ``dispatch``). Rationale for a separate subcommand over a flag: the
+        invariant chain differs (no PER_PR invariants, no PR fetch), the work
+        unit differs (a repo + its default branch, not a PR head), and the
+        post-exec flow differs (push a branch + open a PR, vs. worktree
+        teardown). A ``--mode`` flag would scatter if/else through every step
+        of the dispatch handler; a sibling subcommand keeps each clean.
+
+        Pipeline (per selected repo): (1) gitbulk creates a disposable
+        worktree on a FRESH branch off ``origin/<default-branch>`` under the
+        worktree root (same safety contract as execk7nm — main clone never
+        touched; worktree path verified under the root). This requires a
+        default-branch-based worktree variant; the current ``create_worktree``
+        is PR-head-SHA only. (2) gitbulk runs a headless Claude in that
+        worktree with a PLUGGABLE ``--prompt`` (e.g. ``prompts/codeowners.md``).
+        The PROMPT owns the content logic — for CODEOWNERS it computes
+        (collaborators with push rights, via ``gh api .../collaborators``) ∩
+        (committers in the last 60 days, via ``git log --since``), writes/updates
+        the file, and commits LOCALLY. It does NOT push. (3) gitbulk inspects
+        the worktree: if there are new commits AND ``--apply``, gitbulk pushes
+        the feature branch to origin and opens a PR (``gh pr create`` — PERMITTED
+        for agents per AGENTS.md; only ``gh pr merge`` / protected-push /
+        ``repo delete`` are human-reserved) targeting the default branch. In
+        dry-run (default, node 2vqp4nk6) it reports what it WOULD push/open and
+        pushes/creates nothing. If the agent made no changes (file already
+        correct), no PR.
+
+        Division of responsibility is the safety crux: the OUTWARD, hard-to-
+        undo mutations (branch push, PR creation) are gitbulk's, gated by
+        ``--apply`` and audited in run state — NOT freeform agent actions. The
+        agent only edits + commits inside a disposable worktree. gitbulk gates
+        each repo on the viewer actually having push rights, reusing
+        ``viewer_repo_permission`` (added with aprmn5kq) as a PER_REPO
+        invariant — no point dispatching where we can't open the PR.
+
+        New gh method required: ``create_pr(slug, base, head, title, body)``.
+        Repo-set selection reuses dispatch's (repos.txt + ``--org``/``--repo``
+        filters). ENUMERATING all repos of an org/user (provenant-dev ∪ dhh1128,
+        beyond the curated repos.txt) is a SEPARATE future need (would add
+        ``list_org_repos``/``list_user_repos``) and is DEFERRED: the capability
+        is first proven on ONE repo (``dhh1128/gitbulk-sandbox`` via ``--repo``)
+        before any fleet run. Resume/idempotency: re-running is safe — a repo
+        whose file is already correct yields no PR, and an open gitbulk PR
+        should be detected to avoid duplicates (the prompt checks for an
+        existing equivalent PR/branch).
+      approved-by: >
+        PENDING — auto-proposed 2026-05-30 during an autonomous run. Daniel
+        authorized "build the CODEOWNERS dispatch capability" in the queue, but
+        the confer channel was DOWN when the specific design (subcommand name,
+        flow) was put up for confirmation, so this design has NOT been reviewed.
+        Confirm/adjust on return; the subcommand name and the
+        gitbulk-owns-push-and-PR split are the most likely points to revisit.
+
     Multiprompt Packaging Future = decision:  # resolves tension fw5kq6np
       id: mprmpkg4
       why: >
