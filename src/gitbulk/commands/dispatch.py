@@ -86,6 +86,7 @@ from gitbulk.locks import LockTimeoutError, global_lock
 from gitbulk.pr_info import PRInfo
 from gitbulk.runstate import RunState
 from gitbulk.util.progress import Progress
+from gitbulk.util.style import error_line
 from gitbulk import subcommands as subcommands_mod
 from gitbulk.worktree import (
     WorktreeError,
@@ -343,7 +344,7 @@ def dispatch_handler(args: argparse.Namespace) -> int:
     # and the lock-protected pipeline.
     prompt_path, err = _validate_prompt(args)
     if err is not None:
-        print(f"gitbulk dispatch: {err}", file=sys.stderr)
+        print(error_line(f"gitbulk dispatch: {err}"), file=sys.stderr)
         return EXIT_STRUCTURAL_FAILURE
     assert prompt_path is not None  # narrowed by _validate_prompt contract
 
@@ -359,7 +360,7 @@ def dispatch_handler(args: argparse.Namespace) -> int:
             )
     except LockTimeoutError as e:
         print(
-            f"gitbulk dispatch: timed out acquiring lock: {e}",
+            error_line(f"gitbulk dispatch: timed out acquiring lock: {e}"),
             file=sys.stderr,
         )
         return EXIT_STRUCTURAL_FAILURE

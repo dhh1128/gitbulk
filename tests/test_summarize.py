@@ -252,6 +252,37 @@ def test_summarize_happy_no_top_attention_returns_ok(
     assert "schema_version" in fake_claude.last_call["input_text"]
 
 
+def test_summarize_summary_line_colorized_under_force_color(
+    monkeypatch, isolated_xdg, write_policy, fake_report_run, capsys
+):
+    """End-to-end wiring proof: with FORCE_COLOR the success summary line
+    carries the green outcome color on stdout (summary_line is reached
+    with the right exit code). The glyph character itself (✓ vs ASCII
+    fallback) is encoding-dependent and covered in test_style; here we
+    assert only the deterministic color escapes plus the message."""
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    write_policy()
+    fake_report_run({"schema_version": 1, "repos": {}})
+    fake_claude = FakeClaudeClient(
+        lambda prompt, input_text: (
+            "## TOP ATTENTION\n"
+            "Nothing requires attention today.\n"
+            "## BACKBURNER\n"
+            "## CLEAN\n"
+            "5 PRs are clean.\n"
+        )
+    )
+    _inject_fake_claude(monkeypatch, fake_claude)
+
+    rc = summarize_handler(_make_args())
+    out = capsys.readouterr().out
+    assert rc == EXIT_OK
+    assert "\033[32m" in out  # green (ok) outcome
+    assert "\033[0m" in out
+    assert "nothing requires attention" in out
+
+
 def test_summarize_top_attention_sets_sentinel_and_exits_2(
     monkeypatch, isolated_xdg, write_policy, fake_report_run
 ):

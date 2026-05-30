@@ -395,6 +395,37 @@ def test_config_error_prints_clean_message_no_stack_trace(
     assert err.startswith("gitbulk report:")
 
 
+def test_config_error_colorized_under_force_color(monkeypatch, capsys, tmp_path):
+    """End-to-end wiring proof: with FORCE_COLOR set, the top-level
+    ConfigError handler paints its stderr message red via error_line."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-such-config"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    rc = main(["report"])
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    err = capsys.readouterr().err
+    assert "\033[31m" in err  # red
+    assert "\033[0m" in err   # reset
+    assert "repos.txt not found" in err
+
+
+def test_no_color_overrides_force_color_end_to_end(monkeypatch, capsys, tmp_path):
+    """NO_COLOR outranks FORCE_COLOR even on the error path, and the
+    emitted line stays byte-clean (no escapes) for downstream parsers —
+    the backward-compatibility guarantee, exercised through main()."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "no-such-config"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.setenv("NO_COLOR", "1")
+    rc = main(["report"])
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    err = capsys.readouterr().err
+    assert "\033[" not in err
+    assert err.startswith("gitbulk report:")
+    assert "repos.txt not found" in err
+
+
 def test_not_implemented_handler_returns_99():
     """No subcommand is a stub anymore, but _not_implemented remains as
     the fallback for any future KNOWN subcommand added without a handler.

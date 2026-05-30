@@ -26,6 +26,7 @@ from pathlib import Path
 from gitbulk import paths
 from gitbulk.locks import LockTimeoutError, global_lock
 from gitbulk.subcommands import NAMES
+from gitbulk.util.style import error_line
 
 # Exit codes — duplicated here (instead of importing from cli.py) so the
 # cli → commands dep stays one-way (same pattern as report.py).
@@ -99,8 +100,10 @@ def _emit_for_subcommand(subcommand: str, artifact: str) -> int:
     """Print the requested artifact for ``subcommand``'s latest run."""
     if subcommand not in NAMES:
         print(
-            f"gitbulk show: unknown subcommand {subcommand!r}; "
-            f"expected one of {', '.join(sorted(NAMES))}",
+            error_line(
+                f"gitbulk show: unknown subcommand {subcommand!r}; "
+                f"expected one of {', '.join(sorted(NAMES))}"
+            ),
             file=sys.stderr,
         )
         return EXIT_STRUCTURAL_FAILURE
@@ -108,8 +111,10 @@ def _emit_for_subcommand(subcommand: str, artifact: str) -> int:
     run_dir = _resolve_latest_run_dir(subcommand)
     if run_dir is None:
         print(
-            f"gitbulk show: no {subcommand} runs yet "
-            f"(missing {paths.latest_run_symlink(subcommand)}).",
+            error_line(
+                f"gitbulk show: no {subcommand} runs yet "
+                f"(missing {paths.latest_run_symlink(subcommand)})."
+            ),
             file=sys.stderr,
         )
         return EXIT_STRUCTURAL_FAILURE
@@ -122,8 +127,10 @@ def _emit_for_subcommand(subcommand: str, artifact: str) -> int:
     target = run_dir / filename
     if not target.exists():
         print(
-            f"gitbulk show: no {filename} for the latest {subcommand} run "
-            f"(checked {target}).",
+            error_line(
+                f"gitbulk show: no {filename} for the latest {subcommand} run "
+                f"(checked {target})."
+            ),
             file=sys.stderr,
         )
         return EXIT_STRUCTURAL_FAILURE
@@ -153,7 +160,7 @@ def show_handler(args: argparse.Namespace) -> int:
             return _emit_for_subcommand(sub, artifact)
     except LockTimeoutError as e:
         print(
-            f"gitbulk show: timed out acquiring lock: {e}",
+            error_line(f"gitbulk show: timed out acquiring lock: {e}"),
             file=sys.stderr,
         )
         return EXIT_STRUCTURAL_FAILURE

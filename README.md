@@ -115,6 +115,29 @@ gitbulk show report --manifest     # manifest.yaml (argv, config snapshot)
 gitbulk show report --path         # just the run-dir path (for scripting)
 ```
 
+## Output and color
+
+gitbulk colorizes its summary and error lines with a semantic outcome
+marker — green `✓` for a clean run, yellow `⚠` when something needs
+attention, red `✗`/red text for errors. Color is purely emphasis: it is
+auto-suppressed whenever it would be noise or corruption, so piped and
+redirected output is byte-identical to a no-color run and safe to parse.
+
+Resolution is per stream (stdout and stderr independently), in this
+precedence:
+
+| Signal | Effect |
+| --- | --- |
+| `NO_COLOR` set (any value) | force **off** — the [no-color.org](https://no-color.org) standard; wins over `FORCE_COLOR` |
+| `FORCE_COLOR` / `CLICOLOR_FORCE` set | force **on**, even when piped (e.g. `… \| less -R`) |
+| `TERM=dumb` | off |
+| stream is a TTY | on, else off |
+
+There is no `--color` flag; the environment variables cover the cases:
+`NO_COLOR=1 gitbulk report` to disable, `FORCE_COLOR=1 gitbulk report | tee run.log`
+to keep color through a pipe. Status glyphs fall back to ASCII
+(`[ok] [!] [x]`) on terminals whose encoding can't render Unicode.
+
 ## Running from cron
 
 `bin/gitbulk-cron` is the recommended cron entry point: it serializes overlapping

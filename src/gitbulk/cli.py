@@ -13,6 +13,7 @@ import sys
 
 from gitbulk import __version__
 from gitbulk.subcommands import KNOWN, Subcommand  # noqa: F401  (Subcommand re-export)
+from gitbulk.util.style import error_line
 
 EXIT_OK = 0
 EXIT_STRUCTURAL_FAILURE = 1
@@ -874,7 +875,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         exit_code = args.handler(args)
     except _ConfigError as e:
-        print(f"gitbulk {args.subcommand}: {e}", file=sys.stderr)
+        print(error_line(f"gitbulk {args.subcommand}: {e}"), file=sys.stderr)
         return EXIT_STRUCTURAL_FAILURE
     _maybe_set_attention(exit_code, args.subcommand)
     return exit_code

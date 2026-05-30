@@ -1295,6 +1295,58 @@ Gitbulk Triage Tool = goal:
         broken (consistent with tmlk5pq3's "stuck lock is a structural issue
         surfaced via cron's failure channel, not the daily attention glyph").
 
+    Semantic Terminal Color And Glyphs = decision:
+      id: clr7sgqm
+      why: >
+        gitbulk's summary and error lines are colorized with a semantic
+        outcome marker (green ✓ clean, yellow ⚠ attention, red ✗/red text
+        error) so a human scanning a ~150-repo run can spot the one thing
+        that needs attention. Added 2026-05-30; lives in
+        src/gitbulk/util/style.py with the per-command wiring at each
+        summary/error print site.
+
+        Design rules locked here:
+
+          - SEMANTIC, NOT DECORATIVE. Every style maps to a meaning, and
+            the outcome category is derived from the run's exit code via
+            outcome_for_exit_code() — the SAME classification that drives
+            the ATTENTION sentinel and exit-code channel (node tp4kq2nr).
+            Color never introduces information; disabling it only ever
+            hides emphasis. The exit-code→category map duplicates the
+            EXIT_* integers (which each command module already copies) to
+            keep style.py free of a cli import that would cycle; the drift
+            guard is test_style.test_exit_code_map_matches_cli_constants.
+
+          - TWO INDEPENDENT GATES. Color (ANSI) and Unicode (glyph vs.
+            ASCII fallback [ok]/[!]/[x]) are resolved separately, per
+            stream, because their failure modes are independent (a dumb
+            terminal or a redirected file may take UTF-8 but not ANSI, and
+            vice-versa).
+
+          - EMPHASIS GLYPHS ARE COLOR-GATED. The ✓/⚠/✗ marker appears only
+            when color is on, so with color off a summary line is
+            byte-identical to the pre-color era and any downstream parser
+            of gitbulk's stdout keeps working. This preserves the cron
+            channel-split in tp4kq2nr: the mailed stdout status line stays
+            clean.
+
+          - ENV-VARS ONLY, NO --color FLAG. Precedence (highest first):
+            NO_COLOR present (any value) → off; FORCE_COLOR/CLICOLOR_FORCE
+            → on; TERM=dumb → off; stream.isatty(). NO_COLOR deliberately
+            outranks FORCE_COLOR: it is an accessibility/environment
+            opt-out and is treated as the strongest signal, while
+            FORCE_COLOR's job is only to beat the isatty check when piping
+            (e.g. into `less -R`). A --color flag was rejected to avoid
+            threading a global option through every argparse subparser for
+            no capability the env vars don't already provide.
+
+        Scope of the first cut (this commit): the per-command run summary
+        lines and the error/lock-timeout/ConfigError stderr paths. The
+        diagnostic logger stays plain (it is mailed by cron — ANSI would be
+        noise). Glyphs in dense listings and column alignment in
+        `show`/`invariants` are a deliberate later layer that reuses the
+        same two-gate Style without rework.
+
     # ─── PHASE 1D FOLLOWUPS (adversarial review 2026-05-27) ─────────────────
 
     Phase 2 CLI Lock Timeout Policy = decision:

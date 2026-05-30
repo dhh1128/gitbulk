@@ -64,6 +64,7 @@ from gitbulk.rebase import (
 )
 from gitbulk.runstate import RunState
 from gitbulk.util.progress import Progress
+from gitbulk.util.style import error_line, summary_line
 from gitbulk.worktree import (
     WorktreeError,
     create_worktree,
@@ -213,7 +214,7 @@ def rebase_pr_handler(args: argparse.Namespace) -> int:
             )
     except LockTimeoutError as e:
         print(
-            f"gitbulk rebase-pr: timed out acquiring lock: {e}",
+            error_line(f"gitbulk rebase-pr: timed out acquiring lock: {e}"),
             file=sys.stderr,
         )
         return EXIT_STRUCTURAL_FAILURE
@@ -680,7 +681,7 @@ def _finish(
         sentinel.set_attention(exit_code, "rebase-pr", runid, summary)
 
     rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
-    print(f"gitbulk rebase-pr: {summary}. View: gitbulk show rebase-pr")
+    print(summary_line(f"gitbulk rebase-pr: {summary}. View: gitbulk show rebase-pr", exit_code))
     return exit_code
 
 

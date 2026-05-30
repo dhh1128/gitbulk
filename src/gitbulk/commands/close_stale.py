@@ -58,6 +58,7 @@ from gitbulk.locks import LockTimeoutError, global_lock
 from gitbulk.pr_info import PRComment, PRInfo
 from gitbulk.runstate import RunState
 from gitbulk.util.progress import Progress
+from gitbulk.util.style import error_line, summary_line
 from gitbulk import subcommands as subcommands_mod
 
 # Exit codes — duplicated here (instead of importing from cli.py) so
@@ -264,7 +265,7 @@ def close_stale_handler(args: argparse.Namespace) -> int:
             )
     except LockTimeoutError as e:
         print(
-            f"gitbulk close-stale: timed out acquiring lock: {e}",
+            error_line(f"gitbulk close-stale: timed out acquiring lock: {e}"),
             file=sys.stderr,
         )
         return EXIT_STRUCTURAL_FAILURE
@@ -783,7 +784,7 @@ def _finish(
     rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
 
     # One-line stdout summary; see report._finish for the rationale.
-    print(f"gitbulk close-stale: {summary}. View: gitbulk show close-stale")
+    print(summary_line(f"gitbulk close-stale: {summary}. View: gitbulk show close-stale", exit_code))
     return exit_code
 
 

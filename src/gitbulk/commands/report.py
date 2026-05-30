@@ -64,6 +64,7 @@ from gitbulk.org_members_cache import refresh_cache
 from gitbulk.pr_info import CheckRun, PRInfo
 from gitbulk.runstate import RunState
 from gitbulk.util.progress import Progress
+from gitbulk.util.style import error_line, summary_line
 from gitbulk.watchdog_ack import load_acked, record_ack
 from gitbulk import subcommands as subcommands_mod
 
@@ -537,7 +538,7 @@ def report_handler(args: argparse.Namespace) -> int:
             )
     except LockTimeoutError as e:
         print(
-            f"gitbulk report: timed out acquiring lock: {e}",
+            error_line(f"gitbulk report: timed out acquiring lock: {e}"),
             file=sys.stderr,
         )
         return EXIT_STRUCTURAL_FAILURE
@@ -912,7 +913,7 @@ def _finish(
     # report produces no stdout — the user has to know to look at
     # ~/.cache/gitbulk/runs/latest-report/ on their own. Form is
     # deliberately terse: one line summary + how to read more.
-    print(f"gitbulk report: {summary}. View: gitbulk show report")
+    print(summary_line(f"gitbulk report: {summary}. View: gitbulk show report", exit_code))
     return exit_code
 
 

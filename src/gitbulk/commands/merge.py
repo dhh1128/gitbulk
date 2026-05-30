@@ -56,6 +56,7 @@ from gitbulk.locks import LockTimeoutError, global_lock
 from gitbulk.pr_info import PRInfo
 from gitbulk.runstate import RunState
 from gitbulk.util.progress import Progress
+from gitbulk.util.style import error_line, summary_line
 from gitbulk import subcommands as subcommands_mod
 
 # Exit codes — duplicated here (instead of importing from cli.py) so
@@ -384,7 +385,7 @@ def merge_handler(args: argparse.Namespace) -> int:
             )
     except LockTimeoutError as e:
         print(
-            f"gitbulk merge: timed out acquiring lock: {e}",
+            error_line(f"gitbulk merge: timed out acquiring lock: {e}"),
             file=sys.stderr,
         )
         return EXIT_STRUCTURAL_FAILURE
@@ -997,7 +998,7 @@ def _finish(
     # One-line stdout summary so the user knows what happened without
     # having to know about ~/.cache/gitbulk/runs/. See report._finish
     # for the rationale.
-    print(f"gitbulk merge: {summary}. View: gitbulk show merge")
+    print(summary_line(f"gitbulk merge: {summary}. View: gitbulk show merge", exit_code))
     return exit_code
 
 

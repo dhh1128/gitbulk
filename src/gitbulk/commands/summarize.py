@@ -47,6 +47,7 @@ from gitbulk.claude import ClaudeError, ProductionClaudeClient
 from gitbulk.config.policy import Policy, load_policy
 from gitbulk.locks import LockTimeoutError, global_lock
 from gitbulk.runstate import RunState
+from gitbulk.util.style import error_line, summary_line
 
 EXIT_OK = 0
 EXIT_STRUCTURAL_FAILURE = 1
@@ -138,8 +139,10 @@ def summarize_handler(args: argparse.Namespace) -> int:
     latest_report = paths.latest_run_symlink("report")
     if not latest_report.exists():
         print(
-            "gitbulk summarize: no `gitbulk report` run found. "
-            "Run `gitbulk report` first.",
+            error_line(
+                "gitbulk summarize: no `gitbulk report` run found. "
+                "Run `gitbulk report` first."
+            ),
             file=sys.stderr,
         )
         return EXIT_STRUCTURAL_FAILURE
@@ -147,7 +150,7 @@ def summarize_handler(args: argparse.Namespace) -> int:
     state_path = latest_report / "state.yaml"
     if not state_path.exists():
         print(
-            "gitbulk summarize: latest report run has no state.yaml.",
+            error_line("gitbulk summarize: latest report run has no state.yaml."),
             file=sys.stderr,
         )
         return EXIT_STRUCTURAL_FAILURE
@@ -161,7 +164,7 @@ def summarize_handler(args: argparse.Namespace) -> int:
             return _run_under_lock(args, policy, state_path)
     except LockTimeoutError as e:
         print(
-            f"gitbulk summarize: timed out acquiring lock: {e}",
+            error_line(f"gitbulk summarize: timed out acquiring lock: {e}"),
             file=sys.stderr,
         )
         return EXIT_STRUCTURAL_FAILURE
@@ -200,7 +203,7 @@ def _run_under_lock(
     if not prompt_path.exists():
         rs.record_error(f"prompt file not found: {prompt_path}")
         print(
-            f"gitbulk summarize: prompt file not found: {prompt_path}",
+            error_line(f"gitbulk summarize: prompt file not found: {prompt_path}"),
             file=sys.stderr,
         )
         return _finish_failure(
@@ -224,7 +227,7 @@ def _run_under_lock(
     except ClaudeError as e:
         rs.record_error(f"claude invocation failed: {e}")
         print(
-            f"gitbulk summarize: claude failed: {e}",
+            error_line(f"gitbulk summarize: claude failed: {e}"),
             file=sys.stderr,
         )
         return _finish_failure(
@@ -247,14 +250,18 @@ def _run_under_lock(
             f"triage output flagged {len(items)} attention items",
         )
         rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
-        print(
+        print(summary_line(
             f"gitbulk summarize: {len(items)} attention item(s). "
-            f"View: gitbulk show summarize"
-        )
+            f"View: gitbulk show summarize",
+            exit_code,
+        ))
         return exit_code
 
     rs.complete(EXIT_OK, retain_runs=policy.defaults.retain_runs)
-    print("gitbulk summarize: nothing requires attention. View: gitbulk show summarize")
+    print(summary_line(
+        "gitbulk summarize: nothing requires attention. View: gitbulk show summarize",
+        EXIT_OK,
+    ))
     return EXIT_OK
 
 
