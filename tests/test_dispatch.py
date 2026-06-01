@@ -32,7 +32,9 @@ from gitbulk.commands.dispatch import (
     EXIT_STRUCTURAL_FAILURE,
     _build_summary_md,
     _key_for_pr,
+    _parse_agent_outcome,
     _runid_from_run_dir,
+    _salvage_escalation,
     _validate_prompt,
     dispatch_handler,
 )
@@ -502,8 +504,13 @@ def _stub_execute_targets(monkeypatch, *, results_by_key):
             )
             stdout_path = log_dir / f"{t.key}.stdout.log"
             stderr_path = log_dir / f"{t.key}.stderr.log"
-            stdout_path.write_text("")
+            stdout_path.write_text(cfg.get("stdout", ""))
             stderr_path.write_text("")
+            # Simulate the agent writing ESCALATION.md into its worktree.
+            if "escalation" in cfg:
+                (t.working_directory / "ESCALATION.md").write_text(
+                    cfg["escalation"]
+                )
             out.append(
                 ExecResult(
                     key=t.key,
@@ -1165,6 +1172,178 @@ def test_runid_from_run_dir_fallback(tmp_path):
     d = tmp_path / "20260528T010203Z-something-else"
     # rpartition on the last hyphen → "20260528T010203Z-something"
     assert _runid_from_run_dir(d) == "20260528T010203Z-something"
+
+
+# ─── Gap 1: agent outcome parsing ──────────────────────────────────────────
+
+
+def test_parse_agent_outcome_resolved(tmp_path):
+    p = tmp_path / "o.log"
+    p.write_text("rebasing...\nRESOLVED: union-merged poetry.lock\n")
+    assert _parse_agent_outcome(p) == (
+        "RESOLVED",
+        "RESOLVED: union-merged poetry.lock",
+    )
+
+
+def test_parse_agent_outcome_escalated_strips_backticks(tmp_path):
+    p = tmp_path / "o.log"
+    p.write_text("`ESCALATED: add-add in README.md; see ESCALATION.md`\n")
+    assert _parse_agent_outcome(p) == (
+        "ESCALATED",
+        "ESCALATED: add-add in README.md; see ESCALATION.md",
+    )
+
+
+def test_parse_agent_outcome_no_detail(tmp_path):
+    p = tmp_path / "o.log"
+    p.write_text("ESCALATED:\n")
+    assert _parse_agent_outcome(p) == ("ESCALATED", "ESCALATED")
+
+
+def test_parse_agent_outcome_last_match_wins(tmp_path):
+    p = tmp_path / "o.log"
+    p.write_text("RESOLVED: early guess\nmore work\nESCALATED: final word\n")
+    assert _parse_agent_outcome(p) == ("ESCALATED", "ESCALATED: final word")
+
+
+def test_parse_agent_outcome_no_status_line(tmp_path):
+    p = tmp_path / "o.log"
+    p.write_text("just some logs\nno verdict here\n")
+    assert _parse_agent_outcome(p) == (None, None)
+
+
+def test_parse_agent_outcome_missing_file(tmp_path):
+    assert _parse_agent_outcome(tmp_path / "nope.log") == (None, None)
+
+
+# ─── Gap 2: ESCALATION.md salvage ──────────────────────────────────────────
+
+
+def test_salvage_escalation_present(tmp_path):
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / "ESCALATION.md").write_text("why it is not mechanical\n")
+    dest = tmp_path / "run" / "escalations"
+    out = _salvage_escalation(wt, dest, "x__a__pr3")
+    assert out == str(dest / "x__a__pr3.md")
+    assert (dest / "x__a__pr3.md").read_text() == "why it is not mechanical\n"
+
+
+def test_salvage_escalation_absent_returns_none(tmp_path):
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    assert _salvage_escalation(wt, tmp_path / "run" / "esc", "k") is None
+
+
+def test_salvage_escalation_copy_failure_returns_none(tmp_path):
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    (wt / "ESCALATION.md").write_text("x")
+    blocker = tmp_path / "blocker"
+    blocker.write_text("i am a file, not a dir")
+    # dest_dir lives *under* a regular file → mkdir(parents=True) raises OSError.
+    assert _salvage_escalation(wt, blocker / "esc", "k") is None
+
+
+# ─── Gap 1+2 end-to-end: outcome surfaced + escalation salvaged ────────────
+
+
+def _one_pr_apply_run(monkeypatch, code_root, write_config, fresh_org_cache,
+                      prompt_file, fake_clones, *, cfg, conflict=False):
+    """Drive a single-PR --apply run with a stubbed agent result `cfg`."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake_clones("dhh1128/alpha")
+    pr = _make_pr(slug="dhh1128/alpha", number=7)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+    )
+    paths_seen: list = []
+    removed: list = []
+    _stub_worktree_create(monkeypatch, paths_seen=paths_seen)
+    _stub_worktree_remove(monkeypatch, removed=removed)
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.is_worktree_in_conflict",
+        lambda p: conflict,
+    )
+    _stub_execute_targets(
+        monkeypatch, results_by_key={_key_for_pr("dhh1128/alpha", 7): cfg}
+    )
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, apply=True, code_root=code_root,
+                   skip_check=_LOCAL_SKIPS)
+    )
+    latest = paths.latest_run_symlink("dispatch").resolve()
+    return rc, latest, removed
+
+
+def test_dispatch_apply_surfaces_escalated_and_salvages_note(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """A clean escalation: verdict shown in summary/state, ESCALATION.md
+    salvaged into the run dir, and the (non-conflict) worktree torn down."""
+    cfg = {
+        "status": "completed",
+        "exit_code": 0,
+        "stdout": "`ESCALATED: add-add conflict in README.md; see ESCALATION.md`\n",
+        "escalation": "# Escalation\nPR head vs base both added CI badges.\n",
+    }
+    rc, latest, removed = _one_pr_apply_run(
+        monkeypatch, code_root, write_config, fresh_org_cache, prompt_file,
+        fake_clones, cfg=cfg, conflict=False,
+    )
+    # summary.md surfaces the verdict + tally (not just "completed").
+    summary = (latest / "summary.md").read_text()
+    assert "ESCALATED: add-add conflict in README.md" in summary
+    assert "Escalated: 1" in summary
+    # state.yaml records the parsed outcome + salvaged path.
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    pr_state = state["repos"]["dhh1128/alpha"]["prs"][0]
+    assert pr_state["outcome"] == "ESCALATED"
+    assert pr_state["outcome_detail"].startswith("ESCALATED: add-add")
+    assert pr_state["escalation_file"]
+    # The ESCALATION.md was salvaged into the durable run dir...
+    saved = latest / "escalations" / "dhh1128__alpha__pr7.md"
+    assert saved.is_file()
+    assert "added CI badges" in saved.read_text()
+    # ...and the clean (non-conflict) worktree was torn down.
+    assert len(removed) == 1
+    assert pr_state["worktree_preserved"] is False
+
+
+def test_dispatch_apply_surfaces_resolved_no_escalation_file(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """A RESOLVED run: verdict surfaced, no escalation artifact."""
+    cfg = {
+        "status": "completed",
+        "exit_code": 0,
+        "stdout": "rebased clean\nRESOLVED: union-merged poetry.lock + CHANGELOG\n",
+    }
+    rc, latest, removed = _one_pr_apply_run(
+        monkeypatch, code_root, write_config, fresh_org_cache, prompt_file,
+        fake_clones, cfg=cfg, conflict=False,
+    )
+    summary = (latest / "summary.md").read_text()
+    assert "RESOLVED: union-merged poetry.lock" in summary
+    assert "Resolved: 1" in summary
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    pr_state = state["repos"]["dhh1128/alpha"]["prs"][0]
+    assert pr_state["outcome"] == "RESOLVED"
+    assert pr_state["escalation_file"] is None
+    assert not (latest / "escalations").exists()
 
 
 def test_key_for_pr_shape():

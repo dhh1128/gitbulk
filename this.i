@@ -729,6 +729,48 @@ Gitbulk Triage Tool = goal:
         friction at exactly the moment when the user needs the
         lowest-friction path forward.
 
+    Dispatch Surfaces Agent Verdict And Salvages Escalations = decision:
+      id: dspesc4q
+      why: >
+        Two gaps surfaced by the first live run of the resolve-conflicts
+        dispatch prompt (2026-06-01; all 5 conflicting PRs escalated
+        cleanly). Both are about the run's durable artifacts telling the
+        true story without spelunking per-target logs.
+
+        GAP 1 — outcome visibility. A dispatched agent's real result
+        (e.g. the resolve-conflicts prompt's final ``RESOLVED:`` /
+        ``ESCALATED:`` line) lived ONLY in
+        ``<run>/dispatch-logs/<key>.stdout.log``. summary.md/state.yaml
+        showed only the PROCESS status ("completed (exit 0)"), so an
+        escalation read as a success. Fix: ``_parse_agent_outcome`` lifts
+        the last ``RESOLVED:``/``ESCALATED:`` line (tolerating backtick
+        wrapping) from the agent's stdout; the verdict + normalized line
+        land in state.yaml (``outcome`` / ``outcome_detail``) and replace
+        the bare process status per-PR in summary.md, with a
+        ``Resolved: N  Escalated: M`` tally. A missing/garbled line
+        degrades to "unknown" (the process status), never a crash. This
+        is a deliberate convention: the agent's contract is to END with
+        exactly one such status line.
+
+        GAP 2 — escalation note salvage. The resolve-conflicts prompt
+        escalates by running ``git rebase --abort`` then writing
+        ``ESCALATION.md`` in the worktree. But abort leaves the worktree
+        NOT in a git-conflict state, so the vp7n2krq teardown rule
+        ("preserve only if in git-status conflict") removed it — taking
+        ``ESCALATION.md`` with it. Fix: ``_salvage_escalation`` copies any
+        worktree ``ESCALATION.md`` into ``<run>/escalations/<key>.md``
+        BEFORE the teardown/preserve decision, so the reason survives
+        regardless. Chosen over "always preserve the worktree on
+        escalation": a cleanly-aborted worktree holds no mid-rebase state
+        worth keeping, and preserving it would just accrue disk; the
+        durable run dir is the right home for the note. vp7n2krq's
+        preserve-on-git-conflict behavior is unchanged. Best-effort: a
+        failed salvage returns None rather than aborting the finalizer for
+        the other PRs.
+
+        Found-and-fixed same day; backlog note in global memory
+        ``project-dispatch-escalation-gaps``.
+
     # ─── ON-DISK CONVENTIONS ─────────────────────────────────────────────────
 
     CLI Wiring Phase 1C = decision:

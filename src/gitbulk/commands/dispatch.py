@@ -62,6 +62,8 @@ on the apply path are to the worktree subdir and to the run dir.
 from __future__ import annotations
 
 import argparse
+import re
+import shutil
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -248,12 +250,17 @@ def _build_summary_md(
     results: list[ExecResult] | None,
     apply: bool,
     prompt_path: Path,
+    outcomes: dict[str, str] | None = None,
 ) -> str:
     """Human-readable summary.md.
 
     Two distinct shapes:
       - dry-run: lists what WOULD dispatch (eligible_prs).
       - apply: lists what was attempted + final status per PR.
+
+    ``outcomes`` maps an ExecTarget key to the agent's normalized
+    ``RESOLVED:``/``ESCALATED:`` line; when present it is shown per PR
+    instead of the bare process status (Gap 1, this.i dspesc4q).
     """
     del policy  # not yet rendered; kept in signature for parity
     lines: list[str] = ["# gitbulk dispatch", ""]
@@ -292,12 +299,23 @@ def _build_summary_md(
 
     # apply mode: render per-PR results.
     by_key = {r.key: r for r in (results or [])}
+    outcome_map = outcomes or {}
+    n_resolved = sum(1 for v in outcome_map.values() if v.startswith("RESOLVED"))
+    n_escalated = sum(
+        1 for v in outcome_map.values() if v.startswith("ESCALATED")
+    )
     lines.append("## Dispatch results")
+    lines.append(f"Resolved: {n_resolved}  Escalated: {n_escalated}")
+    lines.append("")
     for slug, pr in eligible_prs:
         key = _key_for_pr(slug, pr.number)
         r = by_key.get(key)
+        outcome_line = outcome_map.get(key)
         if r is None:
             status = "no result recorded"
+        elif outcome_line is not None:
+            # Prefer the agent's own verdict over the bare process status.
+            status = outcome_line
         else:
             status = f"{r.status}"
             if r.exit_code is not None:
@@ -319,6 +337,59 @@ def _attention_results(results: list[ExecResult]) -> list[ExecResult]:
     return [
         r for r in results if r.status in ("failed", "timed-out", "interrupted")
     ]
+
+
+#: The resolve-conflicts prompt ends with a single ``RESOLVED:`` / ``ESCALATED:``
+#: status line. Agents sometimes wrap it in backticks, hence the strip below.
+_OUTCOME_RE = re.compile(r"^(RESOLVED|ESCALATED):\s*(.*)$")
+
+
+def _parse_agent_outcome(stdout_path: Path) -> tuple[str | None, str | None]:
+    """Return ``(verdict, line)`` from a dispatched agent's stdout log.
+
+    ``verdict`` is ``"RESOLVED"`` or ``"ESCALATED"``; ``line`` is the
+    normalized full status line (``"VERDICT: detail"``, or just the verdict
+    when no detail). Scans from the end and returns the LAST match — the
+    agent's final word. Returns ``(None, None)`` when the log is missing,
+    unreadable, or has no status line, so a malformed agent run degrades to
+    "unknown" rather than crashing the finalizer (Gap 1, this.i dspesc4q).
+    """
+    try:
+        text = stdout_path.read_text()
+    except OSError:
+        return (None, None)
+    for raw in reversed(text.splitlines()):
+        line = raw.strip().strip("`").strip()
+        m = _OUTCOME_RE.match(line)
+        if m:
+            verdict = m.group(1)
+            detail = m.group(2).strip()
+            return (verdict, f"{verdict}: {detail}" if detail else verdict)
+    return (None, None)
+
+
+def _salvage_escalation(
+    worktree_path: Path, dest_dir: Path, key: str
+) -> str | None:
+    """Copy an agent-written ``ESCALATION.md`` into the durable run dir.
+
+    A clean escalation runs ``git rebase --abort``, so the worktree is NOT
+    in a git-conflict state and gets torn down — taking its ``ESCALATION.md``
+    with it. Salvage it into ``<run>/escalations/<key>.md`` BEFORE teardown
+    so the reason survives (Gap 2, this.i dspesc4q). Returns the saved path, or ``None`` when
+    there is no ``ESCALATION.md`` or the copy fails (best-effort: a failed
+    salvage must not abort finalizing the other PRs).
+    """
+    src = worktree_path / "ESCALATION.md"
+    if not src.is_file():
+        return None
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        dest = dest_dir / f"{key}.md"
+        shutil.copyfile(src, dest)
+    except OSError:
+        return None
+    return str(dest)
 
 
 # ─── Public handler ───────────────────────────────────────────────────────
@@ -653,9 +724,23 @@ def _run_under_lock(
 
     # 11. Worktree cleanup vs preservation per node vp7n2krq.
     per_pr_states: dict[str, list[dict]] = {}
+    # key -> normalized "VERDICT: detail" line, for the summary (Gap 1).
+    outcomes: dict[str, str] = {}
+    escalations_dir = rs.run_dir / "escalations"
     for r in results:
         slug, pr, worktree_path = target_meta[r.key]
         repo = repo_by_slug[slug]
+        # Gap 1: the agent's RESOLVED:/ESCALATED: verdict lives only in its
+        # stdout log; lift it so summary.md/state.yaml tell the true story.
+        verdict, outcome_line = _parse_agent_outcome(r.stdout_path)
+        if outcome_line is not None:
+            outcomes[r.key] = outcome_line
+        # Gap 2: salvage any ESCALATION.md into the run dir BEFORE teardown
+        # (a clean escalation aborts the rebase, so the worktree is not
+        # in-conflict and would otherwise be removed with the note inside).
+        escalation_file = _salvage_escalation(
+            worktree_path, escalations_dir, r.key
+        )
         in_conflict = is_worktree_in_conflict(worktree_path)
         preserved = False
         if in_conflict:
@@ -685,6 +770,9 @@ def _run_under_lock(
                 "head_sha": pr.head_sha,
                 "status": r.status,
                 "exit_code": r.exit_code,
+                "outcome": verdict,
+                "outcome_detail": outcome_line,
+                "escalation_file": escalation_file,
                 "duration_seconds": r.duration_seconds,
                 "worktree_path": str(worktree_path),
                 "worktree_preserved": preserved,
@@ -717,11 +805,15 @@ def _run_under_lock(
         results=results,
         apply=True,
         prompt_path=prompt_path,
+        outcomes=outcomes,
     )
     rs.write_summary(summary_md)
 
+    n_resolved = sum(1 for v in outcomes.values() if v.startswith("RESOLVED"))
+    n_escalated = sum(1 for v in outcomes.values() if v.startswith("ESCALATED"))
     summary_text = (
         f"dispatched {len(results)} PRs; "
+        f"{n_resolved} resolved, {n_escalated} escalated; "
         f"{len(attention_results)} need attention; "
         f"{len(skipped_repos)} repos skipped"
     )
