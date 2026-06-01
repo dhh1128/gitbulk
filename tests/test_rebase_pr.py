@@ -453,15 +453,56 @@ def test_lock_timeout_returns_structural_failure(
     assert rc == EXIT_STRUCTURAL_FAILURE
 
 
-def test_universal_preflight_failure(monkeypatch, isolated_xdg, code_root, write_config):
-    # No org cache → org.members.fresh fails the universal preflight.
+def test_universal_preflight_failure(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    # Fresh org cache so auto-refresh no-ops; gh.authenticated then fails
+    # the universal preflight (FakeGHClient has no authenticated user).
     write_config(repos_slugs=["dhh1128/alpha"])
-    fake = _fake({"dhh1128/alpha": []})
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient()  # no user → authenticated_user raises
     _patch_gh(monkeypatch, fake)
     rc = rebase_pr_handler(_args(code_root=code_root))
     assert rc == EXIT_STRUCTURAL_FAILURE
     summary = (paths.latest_run_symlink("rebase-pr").resolve() / "summary.md").read_text()
     assert "FAILED" in summary
+
+
+def test_rebase_pr_auto_refreshes_missing_cache(
+    monkeypatch, isolated_xdg, code_root, write_config
+):
+    """A missing org-members cache is auto-refreshed (ormrf7kq) rather than
+    hard-failing the preflight; the run then proceeds."""
+    write_config(repos_slugs=["dhh1128/alpha"])  # no fresh_org_cache
+    fake = _fake({"dhh1128/alpha": []})  # org_members configured
+    _patch_gh(monkeypatch, fake)
+    rc = rebase_pr_handler(_args(code_root=code_root))
+    assert rc == EXIT_OK
+    assert fake.call_count["org_members"] == 1
+    assert paths.org_members_cache_file("provenant-dev").exists()
+
+
+def test_rebase_pr_auto_refresh_failure_exits_structural(
+    monkeypatch, isolated_xdg, code_root, write_config
+):
+    """If the automatic refresh can't reach GitHub, abort with exit 1 and
+    record the failure — a mutating command must not classify on a guess."""
+    import json
+
+    write_config(repos_slugs=["dhh1128/alpha"])  # cache missing
+    fake = FakeGHClient(user={"login": "dhh1128"})  # no org_members → raises
+    _patch_gh(monkeypatch, fake)
+    rc = rebase_pr_handler(_args(code_root=code_root))
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    latest = paths.latest_run_symlink("rebase-pr").resolve()
+    events = [
+        json.loads(line)
+        for line in (latest / "errors.log").read_text().splitlines()
+        if line.strip()
+    ]
+    assert any(
+        "org-members auto-refresh failed" in e.get("message", "") for e in events
+    )
 
 
 def test_per_repo_fail_aborts(

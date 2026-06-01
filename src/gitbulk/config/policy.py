@@ -84,7 +84,12 @@ class Defaults:
 @dataclass(frozen=True)
 class HumansConfig:
     org: str | None = None
-    cache_ttl_hours: int = 24
+    # 7 days. Org membership changes closer to never than to daily, and
+    # since every subcommand now auto-refreshes a stale cache before its
+    # preflight (ormrf7kq), a longer TTL just means fewer needless
+    # refetches; staleness only degrades to the conservative BOT default
+    # (never destructive), mirroring the default-branch cache (rj7p4kqn).
+    cache_ttl_hours: int = 168
     exceptions: tuple[str, ...] = ()
     always_human: tuple[str, ...] = ()
 

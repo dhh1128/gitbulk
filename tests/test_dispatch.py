@@ -208,6 +208,7 @@ def _make_args(
     concurrency=2,
     timeout=1800.0,
     filter=None,
+    refresh_org_members=False,
 ):
     return argparse.Namespace(
         subcommand="dispatch",
@@ -218,6 +219,7 @@ def _make_args(
         concurrency=concurrency,
         timeout=timeout,
         filter=filter,
+        refresh_org_members=refresh_org_members,
     )
 
 
@@ -280,6 +282,58 @@ def test_validate_prompt_unit():
     # Missing arg
     p, err = _validate_prompt(argparse.Namespace(prompt=None))
     assert p is None and "requires --prompt" in err
+
+
+# ─── Auto-refresh of the org-members cache (ormrf7kq) ──────────────────────
+
+
+def test_dispatch_auto_refreshes_missing_cache(
+    monkeypatch, isolated_xdg, code_root, write_config, prompt_file
+):
+    """A missing org-members cache auto-refreshes inside the lock rather
+    than hard-failing the preflight; the run proceeds past it."""
+    write_config(repos_slugs=["dhh1128/alpha"])  # no fresh_org_cache
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
+    )
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, code_root=code_root, skip_check=_LOCAL_SKIPS)
+    )
+    # Got past the org.members.fresh preflight (not a structural failure).
+    assert rc != EXIT_STRUCTURAL_FAILURE
+    assert fake.call_count["org_members"] == 1
+    assert paths.org_members_cache_file("provenant-dev").exists()
+
+
+def test_dispatch_auto_refresh_failure_exits_structural(
+    monkeypatch, isolated_xdg, code_root, write_config, prompt_file
+):
+    """A failed automatic refresh (GitHub unreachable) aborts with exit 1
+    and records the failure."""
+    import json
+
+    write_config(repos_slugs=["dhh1128/alpha"])  # cache missing
+    fake = FakeGHClient(user={"login": "dhh1128"})  # no org_members → raises
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
+    )
+    rc = dispatch_handler(_make_args(prompt=prompt_file, code_root=code_root))
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    latest = paths.latest_run_symlink("dispatch").resolve()
+    events = [
+        json.loads(line)
+        for line in (latest / "errors.log").read_text().splitlines()
+        if line.strip()
+    ]
+    assert any(
+        "org-members auto-refresh failed" in e.get("message", "") for e in events
+    )
 
 
 # ─── Dry-run: default behavior ─────────────────────────────────────────────

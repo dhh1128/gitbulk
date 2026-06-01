@@ -18,7 +18,7 @@ defaults:
 
 humans:
   org: provenant-dev             # gitbulk enumerates org members via `gh api orgs/<org>/members`
-  cache_ttl_hours: 24
+  cache_ttl_hours: 168           # 7 days; a stale cache auto-refreshes, so a long TTL just avoids needless refetches
   exceptions: []                 # org members that are actually bots
   always_human: []               # extra logins outside the org that should count as human
 

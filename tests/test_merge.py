@@ -226,6 +226,53 @@ def test_dry_run_no_eligible_prs_exit_ok(
     assert "no eligible PRs" in summary
 
 
+# ─── Auto-refresh of the org-members cache (ormrf7kq) ──────────────────────
+
+
+def test_merge_auto_refreshes_missing_cache(
+    monkeypatch, isolated_xdg, code_root, write_config,
+):
+    """A missing org-members cache auto-refreshes inside the lock rather
+    than hard-failing the preflight; the (dry-run) merge proceeds."""
+    write_config(repos_slugs=["dhh1128/alpha"])  # no fresh_org_cache
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_OK
+    assert fake.call_count["org_members"] == 1
+    assert paths.org_members_cache_file("provenant-dev").exists()
+
+
+def test_merge_auto_refresh_failure_exits_structural(
+    monkeypatch, isolated_xdg, code_root, write_config,
+):
+    """A failed automatic refresh (GitHub unreachable) aborts with exit 1
+    and records the failure — merge must not classify authors on a guess."""
+    write_config(repos_slugs=["dhh1128/alpha"])  # cache missing
+    fake = FakeGHClient(user={"login": "dhh1128"})  # no org_members → raises
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    rc = merge_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    latest = paths.latest_run_symlink("merge").resolve()
+    events = [
+        json.loads(line)
+        for line in (latest / "errors.log").read_text().splitlines()
+        if line.strip()
+    ]
+    assert any(
+        "org-members auto-refresh failed" in e.get("message", "") for e in events
+    )
+
+
 def test_dry_run_org_filter_prunes_and_reports_filter_line(
     monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
 ):

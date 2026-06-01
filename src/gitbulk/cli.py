@@ -464,6 +464,17 @@ def _add_dispatch_args(sp: argparse.ArgumentParser) -> None:
             "other concern fires."
         ),
     )
+    sp.add_argument(
+        "--refresh-org-members",
+        action="store_true",
+        default=False,
+        help=(
+            "Force a fresh fetch of the configured humans.org members "
+            "even when the cache is still within its TTL. dispatch "
+            "auto-refreshes a missing or stale cache on its own; this "
+            "flag forces a refetch regardless."
+        ),
+    )
 
 
 def _add_close_stale_args(sp: argparse.ArgumentParser) -> None:
@@ -503,7 +514,9 @@ def _add_close_stale_args(sp: argparse.ArgumentParser) -> None:
         default=False,
         help=(
             "Force a fresh fetch of the configured humans.org members "
-            "before running close-stale."
+            "even when the cache is still within its TTL. close-stale "
+            "auto-refreshes a missing or stale cache on its own; this "
+            "flag forces a refetch regardless."
         ),
     )
 
@@ -585,7 +598,9 @@ def _add_rebase_pr_args(sp: argparse.ArgumentParser) -> None:
         default=False,
         help=(
             "Force a fresh fetch of the configured humans.org members "
-            "before running rebase-pr."
+            "even when the cache is still within its TTL. rebase-pr "
+            "auto-refreshes a missing or stale cache on its own; this "
+            "flag forces a refetch regardless."
         ),
     )
 
@@ -654,7 +669,9 @@ def _add_merge_args(sp: argparse.ArgumentParser) -> None:
         default=False,
         help=(
             "Force a fresh fetch of the configured humans.org members "
-            "before running merge."
+            "even when the cache is still within its TTL. merge "
+            "auto-refreshes a missing or stale cache on its own; this "
+            "flag forces a refetch regardless."
         ),
     )
 

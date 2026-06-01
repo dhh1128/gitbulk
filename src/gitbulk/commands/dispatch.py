@@ -80,6 +80,10 @@ from gitbulk.filters import (
 )
 from gitbulk.exec import ExecResult, ExecTarget, execute_targets
 from gitbulk.gh import GHError, ProductionGHClient
+from gitbulk.org_members_cache import (
+    OrgMembersRefreshError,
+    ensure_org_members_fresh,
+)
 from gitbulk.invariants import InvariantContext, get, run_chain
 from gitbulk.invariants.base import Invariant, InvariantKind
 from gitbulk.locks import LockTimeoutError, global_lock
@@ -384,6 +388,32 @@ def _run_under_lock(
 
     gh = ProductionGHClient()
     ctx_base = InvariantContext(policy=policy, runstate=rs, gh=gh)
+
+    # Auto-refresh org-members before the preflight (ormrf7kq). Mirrors
+    # report + the default-branch cache: a missing/stale cache self-heals
+    # rather than hard-failing; --refresh-org-members forces it. Inside
+    # the lock (security-hawk F4). A refresh failure is the one
+    # legitimate abort — a mutating command must not classify on a guess.
+    try:
+        ensure_org_members_fresh(
+            gh, policy, force=bool(getattr(args, "refresh_org_members", False))
+        )
+    except OrgMembersRefreshError as e:
+        rs.record_error(str(e))
+        return _finish(
+            rs,
+            EXIT_STRUCTURAL_FAILURE,
+            summary=str(e),
+            policy=policy,
+            attention=False,
+            all_repos=repos,
+            passing_repos=[],
+            skipped_repos=[],
+            eligible_prs=[],
+            results=None,
+            apply=bool(args.apply),
+            prompt_path=prompt_path,
+        )
 
     dispatch_sub = subcommands_mod.by_name("dispatch")
     universal, per_repo, per_pr = _partition_chain(dispatch_sub.invariant_chain)

@@ -15,9 +15,12 @@ import pytest
 from gitbulk import org_members_cache as omc
 from gitbulk import paths
 from gitbulk.gh import FakeGHClient, GHError
+from gitbulk.config.policy import HumansConfig, Policy
 from gitbulk.org_members_cache import (
     SCHEMA_VERSION,
     CachedMembers,
+    OrgMembersRefreshError,
+    ensure_org_members_fresh,
     is_fresh,
     load_cache,
     refresh_cache,
@@ -324,6 +327,94 @@ def test_refresh_cache_empty_org(isolated_cache):
     loaded = load_cache("empty-org")
     assert loaded is not None
     assert loaded.members == frozenset()
+
+
+# ─── ensure_org_members_fresh (ormrf7kq) ───────────────────────────────────
+
+
+def _policy(org="provenant-dev", ttl=24) -> Policy:
+    return Policy(humans=HumansConfig(org=org, cache_ttl_hours=ttl))
+
+
+def test_ensure_noop_when_org_unset(isolated_cache):
+    """No configured org ⇒ no lookup, no refresh, returns None."""
+    gh = FakeGHClient()  # no org_members configured; must not be called
+    result = ensure_org_members_fresh(gh, _policy(org=None))
+    assert result is None
+    assert gh.call_count["org_members"] == 0
+
+
+def test_ensure_noop_when_cache_fresh(isolated_cache):
+    """A fresh on-disk cache is left untouched — no network call."""
+    save_cache(
+        CachedMembers(
+            org="provenant-dev",
+            fetched_at=datetime.now(timezone.utc),
+            members=frozenset({"dhh1128"}),
+        )
+    )
+    gh = FakeGHClient(org_members={"provenant-dev": ["dhh1128", "alice"]})
+    result = ensure_org_members_fresh(gh, _policy())
+    assert result is None
+    assert gh.call_count["org_members"] == 0
+
+
+def test_ensure_refreshes_when_missing(isolated_cache):
+    gh = FakeGHClient(org_members={"provenant-dev": ["dhh1128", "alice"]})
+    result = ensure_org_members_fresh(gh, _policy())
+    assert result is not None
+    assert result.members == frozenset({"dhh1128", "alice"})
+    assert gh.call_count["org_members"] == 1
+    assert load_cache("provenant-dev") is not None
+
+
+def test_ensure_refreshes_when_stale(isolated_cache):
+    save_cache(
+        CachedMembers(
+            org="provenant-dev",
+            fetched_at=datetime.now(timezone.utc) - timedelta(hours=48),
+            members=frozenset({"dhh1128"}),
+        )
+    )
+    gh = FakeGHClient(org_members={"provenant-dev": ["dhh1128", "alice"]})
+    result = ensure_org_members_fresh(gh, _policy(ttl=24))
+    assert result is not None
+    assert result.members == frozenset({"dhh1128", "alice"})
+    assert gh.call_count["org_members"] == 1
+
+
+def test_ensure_force_refreshes_even_when_fresh(isolated_cache):
+    save_cache(
+        CachedMembers(
+            org="provenant-dev",
+            fetched_at=datetime.now(timezone.utc),
+            members=frozenset({"dhh1128"}),
+        )
+    )
+    gh = FakeGHClient(org_members={"provenant-dev": ["dhh1128", "alice"]})
+    result = ensure_org_members_fresh(gh, _policy(), force=True)
+    assert result is not None
+    assert gh.call_count["org_members"] == 1
+
+
+def test_ensure_auto_refresh_failure_raises_wrapped(isolated_cache):
+    """A failed automatic refresh raises OrgMembersRefreshError naming the
+    automatic trigger, chained from the underlying GHError."""
+    gh = FakeGHClient()  # org_members not configured → GHError
+    with pytest.raises(OrgMembersRefreshError, match="org-members auto-refresh failed"):
+        ensure_org_members_fresh(gh, _policy())
+    # Chains from the GHError so the root cause survives.
+    try:
+        ensure_org_members_fresh(gh, _policy())
+    except OrgMembersRefreshError as e:
+        assert isinstance(e.__cause__, GHError)
+
+
+def test_ensure_forced_refresh_failure_names_flag(isolated_cache):
+    """A failed forced refresh names the --refresh-org-members trigger."""
+    gh = FakeGHClient()
+    with pytest.raises(OrgMembersRefreshError, match="--refresh-org-members failed"):
+        ensure_org_members_fresh(gh, _policy(), force=True)
 
 
 # ─── SCHEMA_VERSION is stable ──────────────────────────────────────────────

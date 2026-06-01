@@ -27,12 +27,24 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
 from gitbulk import paths
-from gitbulk.gh import GHClient
+from gitbulk.gh import GHClient, GHError
+
+if TYPE_CHECKING:
+    from gitbulk.config.policy import Policy
+
+
+class OrgMembersRefreshError(Exception):
+    """Raised when :func:`ensure_org_members_fresh` cannot refresh the cache.
+
+    The message is pre-formatted with the trigger (``--refresh-org-members``
+    forced vs ``org-members auto-refresh`` automatic) so callers record and
+    surface it verbatim without re-deriving which path fired.
+    """
 
 #: Cache file schema version. See ``schv4nrm``. A reader that finds a
 #: different value treats the file as unreadable and returns None;
@@ -189,3 +201,52 @@ def refresh_cache(gh: GHClient, org: str) -> CachedMembers:
     )
     save_cache(cached)
     return cached
+
+
+def ensure_org_members_fresh(
+    gh: GHClient,
+    policy: "Policy",
+    *,
+    force: bool = False,
+) -> CachedMembers | None:
+    """Refresh the org-members cache when it is missing, stale, or ``force``d.
+
+    This is the self-healing entry point every subcommand calls before
+    its universal preflight (node ormrf7kq). It mirrors the default-
+    branch cache's ``prime_default_branches``: a missing or stale cache
+    is refetched rather than hard-failing, because org-members staleness
+    only degrades classification toward the conservative BOT default
+    (node rj7p4kqn / pj5kn2zw) — it is never destructive, so refreshing
+    is always the right move and never a decision a human needs to make.
+    ``force`` (the CLI ``--refresh-org-members`` flag) refetches even a
+    cache that is still within its TTL.
+
+    Returns the freshly-fetched :class:`CachedMembers` when a refresh
+    happened, or ``None`` when no refresh was needed — either because the
+    on-disk cache was already fresh, or because ``policy.humans.org`` is
+    unset (no org ⇒ the classifier falls through to the safe BOT default
+    with no lookup, so no cache is required).
+
+    Raises :class:`OrgMembersRefreshError` when the refresh fetch itself
+    fails (GitHub unreachable or unauthenticated). That is the one
+    legitimate hard-stop: a command — most acutely a mutating one — must
+    not classify PR authors on a guess. The exception message names the
+    trigger so the caller surfaces it verbatim. Callers invoke this
+    inside the global lock (security-hawk F4, shawk7nq) and convert the
+    error into their own EXIT_STRUCTURAL_FAILURE finish.
+    """
+    org = policy.humans.org
+    if org is None:
+        return None
+    cached = load_cache(org)
+    if (
+        not force
+        and cached is not None
+        and is_fresh(cached, policy.humans.cache_ttl_hours)
+    ):
+        return None
+    how = "--refresh-org-members" if force else "org-members auto-refresh"
+    try:
+        return refresh_cache(gh, org)
+    except GHError as e:
+        raise OrgMembersRefreshError(f"{how} failed: {e}") from e

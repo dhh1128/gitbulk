@@ -1728,19 +1728,19 @@ Gitbulk Triage Tool = goal:
           - File: ``~/.cache/gitbulk/org-members/<org>.yaml``
           - Schema: ``schema_version: 1`` (per schv4nrm), ``fetched_at:
             ISO-8601 UTC``, ``members: tuple[str, ...]``.
-          - TTL: ``policy.humans.cache_ttl_hours`` (default 24).
-            Stale cache → ``org.members.fresh`` invariant Fails
-            with reason "org members cache older than TTL; rerun
-            with --refresh-org-members". NOTE: ``report`` no longer
-            relies on this hard-fail — it auto-refreshes a missing/
-            stale cache before the preflight runs (see ormrf7kq). The
-            invariant remains the safety net for the mutating
-            subcommands, which still require --refresh-org-members.
+          - TTL: ``policy.humans.cache_ttl_hours`` (default 168 = 7
+            days, per ormrf7kq; was 24). NOTE: no subcommand relies on
+            the invariant's hard-fail anymore — EVERY command
+            auto-refreshes a missing/stale cache via
+            ``ensure_org_members_fresh`` before the preflight runs (see
+            ormrf7kq). The ``org.members.fresh`` invariant is kept as a
+            belt-and-suspenders safety net (its Fail message still reads
+            "older than TTL; rerun with --refresh-org-members" for any
+            path that ever skips the helper).
           - Refresh command (Phase 2): a CLI flag
-            ``--refresh-org-members`` on the universal preflight
-            forces a fetch via ``gh api orgs/<org>/members
-            --paginate``. On ``report`` the flag is now a FORCE
-            override (refetch even when fresh); see ormrf7kq.
+            ``--refresh-org-members`` on every subcommand forces a fetch
+            via ``gh api orgs/<org>/members --paginate``. It is now a
+            FORCE override (refetch even when fresh); see ormrf7kq.
           - Empty / null ``policy.humans.org``: the classifier
             falls through step 3 (no org lookup), so unknown
             logins default BOT per the safer-failure-mode rule.
@@ -1752,51 +1752,79 @@ Gitbulk Triage Tool = goal:
     Report Auto-Refreshes Org-Members Cache = decision:
       id: ormrf7kq
       why: >
-        ``report`` now refreshes the org-members cache on its own
+        EVERY subcommand now refreshes the org-members cache on its own
         whenever the cache is missing OR stale (age >=
         ``humans.cache_ttl_hours``), instead of requiring an explicit
         ``--refresh-org-members`` and otherwise hard-failing the
         ``org.members.fresh`` universal preflight (the original behavior
-        described under hbcls4pq).
+        described under hbcls4pq). The shared entry point is
+        ``org_members_cache.ensure_org_members_fresh(gh, policy, *,
+        force)``, called by each handler right after it builds the gh
+        client + begins RunState, inside the global lock, before the
+        universal preflight runs.
 
-        Trigger for this decision: the live cron deployment (shkd5crn)
-        runs ``report`` Mon–Fri at 03:00 with no flags and nothing else
-        refreshes the cache, so the 24h TTL is crossed on every run —
-        guaranteed after the weekend gap (Fri→Mon ≈ 72h). The 2026-06-01
-        run aborted at the preflight ("org members cache for
-        'provenant-dev' is older than 24h"), exit 1 → failure email,
-        and produced no triage report. A read-only nightly report that
+        Trigger: the live cron deployment (shkd5crn) runs ``report``
+        Mon–Fri at 03:00 with no flags and nothing else refreshes the
+        cache, so the 24h TTL was crossed on every run — guaranteed after
+        the weekend gap (Fri→Mon ≈ 72h). The 2026-06-01 run aborted at
+        the preflight ("org members cache for 'provenant-dev' is older
+        than 24h"), exit 1 → failure email, no triage report. A run that
         cannot sustain its own freshness precondition is a defect, not a
         user error.
 
+        Why ALL commands, not just the unattended report (the question
+        that reopened an initial report-only cut): a missing/stale cache
+        is strictly worse than a fresh one — refreshing only makes
+        classification MORE accurate, never less, so "the cache is stale"
+        is never a decision a human needs to make and an explicit flag
+        adds friction with zero safety benefit. The "mutating commands
+        are higher-stakes" argument cuts the OTHER way: those commands
+        most need current org membership, so auto-refreshing PROTECTS
+        them. This also matches the analogous default-branch cache, which
+        already self-heals stale entries inline in the same mutating
+        commands (rj7p4kqn: "every staleness failure mode is 'operate too
+        conservatively' — never destructive"). org-members was the
+        inconsistent outlier. Bonus: ``--refresh-org-members`` was a DEAD
+        flag in merge/close-stale/rebase/dispatch (argparse accepted it,
+        handlers never called refresh) — unifying made it live everywhere
+        and added it to dispatch, which lacked it.
+
         Design:
-          - Auto-refresh is scoped to ``report`` ONLY. The mutating
-            subcommands (merge, close-stale, rebase-onto-default,
-            dispatch) deliberately keep the hard-fail + explicit
-            ``--refresh-org-members`` contract: they run rarely and
-            interactively, and a stale-classification surprise there is
-            higher-stakes (could mis-classify a human as a bot and act).
-            Only the unattended read-only path needs to self-heal.
-          - ``--refresh-org-members`` is retained as a FORCE override:
-            it refetches even when the cache is fresh.
-          - The refresh still runs INSIDE the global lock with a RunState
+          - ``ensure_org_members_fresh`` is a no-op when humans.org is
+            unset (classifier falls through to the safe BOT default) or
+            when the on-disk cache is already fresh (no network call).
+          - ``--refresh-org-members`` is retained on report/merge/
+            close-stale/rebase-pr and ADDED to dispatch, now a working
+            FORCE override: refetch even when the cache is fresh.
+          - The refresh runs INSIDE the global lock with a RunState
             already begun (preserves security-hawk F4, shawk7nq): the
             network fetch + cache write stay inside the audit envelope.
-          - A refresh failure (gh error) still aborts with
-            EXIT_STRUCTURAL_FAILURE and records the error to the run's
-            errors.log, so a genuinely unreachable GitHub is not masked.
-            The error message distinguishes the forced
-            (``--refresh-org-members failed``) from the automatic
-            (``org-members auto-refresh failed``) path.
-          - The ``org.members.fresh`` invariant is unchanged and remains
-            the universal safety net; its Fail branches stay live for the
-            mutating subcommands that do not auto-refresh.
+          - The one legitimate hard-stop is a refresh FAILURE (GitHub
+            unreachable/unauthenticated): the helper raises
+            ``OrgMembersRefreshError`` (message names the forced
+            ``--refresh-org-members failed`` vs automatic
+            ``org-members auto-refresh failed`` trigger, chained from the
+            GHError), and each handler converts it to
+            EXIT_STRUCTURAL_FAILURE + an errors.log entry. A mutating
+            command must not classify authors on a guess.
+          - The ``org.members.fresh`` invariant is KEPT, unchanged, as a
+            belt-and-suspenders safety net: after auto-refresh it always
+            passes, but it still guards a future code path that forgets
+            to call the helper. Its Fail branches are covered by direct
+            invariant unit tests (test_invariants_catalog), not command
+            flow.
 
-        Considered and rejected: auto-refreshing in ALL subcommands
-        (broader blast radius on the mutating paths, not requested);
-        widening the cron TTL or adding ``--refresh-org-members`` to the
-        crontab line (treats the symptom, leaves the self-heal gap for
-        any future unattended report invocation).
+        TTL change (folded in same commit): default ``cache_ttl_hours``
+        24 → 168 (7 days), matching the default-branch cache. With
+        universal auto-refresh a longer TTL just means fewer needless
+        refetches; the max staleness window degrades only to the
+        conservative BOT default, never destructively.
+
+        Considered and rejected: widening only the cron TTL or adding
+        ``--refresh-org-members`` to the crontab line (treats the
+        symptom, leaves the self-heal gap for any future unattended
+        invocation); removing the ``org.members.fresh`` invariant
+        (cheap safety net, keep it).
       approved-by: daniel, 2026-06-01
 
     Security Hawk Findings Disposition = decision:

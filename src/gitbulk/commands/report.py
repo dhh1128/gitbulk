@@ -60,7 +60,10 @@ from gitbulk.invariants import (
 )
 from gitbulk.invariants.base import Invariant, InvariantKind
 from gitbulk.locks import LockTimeoutError, global_lock
-from gitbulk.org_members_cache import is_fresh, load_cache, refresh_cache
+from gitbulk.org_members_cache import (
+    OrgMembersRefreshError,
+    ensure_org_members_fresh,
+)
 from gitbulk.pr_info import CheckRun, PRInfo
 from gitbulk.runstate import RunState
 from gitbulk.util.progress import Progress
@@ -571,49 +574,33 @@ def _run_under_lock(
     gh = ProductionGHClient()
     ctx_base = InvariantContext(policy=policy, runstate=rs, gh=gh)
 
-    # 4. Refresh the org-members cache when needed. Per ormrf7kq,
-    # ``report`` auto-refreshes a missing or stale cache so the
-    # unattended nightly run self-heals its own org.members.fresh
-    # precondition instead of hard-failing the preflight;
-    # ``--refresh-org-members`` remains a FORCE override that refetches
-    # even when the cache is fresh. Runs INSIDE the lock per security-
-    # hawk F4 (shawk7nq): the network call + cache write are within the
-    # audit envelope and another gitbulk process cannot race on the file.
-    if policy.humans.org:
-        cached = load_cache(policy.humans.org)
-        needs_refresh = (
-            args.refresh_org_members
-            or cached is None
-            or not is_fresh(cached, policy.humans.cache_ttl_hours)
+    # 4. Auto-refresh the org-members cache when missing/stale (or
+    # forced via --refresh-org-members). Shared with every other
+    # subcommand via ensure_org_members_fresh (ormrf7kq): staleness
+    # self-heals rather than hard-failing the preflight. Runs INSIDE the
+    # lock per security-hawk F4 (shawk7nq) so the network call + cache
+    # write stay in the audit envelope and cannot race on the file. A
+    # refresh FAILURE (GitHub unreachable) is the one legitimate abort.
+    try:
+        ensure_org_members_fresh(
+            gh, policy, force=bool(args.refresh_org_members)
         )
-    else:
-        needs_refresh = False
-    if needs_refresh:
-        # Message distinguishes the forced path from the automatic one
-        # so errors.log/summary name which trigger fetched.
-        how = (
-            "--refresh-org-members"
-            if args.refresh_org_members
-            else "org-members auto-refresh"
-        )
-        try:
-            refresh_cache(gh, policy.humans.org)
-        except GHError as e:
-            rs.record_error(f"{how} failed: {e}")
-            return _finish(
-                rs,
-                EXIT_STRUCTURAL_FAILURE,
-                summary=f"{how} failed: {e}",
-                policy=policy,
-                attention=False,
-                all_repos=repos,
-                passing_repos=[],
-                skipped_repos=[],
-                prs_by_repo={},
-                pr_records_by_repo={},
-                attention_count=0,
+    except OrgMembersRefreshError as e:
+        rs.record_error(str(e))
+        return _finish(
+            rs,
+            EXIT_STRUCTURAL_FAILURE,
+            summary=str(e),
+            policy=policy,
+            attention=False,
+            all_repos=repos,
+            passing_repos=[],
+            skipped_repos=[],
+            prs_by_repo={},
+            pr_records_by_repo={},
+            attention_count=0,
             skipped_entries=skipped_entries,
-            )
+        )
 
     # 5/6/8. Partition the report chain.
     report_sub = subcommands_mod.by_name("report")

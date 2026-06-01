@@ -705,21 +705,65 @@ def test_lock_timeout_returns_structural_failure(
 
 
 def test_universal_preflight_failure_returns_structural_failure(
-    monkeypatch, isolated_xdg, code_root, write_config,
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
 ):
-    """No org-members cache → org.members.fresh Fails → universal preflight
-    is structurally broken."""
+    """A universal invariant Fail → structural failure. Triggered via
+    gh.authenticated (no user); a fresh cache keeps auto-refresh a no-op
+    so we actually reach the preflight."""
     write_config(repos_slugs=["dhh1128/alpha"])
-    # No fresh_org_cache call — cache is missing
-    fake = FakeGHClient(
-        user={"login": "dhh1128"},
-        org_members={"provenant-dev": ["dhh1128"]},
-    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient()  # no user → authenticated_user raises
     monkeypatch.setattr(
         "gitbulk.commands.close_stale.ProductionGHClient", lambda: fake
     )
     rc = close_stale_handler(_make_args(code_root=code_root))
     assert rc == EXIT_STRUCTURAL_FAILURE
+
+
+def test_close_stale_auto_refreshes_missing_cache(
+    monkeypatch, isolated_xdg, code_root, write_config,
+):
+    """A missing org-members cache auto-refreshes (ormrf7kq) and the run
+    proceeds rather than hard-failing the preflight."""
+    write_config(repos_slugs=["dhh1128/alpha"])  # no fresh_org_cache
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.close_stale.ProductionGHClient", lambda: fake
+    )
+    rc = close_stale_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_OK
+    assert fake.call_count["org_members"] == 1
+    assert paths.org_members_cache_file("provenant-dev").exists()
+
+
+def test_close_stale_auto_refresh_failure_exits_structural(
+    monkeypatch, isolated_xdg, code_root, write_config,
+):
+    """A failed automatic refresh (GitHub unreachable) aborts with exit 1
+    and records the failure."""
+    import json
+
+    write_config(repos_slugs=["dhh1128/alpha"])  # cache missing
+    fake = FakeGHClient(user={"login": "dhh1128"})  # no org_members → raises
+    monkeypatch.setattr(
+        "gitbulk.commands.close_stale.ProductionGHClient", lambda: fake
+    )
+    rc = close_stale_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    latest = paths.latest_run_symlink("close-stale").resolve()
+    events = [
+        json.loads(line)
+        for line in (latest / "errors.log").read_text().splitlines()
+        if line.strip()
+    ]
+    assert any(
+        "org-members auto-refresh failed" in e.get("message", "") for e in events
+    )
 
 
 def test_my_open_prs_failure_returns_structural_failure(
