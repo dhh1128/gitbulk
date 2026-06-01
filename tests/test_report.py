@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 import yaml
@@ -386,22 +386,114 @@ def test_report_gh_not_authenticated_exit_1(
     assert "FAILED" in summary
 
 
-# ─── org.members.fresh fails: missing cache → exit 1 ───────────────────────
+# ─── Auto-refresh: report self-heals a missing/stale cache (ormrf7kq) ──────
 
 
-def test_report_org_members_cache_missing_exit_1(
+def test_report_missing_cache_auto_refreshes(
     monkeypatch, isolated_xdg, code_root, write_config
 ):
+    """A missing org-members cache is auto-refreshed (no flag needed),
+    then the run proceeds past the preflight rather than exiting 1.
+
+    Replaces the old missing-cache→exit-1 behavior per ormrf7kq: the
+    unattended nightly ``report`` must self-heal its own freshness
+    precondition.
+    """
     write_config(repos_slugs=["dhh1128/alpha"])  # no fresh_org_cache call
     fake = FakeGHClient(
         user={"login": "dhh1128"},
         org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
     )
     monkeypatch.setattr(
         "gitbulk.commands.report.ProductionGHClient", lambda: fake
     )
     rc = report_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_OK
+    # The cache was fetched once and written for the invariant to read.
+    assert fake.call_count["org_members"] == 1
+    assert paths.org_members_cache_file("provenant-dev").exists()
+
+
+def test_report_stale_cache_auto_refreshes(
+    monkeypatch, isolated_xdg, code_root, write_config
+):
+    """A cache older than the TTL is auto-refreshed without the flag."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    # Seed a STALE cache (fetched_at well past the 24h TTL).
+    stale_at = datetime.now(timezone.utc) - timedelta(hours=72)
+    save_cache(
+        CachedMembers(
+            org="provenant-dev",
+            fetched_at=stale_at,
+            members=frozenset({"dhh1128"}),
+        )
+    )
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128", "alice"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+    rc = report_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_OK
+    assert fake.call_count["org_members"] == 1
+    # The on-disk fetched_at advanced past the stale value.
+    from gitbulk.org_members_cache import load_cache
+
+    refreshed = load_cache("provenant-dev")
+    assert refreshed is not None
+    assert refreshed.fetched_at > stale_at
+
+
+def test_report_fresh_cache_no_auto_refresh(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    """A fresh cache is NOT refetched: no network call, run proceeds."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+    rc = report_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_OK
+    assert fake.call_count["org_members"] == 0
+
+
+def test_report_auto_refresh_failure_exit_1(
+    monkeypatch, isolated_xdg, code_root, write_config
+):
+    """If the automatic refresh itself errors (GitHub unreachable), the
+    run aborts with EXIT_STRUCTURAL_FAILURE and records the failure to
+    the run's errors.log — a genuinely unreachable org is not masked.
+    """
+    write_config(repos_slugs=["dhh1128/alpha"])  # cache missing
+    fake = FakeGHClient(user={"login": "dhh1128"})  # no org_members config
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+    rc = report_handler(_make_args(code_root=code_root))  # no flag
     assert rc == EXIT_STRUCTURAL_FAILURE
+    latest = paths.latest_run_symlink("report").resolve()
+    events = [
+        json.loads(line)
+        for line in (latest / "errors.log").read_text().splitlines()
+        if line.strip()
+    ]
+    assert any(
+        "org-members auto-refresh failed" in e.get("message", "")
+        for e in events
+    )
 
 
 # ─── --refresh-org-members triggers a cache refresh, then runs ─────────────
@@ -431,6 +523,30 @@ def test_report_refresh_org_members_triggers_refetch(
     # The cache YAML now exists for use by the invariants.
     cache_path = paths.org_members_cache_file("provenant-dev")
     assert cache_path.exists()
+
+
+def test_report_refresh_flag_forces_refetch_even_when_fresh(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    """``--refresh-org-members`` is a FORCE override: it refetches even
+    when the on-disk cache is still fresh (ormrf7kq)."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])  # already fresh
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128", "alice"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+    rc = report_handler(
+        _make_args(code_root=code_root, refresh_org_members=True)
+    )
+    assert rc == EXIT_OK
+    # Forced refetch happened despite the fresh cache.
+    assert fake.call_count["org_members"] == 1
 
 
 def test_report_refresh_org_members_failure_exit_1(

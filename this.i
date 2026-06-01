@@ -1731,11 +1731,16 @@ Gitbulk Triage Tool = goal:
           - TTL: ``policy.humans.cache_ttl_hours`` (default 24).
             Stale cache → ``org.members.fresh`` invariant Fails
             with reason "org members cache older than TTL; rerun
-            with --refresh-org-members".
+            with --refresh-org-members". NOTE: ``report`` no longer
+            relies on this hard-fail — it auto-refreshes a missing/
+            stale cache before the preflight runs (see ormrf7kq). The
+            invariant remains the safety net for the mutating
+            subcommands, which still require --refresh-org-members.
           - Refresh command (Phase 2): a CLI flag
             ``--refresh-org-members`` on the universal preflight
             forces a fetch via ``gh api orgs/<org>/members
-            --paginate``.
+            --paginate``. On ``report`` the flag is now a FORCE
+            override (refetch even when fresh); see ormrf7kq.
           - Empty / null ``policy.humans.org``: the classifier
             falls through step 3 (no org lookup), so unknown
             logins default BOT per the safer-failure-mode rule.
@@ -1743,6 +1748,56 @@ Gitbulk Triage Tool = goal:
         Test seam: classifier is pure; tests pass canned Policy +
         canned cached members. No mocking required.
       approved-by: daniel, 2026-05-28
+
+    Report Auto-Refreshes Org-Members Cache = decision:
+      id: ormrf7kq
+      why: >
+        ``report`` now refreshes the org-members cache on its own
+        whenever the cache is missing OR stale (age >=
+        ``humans.cache_ttl_hours``), instead of requiring an explicit
+        ``--refresh-org-members`` and otherwise hard-failing the
+        ``org.members.fresh`` universal preflight (the original behavior
+        described under hbcls4pq).
+
+        Trigger for this decision: the live cron deployment (shkd5crn)
+        runs ``report`` Mon–Fri at 03:00 with no flags and nothing else
+        refreshes the cache, so the 24h TTL is crossed on every run —
+        guaranteed after the weekend gap (Fri→Mon ≈ 72h). The 2026-06-01
+        run aborted at the preflight ("org members cache for
+        'provenant-dev' is older than 24h"), exit 1 → failure email,
+        and produced no triage report. A read-only nightly report that
+        cannot sustain its own freshness precondition is a defect, not a
+        user error.
+
+        Design:
+          - Auto-refresh is scoped to ``report`` ONLY. The mutating
+            subcommands (merge, close-stale, rebase-onto-default,
+            dispatch) deliberately keep the hard-fail + explicit
+            ``--refresh-org-members`` contract: they run rarely and
+            interactively, and a stale-classification surprise there is
+            higher-stakes (could mis-classify a human as a bot and act).
+            Only the unattended read-only path needs to self-heal.
+          - ``--refresh-org-members`` is retained as a FORCE override:
+            it refetches even when the cache is fresh.
+          - The refresh still runs INSIDE the global lock with a RunState
+            already begun (preserves security-hawk F4, shawk7nq): the
+            network fetch + cache write stay inside the audit envelope.
+          - A refresh failure (gh error) still aborts with
+            EXIT_STRUCTURAL_FAILURE and records the error to the run's
+            errors.log, so a genuinely unreachable GitHub is not masked.
+            The error message distinguishes the forced
+            (``--refresh-org-members failed``) from the automatic
+            (``org-members auto-refresh failed``) path.
+          - The ``org.members.fresh`` invariant is unchanged and remains
+            the universal safety net; its Fail branches stay live for the
+            mutating subcommands that do not auto-refresh.
+
+        Considered and rejected: auto-refreshing in ALL subcommands
+        (broader blast radius on the mutating paths, not requested);
+        widening the cron TTL or adding ``--refresh-org-members`` to the
+        crontab line (treats the symptom, leaves the self-heal gap for
+        any future unattended report invocation).
+      approved-by: daniel, 2026-06-01
 
     Security Hawk Findings Disposition = decision:
       id: shawk7nq

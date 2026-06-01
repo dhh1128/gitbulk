@@ -314,7 +314,9 @@ def _add_report_args(sp: argparse.ArgumentParser) -> None:
         default=False,
         help=(
             "Force a fresh fetch of the configured humans.org members "
-            "before running the report."
+            "even when the cache is still within its TTL. report "
+            "auto-refreshes a missing or stale cache on its own; this "
+            "flag forces a refetch regardless."
         ),
     )
 
