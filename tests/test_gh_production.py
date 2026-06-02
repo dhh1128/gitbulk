@@ -1612,11 +1612,36 @@ def test_cached_archived_returns_copy():
     assert client._archived_cache["a/b"] is True
 
 
+def test_prefetch_chunks_at_fifty_not_one_hundred():
+    """Regression guard (2026-06-02): selecting isArchived alongside the
+    branch raised per-node GraphQL cost enough that 100-node chunks began
+    returning HTTP 502. The chunk size must stay <= 50. With 51 slugs we
+    expect TWO subprocess calls (50 + 1), and the first query must carry
+    no more than 50 aliased nodes."""
+    payload = {"data": {}}
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps(payload)),
+        _CompletedFake(0, stdout=json.dumps(payload)),
+    )
+    slugs = [f"o/r{i}" for i in range(51)]
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.prefetch_default_branches(slugs)
+    assert mock_run.call_count == 2, "51 slugs at chunk=50 → 2 round-trips"
+    first_query = mock_run.call_args_list[0][0][0][
+        mock_run.call_args_list[0][0][0].index("-f") + 1
+    ]
+    # Highest alias in the first chunk is r49 (50 nodes: r0..r49); r50
+    # would mean a chunk size > 50.
+    assert "r49: repository" in first_query
+    assert "r50: repository" not in first_query
+
+
 def test_prefetch_reports_progress_per_chunk():
     """on_progress is called after each chunk with (done, total). With
-    3 slugs and chunk size 100 there's one chunk → one callback at
-    (3, 3). The contract is cumulative-completed, so the final call
-    always equals (total, total)."""
+    3 slugs (one chunk) there's a single callback at (3, 3). The contract
+    is cumulative-completed, so the final call always equals
+    (total, total)."""
     payload = {
         "data": {
             "r0": {"defaultBranchRef": {"name": "main"}},

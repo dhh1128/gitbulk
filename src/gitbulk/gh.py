@@ -1046,14 +1046,17 @@ class ProductionGHClient:
         # verified non-deprecated against gh CLI 2026-05-28
         # GraphQL with aliased repository() nodes lets us look up N
         # default branches per round-trip. We chunk at _CHUNK because
-        # empirically (2026-05-29, 205-repo fleet) GitHub returns
-        # HTTP 502 at ~150 nodes; 100 is reliable (~8s) and 50 also
-        # works (~5s). 100 means fewer round-trips for big fleets.
+        # GitHub returns HTTP 502 once the per-request query cost gets too
+        # high. Each node now selects ``defaultBranchRef { name }`` AND
+        # ``isArchived``; that extra field raised per-node cost enough that
+        # 100-node chunks began 502-ing (verified 2026-06-02 against the
+        # 204-repo fleet: 100 nodes → HTTP 502, 50 nodes → clean ~5s). So
+        # the chunk size is 50, not 100. See node ghclmp7n.c.
         slug_list = [s for s in slugs if "/" in s]
         total = len(slug_list)
         if total == 0:
             return
-        _CHUNK = 100
+        _CHUNK = 50
         done = 0
         for start in range(0, total, _CHUNK):
             chunk = slug_list[start : start + _CHUNK]
