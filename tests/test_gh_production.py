@@ -1517,6 +1517,101 @@ def test_cached_default_branches_returns_copy():
     assert client._default_branch_cache["a/b"] == "main"
 
 
+# ─── isArchived: piggybacks on the default-branch prefetch ─────────────────
+
+
+def test_prefetch_query_includes_is_archived():
+    """The coalesced repository() node also selects isArchived so the
+    archived gate costs no extra round-trip (same query as branches)."""
+    payload = {
+        "data": {"r0": {"defaultBranchRef": {"name": "main"}, "isArchived": False}}
+    }
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.prefetch_default_branches(["dhh1128/alpha"])
+    args, _ = mock_run.call_args
+    query = args[0][args[0].index("-f") + 1]
+    assert "isArchived" in query
+
+
+def test_prefetch_populates_archived_cache():
+    """After prefetch, is_archived(slug) returns the cached value with no
+    further subprocess call."""
+    payload = {
+        "data": {
+            "r0": {"defaultBranchRef": {"name": "main"}, "isArchived": True},
+            "r1": {"defaultBranchRef": {"name": "main"}, "isArchived": False},
+        }
+    }
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.prefetch_default_branches(["a/archived", "a/live"])
+        assert client.is_archived("a/archived") is True
+        assert client.is_archived("a/live") is False
+    # Only the prefetch call — is_archived hit memory both times.
+    assert mock_run.call_count == 1
+
+
+def test_prefetch_records_archived_even_when_branch_ref_null():
+    """An archived repo can still report isArchived even if defaultBranchRef
+    is null (e.g. empty repo). Archived status is recorded independently of
+    the branch name."""
+    payload = {
+        "data": {"r0": {"defaultBranchRef": None, "isArchived": True}}
+    }
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        client.prefetch_default_branches(["a/empty-archived"])
+    # No branch cached (ref was null) but archived status IS recorded.
+    assert client._default_branch_cache == {}
+    assert client.is_archived("a/empty-archived") is True
+
+
+def test_is_archived_cache_miss_falls_back_to_rest():
+    """A slug not primed falls through to a per-slug REST call returning
+    the repo's `archived` boolean."""
+    side_effect = _make_run_mock(_CompletedFake(0, stdout="true\n"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        result = client.is_archived("dhh1128/alpha")
+    assert result is True
+    assert mock_run.call_count == 1
+    args, _ = mock_run.call_args
+    argv = args[0]
+    assert argv[1] == "api"
+    assert "repos/dhh1128/alpha" in argv
+    assert ".archived" in argv
+
+
+def test_is_archived_rest_false():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout="false\n"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        assert client.is_archived("dhh1128/alpha") is False
+
+
+def test_seed_archived_populates_cache_no_network():
+    with patch("gitbulk.gh.subprocess.run") as mock_run:
+        client = ProductionGHClient()
+        client.seed_archived({"a/b": True, "c/d": False})
+        assert client.is_archived("a/b") is True
+        assert client.is_archived("c/d") is False
+    assert mock_run.call_count == 0
+
+
+def test_cached_archived_returns_copy():
+    with patch("gitbulk.gh.subprocess.run"):
+        client = ProductionGHClient()
+        client.seed_archived({"a/b": True})
+        snap = client.cached_archived()
+    assert snap == {"a/b": True}
+    snap["a/b"] = False
+    assert client._archived_cache["a/b"] is True
+
+
 def test_prefetch_reports_progress_per_chunk():
     """on_progress is called after each chunk with (done, total). With
     3 slugs and chunk size 100 there's one chunk → one callback at

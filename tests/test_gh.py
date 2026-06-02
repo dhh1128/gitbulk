@@ -412,6 +412,56 @@ def test_fake_cached_default_branches_empty_when_unset():
     assert fake.cached_default_branches() == {}
 
 
+# ─── FakeGHClient.is_archived / archived cache ─────────────────────────────
+
+
+def test_fake_is_archived_defaults_false_for_unconfigured():
+    """Unlike default_branch (which raises when unconfigured), is_archived
+    defaults to False so every chain test that doesn't care about archived
+    status still passes the github.not_archived gate."""
+    fake = FakeGHClient()  # archived unset
+    assert fake.is_archived("a/b") is False
+    assert fake.call_count["is_archived"] == 1
+
+
+def test_fake_is_archived_returns_configured_true():
+    fake = FakeGHClient(archived={"a/b": True, "c/d": False})
+    assert fake.is_archived("a/b") is True
+    assert fake.is_archived("c/d") is False
+    # A slug absent from the map is treated as not-archived.
+    assert fake.is_archived("e/f") is False
+
+
+def test_fake_is_archived_raises_configured_exception():
+    """An Exception value in the archived map is raised — mirrors the
+    merge_responses 'value-or-Exception' pattern so the GHError→Skip
+    branch of github.not_archived is testable."""
+    fake = FakeGHClient(archived={"a/b": GHError("boom")})
+    with pytest.raises(GHError):
+        fake.is_archived("a/b")
+
+
+def test_fake_seed_archived_merges():
+    fake = FakeGHClient(archived={"a/b": True})
+    fake.seed_archived({"c/d": True})
+    assert fake.is_archived("a/b") is True
+    assert fake.is_archived("c/d") is True
+
+
+def test_fake_cached_archived_returns_bool_only_copy():
+    fake = FakeGHClient(archived={"a/b": True, "c/d": False, "x/y": GHError("z")})
+    snap = fake.cached_archived()
+    # Exception entries are excluded so prime_default_branches only
+    # persists real booleans.
+    assert snap == {"a/b": True, "c/d": False}
+    snap["a/b"] = False
+    assert fake.is_archived("a/b") is True  # internal unaffected
+
+
+def test_fake_cached_archived_empty_when_unset():
+    assert FakeGHClient().cached_archived() == {}
+
+
 # ─── FakeGHClient.fetch_merge_commit_sha ───────────────────────────────────
 
 

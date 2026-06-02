@@ -37,6 +37,7 @@ from gitbulk.invariants import catalog
 from gitbulk.invariants.catalog import (
     ConfigParseableInvariant,
     GhAuthenticatedInvariant,
+    GithubNotArchivedInvariant,
     GithubReachableInvariant,
     LocalDefaultBranchInSyncInvariant,
     LocalExistsInvariant,
@@ -161,6 +162,7 @@ def test_all_phase2_invariants_registered():
         "local.remote_matches",
         "local.default_branch_in_sync",
         "github.reachable",
+        "github.not_archived",
         "pr.base_is_default",
         "pr.author_known",
         "pr.mergeable_state_clean",
@@ -184,6 +186,7 @@ def test_kinds_are_set_correctly():
     assert LocalRemoteMatchesInvariant.kind == InvariantKind.PER_REPO
     assert LocalDefaultBranchInSyncInvariant.kind == InvariantKind.PER_REPO
     assert GithubReachableInvariant.kind == InvariantKind.PER_REPO
+    assert GithubNotArchivedInvariant.kind == InvariantKind.PER_REPO
     assert PrBaseIsDefaultInvariant.kind == InvariantKind.PER_PR
     assert PrAuthorKnownInvariant.kind == InvariantKind.PER_PR
     assert PrMergeableStateCleanInvariant.kind == InvariantKind.PER_PR
@@ -627,6 +630,54 @@ def test_github_reachable_skip_when_gh_errors(runstate, repo):
     result = GithubReachableInvariant().check(ctx)
     assert isinstance(result, Skip)
     assert "github not reachable" in result.reason
+
+
+# ─── github.not_archived ───────────────────────────────────────────────────
+
+
+def test_github_not_archived_pass_when_not_archived(runstate, repo):
+    gh = FakeGHClient(archived={"dhh1128/gitbulk": False})
+    ctx = _ctx(runstate, repo=repo, gh=gh)
+    assert GithubNotArchivedInvariant().check(ctx) == Pass()
+
+
+def test_github_not_archived_pass_when_unconfigured(runstate, repo):
+    """A repo absent from the archived map is treated as live → Pass.
+    Keeps the gate transparent for the overwhelming majority of repos."""
+    gh = FakeGHClient(archived={})
+    ctx = _ctx(runstate, repo=repo, gh=gh)
+    assert GithubNotArchivedInvariant().check(ctx) == Pass()
+
+
+def test_github_not_archived_skip_when_archived(runstate, repo):
+    gh = FakeGHClient(archived={"dhh1128/gitbulk": True})
+    ctx = _ctx(runstate, repo=repo, gh=gh)
+    result = GithubNotArchivedInvariant().check(ctx)
+    assert isinstance(result, Skip)
+    assert "archived" in result.reason
+    assert "dhh1128/gitbulk" in result.reason
+
+
+def test_github_not_archived_fail_no_repo(runstate):
+    ctx = _ctx(runstate, repo=None, gh=FakeGHClient(archived={}))
+    result = GithubNotArchivedInvariant().check(ctx)
+    assert isinstance(result, Fail)
+    assert "without ctx.repo" in result.reason
+
+
+def test_github_not_archived_fail_no_gh(runstate, repo):
+    ctx = _ctx(runstate, repo=repo, gh=None)
+    result = GithubNotArchivedInvariant().check(ctx)
+    assert isinstance(result, Fail)
+    assert "without ctx.gh" in result.reason
+
+
+def test_github_not_archived_skip_when_gh_errors(runstate, repo):
+    gh = FakeGHClient(archived={"dhh1128/gitbulk": GHError("boom")})
+    ctx = _ctx(runstate, repo=repo, gh=gh)
+    result = GithubNotArchivedInvariant().check(ctx)
+    assert isinstance(result, Skip)
+    assert "dhh1128/gitbulk" in result.reason
 
 
 # ─── pr.base_is_default ────────────────────────────────────────────────────

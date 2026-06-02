@@ -17,6 +17,7 @@ Invariant catalog:
     - local.remote_matches
     - local.default_branch_in_sync
     - github.reachable
+    - github.not_archived
 
   PER_PR baseline
     - pr.base_is_default
@@ -308,6 +309,51 @@ class GithubReachableInvariant(Invariant):
             ctx.gh.default_branch(ctx.repo.slug)
         except GHError as e:
             return Skip(f"github not reachable for {ctx.repo.slug}: {e}")
+        return Pass()
+
+
+@register
+class GithubNotArchivedInvariant(Invariant):
+    """Skip repos that are archived on GitHub.
+
+    An archived repo still answers read queries — ``github.reachable``
+    passes and ``gh pr list`` can return lingering open PRs — but GitHub
+    refuses every mutation (merge, branch delete, push, close). Without
+    this gate an archived repo's stale PR shows up as ATTENTION in the
+    report and, worse, ``merge --apply`` would list it as eligible and
+    then fail at the ``gh pr merge`` boundary (counted as a failure,
+    exit 2). Skipping it here — right after reachability, before any
+    PR-level work — drops the repo cleanly from every gh-touching
+    subcommand with a prominent reason.
+
+    Archived status comes from the same cache the default-branch prefetch
+    populates (``gh.is_archived`` selects ``isArchived`` in the coalesced
+    query), so this adds no per-run network cost on a warm cache. A
+    transient failure to determine archived status is treated as a Skip,
+    matching ``github.reachable``'s GHError-Skip convention (conservative
+    safety wins, per AGENTS.md).
+    """
+
+    name = "github.not_archived"
+    kind = InvariantKind.PER_REPO
+    subcommands = _ALL_SUBS
+
+    def check(self, ctx: InvariantContext) -> Result:
+        if ctx.repo is None:
+            return Fail("per-repo invariant called without ctx.repo")
+        if ctx.gh is None:
+            return Fail("per-repo invariant called without ctx.gh")
+        try:
+            archived = ctx.gh.is_archived(ctx.repo.slug)
+        except GHError as e:
+            return Skip(
+                f"archived status unavailable for {ctx.repo.slug}: {e}"
+            )
+        if archived:
+            return Skip(
+                f"{ctx.repo.slug} is archived on GitHub; "
+                "gitbulk cannot act on its PRs"
+            )
         return Pass()
 
 

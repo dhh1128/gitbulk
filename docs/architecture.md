@@ -166,9 +166,10 @@ src/gitbulk/
     runner.py             — chain runner; first Fail aborts, Skips collected
     catalog.py            — concrete invariants: gh.authenticated,
                             config.parseable, org.members.fresh,
-                            github.reachable, pr.base_is_default,
-                            pr.author_known, local.exists,
-                            local.remote_matches, local.default_branch_in_sync
+                            github.reachable, github.not_archived,
+                            pr.base_is_default, pr.author_known,
+                            local.exists, local.remote_matches,
+                            local.default_branch_in_sync
   classifier.py           — humans-vs-bots resolution (hbcls4pq)
   org_members_cache.py    — org members cache reader/writer (CachedMembers,
                             save/load, refresh_cache, freshness check)

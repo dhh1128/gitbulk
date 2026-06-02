@@ -153,6 +153,7 @@ so an audit can find every loosened operation.
 - `local.remote_matches`
 - `local.default_branch_in_sync`
 - `github.reachable`
+- `github.not_archived`
 
 **Per-PR baseline (report, summarize, dispatch, merge, rebase, close):**
 - `pr.base_is_default`

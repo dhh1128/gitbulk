@@ -54,10 +54,20 @@ DEFAULT_TTL_DAYS = 7
 
 @dataclass(frozen=True)
 class CachedBranch:
-    """One cache entry: the default branch and when it was fetched."""
+    """One cache entry: the default branch, when it was fetched, and the
+    repo's archived status.
+
+    ``archived`` piggybacks on this cache because it is resolved by the
+    same coalesced GraphQL prefetch (``isArchived`` is selected alongside
+    ``defaultBranchRef``). It defaults to False so bare two-arg
+    construction keeps working and a legacy entry with no ``archived`` key
+    loads as not-archived — the safe direction, since it never causes a
+    live repo to be wrongly skipped.
+    """
 
     branch: str
     fetched_at: datetime
+    archived: bool = False
 
 
 # ─── load ───────────────────────────────────────────────────────────────────
@@ -82,7 +92,11 @@ def _coerce_entry(raw: Any) -> CachedBranch | None:
         return None
     if fetched_at.tzinfo is None:
         return None
-    return CachedBranch(branch=branch, fetched_at=fetched_at.astimezone(timezone.utc))
+    return CachedBranch(
+        branch=branch,
+        fetched_at=fetched_at.astimezone(timezone.utc),
+        archived=bool(raw.get("archived", False)),
+    )
 
 
 def load_cache() -> dict[str, CachedBranch]:
@@ -132,6 +146,7 @@ def save_cache(branches: dict[str, CachedBranch]) -> None:
             slug: {
                 "branch": cb.branch,
                 "fetched_at": cb.fetched_at.astimezone(timezone.utc).isoformat(),
+                "archived": cb.archived,
             }
             for slug, cb in sorted(branches.items())
         },
@@ -193,6 +208,9 @@ def prime_default_branches(
 
     if fresh:
         gh.seed_default_branches({slug: cb.branch for slug, cb in fresh.items()})
+        # Seed archived status too so the github.not_archived gate works on
+        # an all-warm run (no network).
+        gh.seed_archived({slug: cb.archived for slug, cb in fresh.items()})
 
     if missing:
         gh.prefetch_default_branches(missing, on_progress=on_progress)
@@ -207,10 +225,15 @@ def prime_default_branches(
     # (deleted repo) won't be in the in-process cache — drop any stale
     # file entry for it so we don't keep serving a dead branch forever.
     resolved = gh.cached_default_branches()
+    resolved_archived = gh.cached_archived()
     for slug in missing:
         branch = resolved.get(slug)
         if branch is not None:
-            merged[slug] = CachedBranch(branch=branch, fetched_at=now)
+            merged[slug] = CachedBranch(
+                branch=branch,
+                fetched_at=now,
+                archived=bool(resolved_archived.get(slug, False)),
+            )
         else:
             merged.pop(slug, None)
     save_cache(merged)

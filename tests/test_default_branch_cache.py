@@ -305,3 +305,75 @@ def test_prime_defaults_now_to_wall_clock():
 
 def test_default_ttl_is_seven_days():
     assert DEFAULT_TTL_DAYS == 7
+
+
+# ─── archived status (piggybacks on the default-branch cache) ───────────────
+
+
+def test_archived_round_trips_through_save_load():
+    save_cache(
+        {
+            "a/archived": CachedBranch("main", _now(), archived=True),
+            "a/live": CachedBranch("main", _now(), archived=False),
+        }
+    )
+    loaded = load_cache()
+    assert loaded["a/archived"].archived is True
+    assert loaded["a/live"].archived is False
+
+
+def test_load_defaults_archived_false_for_legacy_entry():
+    """A pre-archived cache file (no `archived` key) loads as not-archived —
+    backward compatible, and the safe direction (won't wrongly skip)."""
+    paths.default_branch_cache_file().write_text(
+        yaml.safe_dump(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "branches": {
+                    "a/b": {"branch": "main", "fetched_at": _now().isoformat()},
+                },
+            }
+        )
+    )
+    loaded = load_cache()
+    assert loaded["a/b"].archived is False
+
+
+def test_cachedbranch_archived_defaults_false():
+    """The dataclass default keeps existing two-arg construction working."""
+    assert CachedBranch("main", _now()).archived is False
+
+
+def test_prime_seeds_archived_from_fresh_entries():
+    """Warm entries seed gh's archived cache (no network), so the
+    github.not_archived gate works on an all-warm run."""
+    save_cache(
+        {
+            "warm/archived": CachedBranch(
+                "main", _now() - timedelta(days=1), archived=True
+            ),
+        }
+    )
+    gh = FakeGHClient(default_branches={}, archived={})
+    prime_default_branches(gh, ["warm/archived"], now=_now())
+    assert gh.call_count["prefetch_default_branches"] == 0
+    assert gh.is_archived("warm/archived") is True
+
+
+def test_prime_persists_archived_from_fetch():
+    """After a cold fetch, the resolved archived flag is written to the
+    file cache (read back from gh.cached_archived())."""
+    gh = FakeGHClient(
+        default_branches={"a/b": "main"}, archived={"a/b": True}
+    )
+    prime_default_branches(gh, ["a/b"], now=_now())
+    persisted = load_cache()
+    assert persisted["a/b"].archived is True
+
+
+def test_prime_persists_archived_false_when_not_archived():
+    gh = FakeGHClient(
+        default_branches={"a/b": "main"}, archived={"a/b": False}
+    )
+    prime_default_branches(gh, ["a/b"], now=_now())
+    assert load_cache()["a/b"].archived is False

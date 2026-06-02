@@ -122,6 +122,31 @@ class GHClient(Protocol):
         """
         ...
 
+    def is_archived(self, slug: str, *, timeout: float | None = None) -> bool:
+        """Return True iff ``slug`` is archived on GitHub.
+
+        Backs the ``github.not_archived`` PER_REPO invariant. Archived
+        status is populated as a side effect of
+        :meth:`prefetch_default_branches` (the same coalesced GraphQL
+        query selects ``isArchived``), so on a warm cache this is a
+        memory hit with no network cost. A cache miss falls back to a
+        per-slug REST lookup of the repo's ``archived`` field.
+        """
+        ...
+
+    def seed_archived(self, mapping: dict[str, bool]) -> None:
+        """Populate the in-process archived cache from an external source
+        (the on-disk default-branch cache) WITHOUT any network call."""
+        ...
+
+    def cached_archived(self) -> dict[str, bool]:
+        """Return a copy of the current in-process archived cache.
+
+        Used by :mod:`gitbulk.default_branch_cache` to read back what a
+        prefetch resolved so it can be persisted alongside the branch.
+        """
+        ...
+
     def my_open_prs(
         self,
         slugs: Iterable[str] | None = None,
@@ -365,6 +390,7 @@ class FakeGHClient:
             tuple[str, int], "dict[str, Any] | Exception"
         ] | None = None,
         repo_permissions: Mapping[str, str] | None = None,
+        archived: Mapping[str, "bool | Exception"] | None = None,
     ) -> None:
         self._user = user
         self._org_members = dict(org_members) if org_members is not None else None
@@ -406,6 +432,15 @@ class FakeGHClient:
         self._repo_permissions = (
             dict(repo_permissions) if repo_permissions is not None else None
         )
+        # Archived map doubles as the in-process archived cache. Unlike
+        # default_branches (None → raise), an unset/missing slug here
+        # resolves to False, so every chain test that doesn't configure
+        # archived still passes the github.not_archived gate. A slug whose
+        # value is an Exception raises it (mirrors merge_responses) so the
+        # GHError→Skip branch is testable.
+        self._archived: dict[str, "bool | Exception"] = (
+            dict(archived) if archived is not None else {}
+        )
         # Per-call argument records so tests can assert merge_pr was
         # invoked with the right method / delete_branch flags.
         self.merge_calls: list[dict[str, Any]] = []
@@ -428,6 +463,7 @@ class FakeGHClient:
             "prefetch_default_branches": 0,
             "approve_pr": 0,
             "viewer_repo_permission": 0,
+            "is_archived": 0,
         }
 
     def authenticated_user(self, *, timeout: float | None = None) -> dict[str, Any]:
@@ -478,6 +514,22 @@ class FakeGHClient:
     def cached_default_branches(self) -> dict[str, str]:
         """Return a copy of the fake's configured default-branches map."""
         return dict(self._default_branches or {})
+
+    def is_archived(self, slug: str, *, timeout: float | None = None) -> bool:
+        self.call_count["is_archived"] += 1
+        v = self._archived.get(slug)
+        if isinstance(v, Exception):
+            raise v
+        return bool(v)
+
+    def seed_archived(self, mapping: dict[str, bool]) -> None:
+        self._archived.update(mapping)
+
+    def cached_archived(self) -> dict[str, bool]:
+        """Return a copy of the archived map, booleans only (Exception
+        entries — used to exercise the error path — are excluded so they
+        never reach the on-disk cache)."""
+        return {k: v for k, v in self._archived.items() if isinstance(v, bool)}
 
     def my_open_prs(
         self,
@@ -852,6 +904,11 @@ class ProductionGHClient:
         #: fall back to a per-slug REST call. Per-process only — not
         #: persisted to disk in this stage.
         self._default_branch_cache: dict[str, str] = {}
+        #: Archived status, populated by the same coalesced prefetch
+        #: (``isArchived`` is selected alongside ``defaultBranchRef``).
+        #: ``is_archived`` consults this first and falls back to REST on
+        #: a miss. Seeded from disk by ``default_branch_cache``.
+        self._archived_cache: dict[str, bool] = {}
 
     # ─── private helpers ───────────────────────────────────────────────
 
@@ -960,6 +1017,25 @@ class ProductionGHClient:
     def cached_default_branches(self) -> dict[str, str]:
         return dict(self._default_branch_cache)
 
+    def is_archived(self, slug: str, *, timeout: float | None = None) -> bool:
+        # In-process cache populated by prefetch_default_branches.
+        # Cache miss falls through to the per-slug REST call below.
+        cached = self._archived_cache.get(slug)
+        if cached is not None:
+            return cached
+        # verified non-deprecated against gh CLI 2026-06-02
+        stdout = self._run(
+            ("api", f"repos/{slug}", "--jq", ".archived"),
+            timeout=timeout,
+        )
+        return stdout.strip().lower() == "true"
+
+    def seed_archived(self, mapping: dict[str, bool]) -> None:
+        self._archived_cache.update(mapping)
+
+    def cached_archived(self) -> dict[str, bool]:
+        return dict(self._archived_cache)
+
     def prefetch_default_branches(
         self,
         slugs: Iterable[str],
@@ -1014,7 +1090,7 @@ class ProductionGHClient:
             # regex rejects quotes and backslashes.)
             body_lines.append(
                 f'  {alias}: repository(owner: "{owner}", name: "{name}") '
-                "{ defaultBranchRef { name } }"
+                "{ defaultBranchRef { name } isArchived }"
             )
         query = "query {\n" + "\n".join(body_lines) + "\n}\n"
         argv = (self._gh_path, "api", "graphql", "-f", f"query={query}")
@@ -1062,6 +1138,12 @@ class ProductionGHClient:
             node = data.get(alias)
             if not isinstance(node, dict):
                 continue
+            # Archived status is recorded independently of the branch name:
+            # an archived (or empty) repo may have a null defaultBranchRef
+            # yet still report isArchived.
+            archived = node.get("isArchived")
+            if isinstance(archived, bool):
+                self._archived_cache[slug] = archived
             ref = node.get("defaultBranchRef")
             if not isinstance(ref, dict):
                 continue
