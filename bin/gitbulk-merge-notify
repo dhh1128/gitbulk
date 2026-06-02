@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Nightly `gitbulk merge --apply` with a POSITIVE-ONLY email channel.
+#
+# Companion to `gitbulk-cron`. It runs `gitbulk-cron merge --apply` (so all
+# of the wrapper's logging, locking, log-retention and exit-code symlinks
+# still apply) and then decides what — if anything — to put on stdout, which
+# is what cron mails to MAILTO.
+#
+# Email policy (a superset of gitbulk-cron's failure-only policy):
+#   * Structural failure (gitbulk-cron exit 1 / unexpected): gitbulk-cron
+#     already writes a one-line status to stdout; we pass it through, so the
+#     existing failure email still fires.
+#   * A night that ACTED on PRs: if the merge run produced a "## Merge
+#     results" section (only present on an --apply run that had at least one
+#     eligible PR), we append the full run summary to stdout → cron mails it.
+#     This covers both successful merges AND any per-PR merge FAILURES — the
+#     latter exit 2, which gitbulk-cron keeps email-silent, so without this
+#     a failed merge could go unnoticed.
+#   * A quiet no-op night (no eligible PRs): nothing on stdout → no email.
+#
+# Exit code is gitbulk-cron's, untouched, so the exit-code-aware symlinks and
+# any downstream interpretation stay consistent.
+#
+# Usage from crontab (mail the result only when something happened):
+#   0 3 * * 1-5 /home/daniel/code/gitbulk/bin/gitbulk-merge-notify
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WRAPPER="${HERE}/gitbulk-cron"
+CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/gitbulk"
+SUMMARY="${CACHE_DIR}/runs/latest-merge/summary.md"
+
+if [ ! -x "${WRAPPER}" ]; then
+    echo "gitbulk-merge-notify: cannot find executable gitbulk-cron at ${WRAPPER}" >&2
+    exit 1
+fi
+
+# Run the merge through the standard cron wrapper. Capture its stdout (which
+# the wrapper only writes on a structural failure) so we can re-emit it and
+# preserve the failure-only email path. Do NOT let a non-zero rc abort us.
+set +e
+cron_stdout="$("${WRAPPER}" merge --apply)"
+rc=$?
+set -e 2>/dev/null || true
+
+# 1. Pass through gitbulk-cron's failure-only stdout verbatim.
+if [ -n "${cron_stdout}" ]; then
+    printf '%s\n' "${cron_stdout}"
+fi
+
+# 2. Positive (and failed-merge) channel: the "## Merge results" header is
+#    written only when the apply run had eligible PRs. Its presence means the
+#    run acted (or tried to). Mail the whole summary in that case.
+if [ -f "${SUMMARY}" ] && grep -q '^## Merge results' "${SUMMARY}"; then
+    echo
+    echo "=== gitbulk nightly merge --apply: action taken (see results below) ==="
+    echo "summary: ${SUMMARY}"
+    echo
+    cat "${SUMMARY}"
+fi
+
+exit "${rc}"
