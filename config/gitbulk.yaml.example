@@ -13,6 +13,7 @@ defaults:
   stale_age_days: 90             # close-stale: inactivity threshold
   stale_cooloff_days: 7          # close-stale: must have been warned at least this long ago
   stale_policy: warn-and-close   # warn-and-close | warn-only | never
+  prune_min_age_days: 7          # prune-branches/-worktrees: grace period since a PR merged/closed
   # skip_checks: []              # invariants suppressed for every repo
   # extra_checks: []             # extra invariants enabled for every repo
 
