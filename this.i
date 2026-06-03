@@ -803,6 +803,10 @@ Gitbulk Triage Tool = goal:
             because a 0-exit on one subcommand does not necessarily
             mean every concern from a previous subcommand has been
             resolved.
+            REFINED by node aklr5pq3 (2026-06-03): same-subcommand 0-exit
+            supersession and view-the-flagged-run clearing are now safe
+            implicit triggers; the cross-subcommand concern stated here is
+            preserved (those cases still need `ack`).
 
         Subcommand stubs for report/summarize/dispatch/merge/
         rebase-onto-default/close-stale/show continue to return 99
@@ -931,6 +935,62 @@ Gitbulk Triage Tool = goal:
         process at a time (guaranteed by the global lock acquired
         upstream). read_attention silently returns None if the file
         is missing — `has_attention` is the explicit existence test.
+
+    Implicit ATTENTION clearing = decision:
+      id: aklr5pq3
+      why: >
+        Refines clip7nm4's "only `gitbulk ack` clears" stance. clip7nm4
+        rejected clearing on a 0-exit because "a 0-exit on one subcommand
+        does not necessarily mean every concern from a previous subcommand
+        has been resolved." That objection is real but narrower than the
+        blanket rule it produced: it only argues against CROSS-subcommand
+        clearing. Within the same subcommand, and when the operator
+        demonstrably views the flagged run, an implicit clear is safe and
+        removes friction (the alternative — a stale yellow glyph that
+        outlives its cause until a separate `ack` — trains the operator to
+        ignore the glyph).
+
+        Three implicit-clear triggers are added; `ack` remains the
+        unconditional hammer (clears any sentinel, including a corrupt or
+        legacy-format one):
+
+          1. `gitbulk show <sub>` (any artifact, including --path) clears
+             the sentinel IFF it was set by the run being viewed: the
+             sentinel's subcommand == <sub> AND its runid == the runid of
+             the resolved `latest-<sub>` run. A "?" fallback runid (written
+             by _maybe_set_attention when a handler did not record its own)
+             never matches — those still require `ack`. Viewing a DIFFERENT
+             subcommand's run never clears (preserves clip7nm4's concern).
+
+          2. `gitbulk show` with no arg (the dashboard) clears WHATEVER
+             parseable sentinel is present. The dashboard aggregates every
+             subcommand's latest-run summary, so it is the broad "I looked"
+             gesture; weaker evidence than (1) but the user accepted it.
+             An unparseable/legacy sentinel is left for `ack` (the note
+             needs a parseable payload to describe what was cleared).
+
+          3. A clean (exit 0) run of an attention-PRODUCING subcommand
+             (report, summarize, dispatch, merge, rebase-pr, close-stale —
+             marked by Subcommand.sets_attention) supersedes a sentinel the
+             SAME subcommand set earlier: the condition that raised the
+             alert has resolved. Cross-subcommand sentinels are left intact
+             (a clean `report` must not dismiss a `dispatch` failure). Only
+             exit 0 supersedes — exit 1/2/3 means the run itself did not
+             complete cleanly, so it cannot claim the prior concern is gone.
+
+        sentinel.py gains clear_if_matches(subcommand, runid),
+        clear_if_superseded(subcommand), and clear_and_describe(); each
+        returns the cleared payload (or None) so callers can emit a
+        one-line note. Notes go to STDERR in `show` so they never corrupt
+        an artifact piped from stdout (e.g. `gitbulk show report --state |
+        yq`). Clearing keeps `show` mutating=False: per clip7nm4 the
+        sentinel is local-cache state, and `ack` itself is mutating=False
+        despite deleting it; "mutating" in gitbulk means touches GitHub.
+        `show` already holds the shared global lock, which is what guards
+        the read+clear against a concurrent exclusive run swapping the
+        symlink.
+      approved-by: daniel, 2026-06-03
+      supersedes-aspect-of: clip7nm4
 
     Policy Config Loader Schema = decision:
       id: ck5pwr2n

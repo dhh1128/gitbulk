@@ -298,3 +298,123 @@ def test_show_via_main_path_flag(report_run):
         rc = main(["show", "report", "--path"])
     assert rc == EXIT_OK
     assert str(report_run) in out.getvalue()
+
+
+# ─── Implicit ATTENTION clearing (node aklr5pq3) ───────────────────────────
+
+
+def _runid_of(run_dir, subcommand: str) -> str:
+    name = run_dir.name
+    suffix = f"-{subcommand}"
+    assert name.endswith(suffix)
+    return name[: -len(suffix)]
+
+
+def test_show_subcommand_clears_matching_sentinel(report_run):
+    """Viewing the exact run that raised the alert dismisses it (trigger 1)."""
+    from gitbulk import sentinel
+
+    runid = _runid_of(report_run, "report")
+    sentinel.set_attention(2, "report", runid, "4 PRs need attention")
+    out, err = StringIO(), StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = show_handler(_make_args(show_subcommand="report"))
+    assert rc == EXIT_OK
+    assert not sentinel.has_attention()
+    # The clear note goes to stderr so it never corrupts the piped artifact.
+    assert "cleared" in err.getvalue().lower()
+    assert "report" in err.getvalue()
+    # The artifact itself is untouched on stdout.
+    assert "gitbulk report" in out.getvalue()
+    assert "cleared" not in out.getvalue().lower()
+
+
+def test_show_subcommand_path_flag_also_clears_matching_sentinel(report_run):
+    from gitbulk import sentinel
+
+    runid = _runid_of(report_run, "report")
+    sentinel.set_attention(2, "report", runid, "summary")
+    out, err = StringIO(), StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = show_handler(_make_args(show_subcommand="report", path=True))
+    assert rc == EXIT_OK
+    assert not sentinel.has_attention()
+
+
+def test_show_subcommand_does_not_clear_other_subcommands_sentinel(report_run):
+    """A dispatch-set sentinel survives a `show report` (clip7nm4 concern)."""
+    from gitbulk import sentinel
+
+    sentinel.set_attention(2, "dispatch", "DID", "agent failed")
+    out = StringIO()
+    with redirect_stdout(out):
+        rc = show_handler(_make_args(show_subcommand="report"))
+    assert rc == EXIT_OK
+    assert sentinel.has_attention()
+
+
+def test_show_subcommand_does_not_clear_on_runid_mismatch(report_run):
+    """A newer/older report run's sentinel is not the one being viewed."""
+    from gitbulk import sentinel
+
+    sentinel.set_attention(2, "report", "SOME-OTHER-RUNID", "summary")
+    out = StringIO()
+    with redirect_stdout(out):
+        rc = show_handler(_make_args(show_subcommand="report"))
+    assert rc == EXIT_OK
+    assert sentinel.has_attention()
+
+
+def test_show_subcommand_failure_does_not_clear_sentinel(report_run):
+    """A missing artifact (exit 1) means the user saw nothing — keep alert."""
+    from gitbulk import sentinel
+
+    runid = _runid_of(report_run, "report")
+    sentinel.set_attention(2, "report", runid, "summary")
+    (report_run / "summary.md").unlink()
+    err = StringIO()
+    with redirect_stderr(err):
+        rc = show_handler(_make_args(show_subcommand="report"))
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    assert sentinel.has_attention()
+
+
+def test_show_dashboard_clears_any_sentinel(isolated_xdg):
+    """Bare `show` (dashboard) dismisses whatever attention is set (trigger 2)."""
+    from gitbulk import sentinel
+
+    dash = paths.dashboard_file()
+    dash.parent.mkdir(parents=True, exist_ok=True)
+    dash.write_text("# DASH\n")
+    sentinel.set_attention(2, "dispatch", "DID", "agent failed")
+    out, err = StringIO(), StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = show_handler(_make_args())
+    assert rc == EXIT_OK
+    assert not sentinel.has_attention()
+    assert "cleared" in err.getvalue().lower()
+
+
+def test_show_dashboard_missing_does_not_clear_sentinel(isolated_xdg):
+    """No dashboard printed (first-install) → nothing viewed → keep alert."""
+    from gitbulk import sentinel
+
+    sentinel.set_attention(2, "report", "RID", "summary")
+    out, err = StringIO(), StringIO()
+    with redirect_stdout(out), redirect_stderr(err):
+        rc = show_handler(_make_args())
+    assert rc == EXIT_OK
+    assert sentinel.has_attention()
+
+
+def test_clear_if_viewing_flagged_run_noop_on_unrecoverable_runid(isolated_xdg):
+    """Defensive: a run dir whose name lacks the ``-<sub>`` suffix yields no
+    recoverable runid, so the clear is skipped (left for ``ack``)."""
+    from gitbulk import sentinel
+    from gitbulk.commands.show import _clear_if_viewing_flagged_run
+
+    sentinel.set_attention(2, "report", "RID", "summary")
+    weird_dir = paths.runs_dir() / "no-suffix-here"
+    weird_dir.mkdir(parents=True, exist_ok=True)
+    _clear_if_viewing_flagged_run("report", weird_dir)
+    assert sentinel.has_attention()

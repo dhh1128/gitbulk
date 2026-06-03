@@ -120,6 +120,14 @@ class Subcommand:
     Per this.i node ``scinv4qm``. Empty tuple is valid (e.g. ``ack``,
     ``invariants``, ``show``).
     """
+    sets_attention: bool = False
+    """When True, the subcommand can raise the ATTENTION sentinel (exit 2/3)
+    and so a clean (exit 0) run of it supersedes its own stale sentinel.
+
+    Per this.i node ``aklr5pq3``. True for the six fleet operations
+    (report, summarize, dispatch, merge, rebase-pr, close-stale); False for
+    show/ack/invariants, which never set attention.
+    """
 
 
 KNOWN: tuple[Subcommand, ...] = (
@@ -130,6 +138,7 @@ KNOWN: tuple[Subcommand, ...] = (
         lock_mode="shared",
         needs_clone=False,
         invariant_chain=_GH_TOUCHING_CHAIN,
+        sets_attention=True,
     ),
     Subcommand(
         name="summarize",
@@ -138,6 +147,7 @@ KNOWN: tuple[Subcommand, ...] = (
         lock_mode="shared",
         needs_clone=False,
         invariant_chain=_GH_TOUCHING_CHAIN,
+        sets_attention=True,
     ),
     Subcommand(
         name="dispatch",
@@ -146,6 +156,7 @@ KNOWN: tuple[Subcommand, ...] = (
         lock_mode="exclusive",
         needs_clone=True,
         invariant_chain=_CLONE_TOUCHING_CHAIN,
+        sets_attention=True,
     ),
     Subcommand(
         name="merge",
@@ -154,6 +165,7 @@ KNOWN: tuple[Subcommand, ...] = (
         lock_mode="exclusive",
         needs_clone=False,
         invariant_chain=_MERGE_CHAIN,
+        sets_attention=True,
     ),
     Subcommand(
         name="rebase-pr",
@@ -162,6 +174,7 @@ KNOWN: tuple[Subcommand, ...] = (
         lock_mode="exclusive",
         needs_clone=True,
         invariant_chain=_REBASE_PR_CHAIN,
+        sets_attention=True,
     ),
     Subcommand(
         name="close-stale",
@@ -170,6 +183,7 @@ KNOWN: tuple[Subcommand, ...] = (
         lock_mode="exclusive",
         needs_clone=False,
         invariant_chain=_CLOSE_STALE_CHAIN,
+        sets_attention=True,
     ),
     Subcommand(
         name="show",
@@ -198,6 +212,12 @@ KNOWN: tuple[Subcommand, ...] = (
 )
 
 NAMES: tuple[str, ...] = tuple(s.name for s in KNOWN)
+
+#: Subcommands that can raise the ATTENTION sentinel; a clean (exit 0) run
+#: of one of these supersedes its own stale sentinel (node ``aklr5pq3``).
+ATTENTION_PRODUCING_NAMES: frozenset[str] = frozenset(
+    s.name for s in KNOWN if s.sets_attention
+)
 
 
 def by_name(name: str) -> Subcommand:

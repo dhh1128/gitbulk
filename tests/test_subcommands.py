@@ -192,6 +192,40 @@ def test_subcommand_invariant_chain(name, expected_chain):
     assert by_name(name).invariant_chain == expected_chain
 
 
+# ─── sets_attention field (this.i node ``aklr5pq3``) ───────────────────────
+
+
+def test_subcommand_has_sets_attention_default_false():
+    sc = Subcommand("x", "h", mutating=False, lock_mode="shared", needs_clone=False)
+    assert sc.sets_attention is False
+
+
+@pytest.mark.parametrize(
+    "name,sets_attention",
+    [
+        ("report", True),
+        ("summarize", True),
+        ("dispatch", True),
+        ("merge", True),
+        ("rebase-pr", True),
+        ("close-stale", True),
+        ("show", False),
+        ("ack", False),
+        ("invariants", False),
+    ],
+)
+def test_subcommand_sets_attention(name, sets_attention):
+    assert by_name(name).sets_attention is sets_attention
+
+
+def test_attention_producing_subcommands_match_nonempty_chains():
+    """The six attention-producing subcommands are exactly those that run an
+    invariant chain (they are the fleet operations that produce runs)."""
+    producing = {s.name for s in KNOWN if s.sets_attention}
+    chained = {s.name for s in KNOWN if s.invariant_chain}
+    assert producing == chained
+
+
 def test_clone_subcommands_have_local_invariants():
     """Symmetric: needs_clone ↔ chain includes local.* invariants."""
     for sc in KNOWN:

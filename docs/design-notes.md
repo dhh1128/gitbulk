@@ -219,7 +219,12 @@ subcommands. Designed to be `cat`-able at shell start.
 
 **Layer 4 — ATTENTION sentinel:** `~/.cache/gitbulk/ATTENTION` created
 when exit code is 2 or 3. Shell-prompt or tmux-statusline integration
-shows a glyph while it exists. `gitbulk ack` removes it.
+shows a glyph while it exists. It clears implicitly when you view the run
+that raised it (`gitbulk show <sub>` matching subcommand + run id), when
+you view the dashboard (bare `gitbulk show`), or when a later clean run of
+the *same* subcommand supersedes it. `gitbulk ack` is the explicit
+catch-all that removes any sentinel unconditionally. See `this.i` node
+`aklr5pq3`.
 
 **Cron wrapper convention:** `bin/gitbulk-cron` captures all stdout/stderr
 to `~/.cache/gitbulk/cron/<timestamp>-<subcommand>.log` and symlinks

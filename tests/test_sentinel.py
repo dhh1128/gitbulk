@@ -107,3 +107,84 @@ def test_parse_attention_returns_none_for_legacy_whitespace_format(isolated_cach
 def test_parse_attention_returns_none_for_non_dict_json(isolated_cache):
     paths.attention_sentinel().write_text("[1, 2, 3]\n")
     assert sentinel.parse_attention() is None
+
+
+# ─── clear_if_matches (node aklr5pq3 trigger 1) ────────────────────────────
+
+
+def test_clear_if_matches_clears_and_returns_payload_on_exact_match(isolated_cache):
+    sentinel.set_attention(2, "report", "RID-1", "4 PRs need attention")
+    cleared = sentinel.clear_if_matches("report", "RID-1")
+    assert cleared is not None
+    assert cleared["subcommand"] == "report"
+    assert cleared["runid"] == "RID-1"
+    assert not sentinel.has_attention()
+
+
+def test_clear_if_matches_leaves_sentinel_on_runid_mismatch(isolated_cache):
+    sentinel.set_attention(2, "report", "RID-1", "summary")
+    assert sentinel.clear_if_matches("report", "RID-2") is None
+    assert sentinel.has_attention()
+
+
+def test_clear_if_matches_leaves_sentinel_on_subcommand_mismatch(isolated_cache):
+    sentinel.set_attention(2, "dispatch", "RID-1", "agent failed")
+    # Viewing a report run must not clear a dispatch-set sentinel.
+    assert sentinel.clear_if_matches("report", "RID-1") is None
+    assert sentinel.has_attention()
+
+
+def test_clear_if_matches_never_matches_fallback_runid(isolated_cache):
+    # The "?" placeholder written by _maybe_set_attention requires `ack`.
+    sentinel.set_attention(2, "report", "?", "fallback")
+    assert sentinel.clear_if_matches("report", "?") is None
+    assert sentinel.has_attention()
+
+
+def test_clear_if_matches_returns_none_when_absent(isolated_cache):
+    assert sentinel.clear_if_matches("report", "RID-1") is None
+
+
+# ─── clear_if_superseded (node aklr5pq3 trigger 3) ─────────────────────────
+
+
+def test_clear_if_superseded_clears_same_subcommand(isolated_cache):
+    sentinel.set_attention(2, "report", "OLD-RID", "stale")
+    cleared = sentinel.clear_if_superseded("report")
+    assert cleared is not None
+    assert cleared["subcommand"] == "report"
+    assert not sentinel.has_attention()
+
+
+def test_clear_if_superseded_leaves_cross_subcommand(isolated_cache):
+    sentinel.set_attention(2, "dispatch", "RID", "agent failed")
+    # A clean report run must not clear a dispatch failure sentinel.
+    assert sentinel.clear_if_superseded("report") is None
+    assert sentinel.has_attention()
+
+
+def test_clear_if_superseded_returns_none_when_absent(isolated_cache):
+    assert sentinel.clear_if_superseded("report") is None
+
+
+# ─── clear_and_describe (node aklr5pq3 trigger 2) ──────────────────────────
+
+
+def test_clear_and_describe_clears_any_parseable_sentinel(isolated_cache):
+    sentinel.set_attention(3, "merge", "RID", "1 repo skipped")
+    cleared = sentinel.clear_and_describe()
+    assert cleared is not None
+    assert cleared["subcommand"] == "merge"
+    assert not sentinel.has_attention()
+
+
+def test_clear_and_describe_returns_none_when_absent(isolated_cache):
+    assert sentinel.clear_and_describe() is None
+
+
+def test_clear_and_describe_leaves_unparseable_sentinel(isolated_cache):
+    # Legacy/corrupt format: parse_attention() returns None, so the bare
+    # `show` dashboard path leaves it for `ack` to clear unconditionally.
+    paths.attention_sentinel().write_text("2 report RID legacy\n")
+    assert sentinel.clear_and_describe() is None
+    assert sentinel.has_attention()

@@ -221,8 +221,26 @@ case "$PS1" in *__gitbulk_attention*) ;; *) PS1='$(__gitbulk_attention)'"$PS1" ;
 ```
 
 A red `✖ gitbulk` means a structural failure (you were also emailed); a yellow
-`⚠ gitbulk` means PRs need attention. Run `gitbulk show report` for the detail
-and `gitbulk ack` to clear the sentinel once you've looked.
+`⚠ gitbulk` means PRs need attention. Run `gitbulk show report` for the detail.
+
+The sentinel clears as soon as you've actually looked — you rarely need
+`gitbulk ack`:
+
+- **`gitbulk show <sub>`** clears the sentinel when the run you're viewing is
+  the one that raised it (it matches on subcommand + run id). Viewing a
+  *different* subcommand's run leaves the alert in place, so a glance at
+  `show report` never silently dismisses, say, a `dispatch` failure.
+- **`gitbulk show`** with no argument (the dashboard) clears whatever alert is
+  outstanding — the dashboard surfaces every subcommand's latest summary.
+- **A clean run supersedes its own alert**: if last night's `report` flagged
+  PRs and today's `report` comes back clean (exit 0), the stale alert clears
+  itself. Only the *same* subcommand supersedes — a clean `report` won't clear
+  a `merge` alert.
+- **`gitbulk ack`** is still the explicit catch-all: it clears any sentinel,
+  including a legacy/corrupt one or a fallback alert with no recorded run id.
+
+When `show` clears an alert it prints a one-line note to stderr (so it never
+corrupts an artifact you're piping from stdout).
 
 ## Local-git safety contract
 

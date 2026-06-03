@@ -23,7 +23,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from gitbulk import paths
+from gitbulk import paths, sentinel
 from gitbulk.locks import LockTimeoutError, global_lock
 from gitbulk.subcommands import NAMES
 from gitbulk.util.style import error_line
@@ -76,6 +76,28 @@ def _resolve_latest_run_dir(subcommand: str) -> Path | None:
         return None
 
 
+def _runid_from_run_dir(run_dir: Path, subcommand: str) -> str | None:
+    """Strip the ``-<subcommand>`` suffix off a run dir name to recover the
+    runid, or None if the name does not carry that suffix (defensive)."""
+    name = run_dir.name
+    suffix = f"-{subcommand}"
+    return name[: -len(suffix)] if name.endswith(suffix) else None
+
+
+def _note_cleared(payload: dict) -> None:
+    """Emit the one-line 'sentinel cleared' note to STDERR.
+
+    Per node ``aklr5pq3``: notes go to stderr so they never corrupt an
+    artifact piped from stdout (e.g. ``gitbulk show report --state | yq``).
+    """
+    sub = payload.get("subcommand", "?")
+    code = payload.get("exit_code", "?")
+    print(
+        f"gitbulk show: cleared the ATTENTION sentinel (set by {sub}, exit {code}).",
+        file=sys.stderr,
+    )
+
+
 def _emit_dashboard() -> int:
     """Print ~/.cache/gitbulk/dashboard.md if present; otherwise a short hint.
 
@@ -83,10 +105,18 @@ def _emit_dashboard() -> int:
     no run has happened yet it simply hasn't been created. We treat that
     as exit 0 (not an error) because "no runs yet" is the expected first-
     install state, not a structural failure.
+
+    Per node ``aklr5pq3`` trigger 2: viewing the dashboard (which aggregates
+    every subcommand's latest-run summary) clears whatever parseable
+    sentinel is outstanding. If no dashboard exists yet, nothing was viewed,
+    so the sentinel is left intact.
     """
     dash = paths.dashboard_file()
     if dash.exists():
         sys.stdout.write(dash.read_text())
+        cleared = sentinel.clear_and_describe()
+        if cleared is not None:
+            _note_cleared(cleared)
         return EXIT_OK
     print(
         "gitbulk show: no dashboard yet (no runs have completed). "
@@ -121,6 +151,7 @@ def _emit_for_subcommand(subcommand: str, artifact: str) -> int:
 
     if artifact == "path":
         print(run_dir)
+        _clear_if_viewing_flagged_run(subcommand, run_dir)
         return EXIT_OK
 
     filename = _ARTIFACT_FILES[artifact]
@@ -136,7 +167,23 @@ def _emit_for_subcommand(subcommand: str, artifact: str) -> int:
         return EXIT_STRUCTURAL_FAILURE
 
     sys.stdout.write(target.read_text())
+    _clear_if_viewing_flagged_run(subcommand, run_dir)
     return EXIT_OK
+
+
+def _clear_if_viewing_flagged_run(subcommand: str, run_dir: Path) -> None:
+    """Clear the ATTENTION sentinel iff it was raised by the run just shown.
+
+    Per node ``aklr5pq3`` trigger 1. No-op when the runid cannot be
+    recovered from the run dir name, or the sentinel was set by a different
+    run/subcommand (those cases are left for ``ack``).
+    """
+    runid = _runid_from_run_dir(run_dir, subcommand)
+    if runid is None:
+        return
+    cleared = sentinel.clear_if_matches(subcommand, runid)
+    if cleared is not None:
+        _note_cleared(cleared)
 
 
 def show_handler(args: argparse.Namespace) -> int:

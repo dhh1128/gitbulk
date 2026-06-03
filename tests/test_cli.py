@@ -22,6 +22,7 @@ from gitbulk.cli import (
     SUBCOMMANDS,
     _check_python_version,
     _configure_logging,
+    _maybe_clear_superseded,
     _maybe_set_attention,
     _set_private_umask,
     build_parser,
@@ -221,6 +222,44 @@ def test_maybe_set_attention_does_nothing_on_exit_99(isolated_cache):
 
     _maybe_set_attention(EXIT_NOT_IMPLEMENTED, "report")
     assert not sentinel.has_attention()
+
+
+# ─── ATTENTION supersession on clean run (node aklr5pq3 trigger 3) ─────────
+
+
+def test_maybe_clear_superseded_clears_same_subcommand_on_exit_0(isolated_cache):
+    from gitbulk import sentinel
+
+    sentinel.set_attention(2, "report", "OLD-RID", "stale")
+    _maybe_clear_superseded(EXIT_OK, "report")
+    assert not sentinel.has_attention()
+
+
+def test_maybe_clear_superseded_leaves_cross_subcommand(isolated_cache):
+    from gitbulk import sentinel
+
+    sentinel.set_attention(2, "dispatch", "DID", "agent failed")
+    # A clean report run must not dismiss a dispatch failure sentinel.
+    _maybe_clear_superseded(EXIT_OK, "report")
+    assert sentinel.has_attention()
+
+
+def test_maybe_clear_superseded_noop_on_nonzero_exit(isolated_cache):
+    from gitbulk import sentinel
+
+    sentinel.set_attention(2, "report", "RID", "stale")
+    _maybe_clear_superseded(EXIT_STRUCTURAL_FAILURE, "report")
+    assert sentinel.has_attention()
+
+
+def test_maybe_clear_superseded_noop_for_non_attention_subcommand(isolated_cache):
+    from gitbulk import sentinel
+
+    # A sentinel can never name show/ack/invariants, but assert the guard
+    # short-circuits before touching a (hypothetically) matching sentinel.
+    sentinel.set_attention(2, "show", "RID", "impossible-but-defensive")
+    _maybe_clear_superseded(EXIT_OK, "show")
+    assert sentinel.has_attention()
 
 
 def test_main_returns_exit_ok_when_no_subcommand_does_not_set_attention(isolated_cache):

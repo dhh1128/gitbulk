@@ -48,6 +48,66 @@ def clear_attention() -> bool:
     return False
 
 
+def clear_if_matches(subcommand: str, runid: str) -> dict[str, Any] | None:
+    """Clear the sentinel iff it was set by the run identified by
+    ``(subcommand, runid)``; return the cleared payload, else None.
+
+    Per node ``aklr5pq3`` trigger 1: ``gitbulk show <sub>`` calls this so
+    viewing the exact run that raised the alert dismisses it. A sentinel
+    set by a DIFFERENT subcommand, or whose recorded runid differs, is left
+    intact (clip7nm4's cross-subcommand concern). The ``"?"`` fallback
+    runid written by :func:`gitbulk.cli._maybe_set_attention` never matches
+    — those still require an explicit ``ack``.
+    """
+    payload = parse_attention()
+    if payload is None:
+        return None
+    if payload.get("subcommand") != subcommand:
+        return None
+    sentinel_runid = payload.get("runid")
+    if not sentinel_runid or sentinel_runid == "?" or sentinel_runid != runid:
+        return None
+    clear_attention()
+    return payload
+
+
+def clear_if_superseded(subcommand: str) -> dict[str, Any] | None:
+    """Clear the sentinel iff it was set by an earlier run of the SAME
+    subcommand; return the cleared payload, else None.
+
+    Per node ``aklr5pq3`` trigger 3: a clean (exit 0) run of an
+    attention-producing subcommand supersedes its own stale sentinel — the
+    condition that raised the alert has resolved. A sentinel set by a
+    different subcommand is left intact (a clean ``report`` must not dismiss
+    a ``dispatch`` failure). The caller is responsible for only invoking
+    this on a 0-exit.
+    """
+    payload = parse_attention()
+    if payload is None:
+        return None
+    if payload.get("subcommand") != subcommand:
+        return None
+    clear_attention()
+    return payload
+
+
+def clear_and_describe() -> dict[str, Any] | None:
+    """Clear whatever parseable sentinel is present; return its payload,
+    else None.
+
+    Per node ``aklr5pq3`` trigger 2: the bare ``gitbulk show`` dashboard
+    aggregates every subcommand's latest-run summary, so viewing it is the
+    broad "I looked" gesture that dismisses any outstanding attention. An
+    unparseable/legacy sentinel is left for ``ack`` (we cannot describe what
+    we cannot parse), matching the defensive treatment in
+    :func:`parse_attention`.
+    """
+    payload = parse_attention()
+    if payload is not None:
+        clear_attention()
+    return payload
+
+
 def has_attention() -> bool:
     return paths.attention_sentinel().exists()
 

@@ -840,6 +840,32 @@ def _maybe_set_attention(exit_code: int, subcommand: str) -> None:
     )
 
 
+def _maybe_clear_superseded(exit_code: int, subcommand: str) -> None:
+    """A clean run of an attention-producing subcommand clears its own
+    stale sentinel (this.i node ``aklr5pq3`` trigger 3).
+
+    Only exit 0 supersedes — a non-zero exit means the run did not complete
+    cleanly, so it cannot claim the prior concern is resolved. Only the
+    SAME subcommand's sentinel is cleared; a clean ``report`` must not
+    dismiss a ``dispatch`` failure (clip7nm4's cross-subcommand concern).
+    show/ack/invariants never set attention, so they are excluded.
+    """
+    if exit_code != EXIT_OK:
+        return
+    from gitbulk.subcommands import ATTENTION_PRODUCING_NAMES
+
+    if subcommand not in ATTENTION_PRODUCING_NAMES:
+        return
+    from gitbulk import sentinel
+
+    if sentinel.clear_if_superseded(subcommand) is not None:
+        print(
+            f"gitbulk {subcommand}: cleared a stale ATTENTION sentinel "
+            f"(superseded by this clean run).",
+            file=sys.stderr,
+        )
+
+
 def _apply_config_root(config_root: str | None) -> None:
     """If --config-root was passed, pin ``paths.config_dir()`` to it.
 
@@ -897,6 +923,7 @@ def main(argv: list[str] | None = None) -> int:
         print(error_line(f"gitbulk {args.subcommand}: {e}"), file=sys.stderr)
         return EXIT_STRUCTURAL_FAILURE
     _maybe_set_attention(exit_code, args.subcommand)
+    _maybe_clear_superseded(exit_code, args.subcommand)
     return exit_code
 
 
