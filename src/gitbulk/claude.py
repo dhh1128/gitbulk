@@ -155,7 +155,12 @@ class ProductionClaudeClient:
     Constructor knobs (all keyword-only):
 
       - ``claude_path``: path to the ``claude`` executable; default
-        ``"claude"`` (picked up from PATH).
+        ``"claude"``. A bare name is resolved to an absolute path via
+        ``shutil.which`` at construction (security-hawk F2 parity with
+        :class:`gitbulk.gh.ProductionGHClient`), so a later ``PATH``
+        prepend cannot substitute the binary; an unresolvable name falls
+        back to itself (see ``__init__`` for the deliberate divergence
+        from the gh client).
       - ``default_model``: model alias or full name passed via
         ``--model`` when the caller doesn't override.
       - ``default_timeout``: per-call timeout seconds when caller
@@ -178,7 +183,30 @@ class ProductionClaudeClient:
         default_model: str = "claude-sonnet-4-6",
         default_timeout: float = 300.0,
     ) -> None:
-        self._claude_path = claude_path
+        import shutil
+
+        # Resolve a bare ``claude_path`` to an absolute path via
+        # ``shutil.which`` at construction, mirroring the security-hawk F2
+        # fix in :class:`gitbulk.gh.ProductionGHClient`: once resolved, a
+        # later ``PATH``-prepend cannot substitute the ``claude`` binary
+        # out from under a constructed client. An absolute path is trusted
+        # as-is (no lookup).
+        #
+        # Divergence from ProductionGHClient (deliberate): an unresolvable
+        # bare name falls back to itself rather than raising. ``gh`` is
+        # essential to every subcommand, so an unresolvable ``gh`` is a
+        # loud construction failure; ``claude`` is used only by
+        # ``dispatch`` / ``summarize``, where a missing binary already
+        # surfaces gracefully (exec.py's per-target "failed to launch"
+        # path; summarize's ClaudeError handling) instead of aborting the
+        # whole run — and a name that doesn't resolve cannot be
+        # PATH-hijacked, so the fallback costs no security.
+        if Path(claude_path).is_absolute():
+            resolved = claude_path
+        else:
+            found = shutil.which(claude_path)
+            resolved = found if found is not None else claude_path
+        self._claude_path = resolved
         self._default_model = default_model
         self._default_timeout = default_timeout
 

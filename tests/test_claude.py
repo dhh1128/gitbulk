@@ -23,6 +23,23 @@ from gitbulk.claude import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _mock_shutil_which(monkeypatch):
+    """Make ``shutil.which`` resolve every name to itself.
+
+    ProductionClaudeClient resolves a bare ``claude_path`` through
+    ``shutil.which`` at construction (security-hawk F2 parity with
+    ProductionGHClient). For unit tests we don't want the host's
+    ``claude`` presence (or absence, e.g. on CI) to leak into
+    ``_claude_path`` / argv assertions, so we stub the resolver to be the
+    identity function. The dedicated resolution tests below override this
+    fixture per test as needed.
+    """
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda name: name)
+
+
 # ─── Protocol satisfaction ─────────────────────────────────────────────────
 
 
@@ -124,6 +141,45 @@ def test_production_constructor_overrides():
     assert p._claude_path == "/usr/local/bin/claude"
     assert p._default_model == "opus"
     assert p._default_timeout == 60.0
+
+
+# ─── ProductionClaudeClient: claude_path resolution (F2 parity) ────────────
+
+
+def test_constructor_resolves_bare_name_via_shutil_which(monkeypatch):
+    """A bare claude_path is resolved to an absolute path via
+    shutil.which at construction, so a later PATH-prepend cannot
+    substitute the binary (mirrors the gh F2 fix)."""
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda name: f"/canonical/{name}")
+    p = ProductionClaudeClient()
+    assert p._claude_path == "/canonical/claude"
+
+
+def test_constructor_absolute_path_skips_which_lookup(monkeypatch):
+    """Absolute paths are taken as-is — shutil.which is not consulted."""
+    import shutil
+
+    called = []
+    monkeypatch.setattr(
+        shutil, "which", lambda name: called.append(name) or "/should/not/use"
+    )
+    p = ProductionClaudeClient(claude_path="/explicit/claude")
+    assert p._claude_path == "/explicit/claude"
+    assert called == []
+
+
+def test_constructor_unresolvable_name_falls_back_to_bare(monkeypatch):
+    """Divergence from ProductionGHClient: an unresolvable bare name
+    falls back to itself (no raise). dispatch/summarize degrade
+    gracefully on a missing claude, and an absent binary can't be
+    PATH-hijacked, so the fallback costs no security."""
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda name: None)
+    p = ProductionClaudeClient()
+    assert p._claude_path == "claude"
 
 
 def test_production_happy_path_argv_and_stdout():
