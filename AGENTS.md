@@ -214,6 +214,60 @@ same file concurrently.
 6. `git add <specific files>` (never `git add -A`).
 7. `git commit -s` with a message focused on the why.
 
+---
+
+## Defect management (GitHub Issues)
+
+This repo tracks defects as **GitHub Issues** on `dhh1128/gitbulk`, managed
+with the `gh` CLI (no issue tracker MCP server is used). Issues are enabled
+and the standard `bug` label exists.
+
+**Logging a bug.** When a maintainer says "log a bug about X" (or an agent
+discovers a defect worth tracking), create the issue immediately — do not
+wait for further confirmation — and report the issue number and URL:
+
+```
+gh issue create --repo dhh1128/gitbulk --label bug \
+  --title "<concise summary of the defect>" \
+  --body "$(cat <<'EOF'
+## Summary
+<one-paragraph description>
+
+## Steps to reproduce
+1. ...
+
+## Expected
+<what should happen>
+
+## Actual
+<what happens instead>
+
+## Environment
+<version / OS / config relevant to the bug, if any>
+
+## Notes
+<logs, stack traces, suspected cause, related issues>
+EOF
+)"
+```
+
+Fill in every section you can; omit a section's body only when it genuinely
+does not apply. The only triage label is `bug` — no severity/priority labels.
+Use milestones or comments if prioritization is needed later.
+
+**Fixing a bug.** When a maintainer says "let's fix bug X":
+
+1. Resolve X to an issue: `gh issue list --repo dhh1128/gitbulk --label bug
+   --state open --search "X"`, or `gh issue view <n>` if given a number.
+   Confirm the match before proceeding.
+2. Branch `fix/<issue#>-<short-slug>` off the default branch.
+3. Fix it TDD-style per the rules above (failing test first).
+4. Reference `Fixes #<n>` in the commit message and/or PR body so the issue
+   auto-closes when the change merges to the default branch.
+
+**Finding bugs.** `gh issue list --repo dhh1128/gitbulk --label bug
+--state open` lists the open defect backlog; `gh issue view <n>` shows one.
+
 <!-- BEGIN AGENTPREP MANAGED BLOCK -->
 ## AgentPrep AI Operating Rules
 
