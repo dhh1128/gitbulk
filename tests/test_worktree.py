@@ -530,3 +530,26 @@ def test_delete_merged_local_branch_refused_returns_false():
         ),
     ):
         assert delete_merged_local_branch(Path("/r"), "feat") is False
+
+
+def test_list_worktrees_skips_blank_blocks_and_unknown_keys():
+    # Leading blank line (empty _flush), an unknown 'prunable' key (no elif
+    # matches → falls through), and a trailing block.
+    porcelain = (
+        "\n"  # leading blank → _flush with empty cur
+        "worktree /a\n"
+        "HEAD " + "a" * 40 + "\n"
+        "branch refs/heads/main\n"
+        "prunable gitdir file points to non-existent location\n"
+        "\n"
+        "worktree /b\n"
+        "HEAD " + "b" * 40 + "\n"
+        "branch refs/heads/feat\n"
+    )
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout=porcelain),
+    ):
+        entries = list_worktrees(Path("/x"))
+    assert [e.branch for e in entries] == ["main", "feat"]
+    assert entries[0].is_main is True
