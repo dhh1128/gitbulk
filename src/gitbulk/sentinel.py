@@ -19,6 +19,7 @@ import json
 from typing import Any
 
 from gitbulk import paths
+from gitbulk.util import atomicio
 
 #: Schema version stamped onto the ATTENTION sentinel JSON object.
 #: Bump (with a corresponding decision node in ``this.i``) on any
@@ -35,7 +36,10 @@ def set_attention(exit_code: int, subcommand: str, runid: str, summary: str) -> 
         "runid": runid,
         "summary": summary,
     }
-    paths.attention_sentinel().write_text(json.dumps(payload) + "\n")
+    # Atomic write (unique tmp + os.replace) so an external reader — tmux
+    # status line, `gitbulk show` — never observes a torn JSON line. The
+    # old bare write_text could be read mid-write (node rsclk7nq, Phase 0).
+    atomicio.atomic_write_text(paths.attention_sentinel(), json.dumps(payload) + "\n")
 
 
 def clear_attention() -> bool:

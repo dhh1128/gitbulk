@@ -67,9 +67,35 @@ def test_begin_run_dir_property_matches_paths_module(isolated_cache):
     assert rs.run_dir == expected
 
 
-def test_begin_raises_if_run_dir_already_exists(isolated_cache):
+def test_begin_same_second_gets_distinct_run_dirs(isolated_cache):
+    """Two same-subcommand runs in the same UTC second must not collide.
+
+    Node rsclk7nq Phase 0: the runid is to-the-second, so a second run at the
+    same instant used to crash on mkdir(exist_ok=False). begin() now advances
+    the timestamp by a second and retries; both runs get distinct dirs whose
+    names remain valid `<timestamp>-<subcommand>` (gc/parsers keep working).
+    """
     when = datetime(2026, 5, 27, 12, 0, 0, tzinfo=timezone.utc)
-    RunState.begin("report", [], {}, when=when)
+    rs1 = RunState.begin("report", [], {}, when=when)
+    rs2 = RunState.begin("report", [], {}, when=when)
+    assert rs1.run_dir != rs2.run_dir
+    assert rs1.run_dir == paths.run_dir("20260527T120000Z", "report")
+    assert rs2.run_dir == paths.run_dir("20260527T120001Z", "report")
+    # Both names still end in "-report" so gc.prune_runs matches them.
+    assert rs1.run_dir.name.endswith("-report")
+    assert rs2.run_dir.name.endswith("-report")
+
+
+def test_begin_raises_after_collision_limit(isolated_cache, monkeypatch):
+    """The retry loop is bounded; exhausting it surfaces a FileExistsError."""
+    import gitbulk.runstate as runstate_mod
+
+    monkeypatch.setattr(runstate_mod, "_RUNID_COLLISION_LIMIT", 3)
+    when = datetime(2026, 5, 27, 12, 0, 0, tzinfo=timezone.utc)
+    # Occupy the 3 slots the loop will try (offset 0,1,2).
+    for sec in range(3):
+        ts = datetime(2026, 5, 27, 12, 0, sec, tzinfo=timezone.utc)
+        RunState.begin("report", [], {}, when=ts)
     with pytest.raises(FileExistsError):
         RunState.begin("report", [], {}, when=when)
 
@@ -329,18 +355,19 @@ def test_atomic_write_text_creates_file_and_no_tmp(tmp_path):
     assert not (tmp_path / "x.txt.tmp").exists()
 
 
-def test_atomic_write_symlink_cleans_existing_tmp(tmp_path):
-    """Cover the branch where the .tmp symlink already exists from a prior failure."""
+def test_atomic_write_symlink_delegates_and_points_at_target(tmp_path):
+    """The runstate wrapper delegates to atomicio and writes a relative link.
+
+    (Unique-tmp behaviour and stale-fixed-tmp independence are covered in
+    test_atomicio.py; here we only pin that the delegating wrapper works.)
+    """
     target_a = tmp_path / "target-a"
     target_b = tmp_path / "target-b"
     target_a.mkdir()
     target_b.mkdir()
     symlink = tmp_path / "latest"
-    tmp_symlink = tmp_path / "latest.tmp"
-    # Simulate a stale .tmp left behind by a previous interrupted call
-    tmp_symlink.symlink_to(target_a)
-    # Now do a clean atomic write; should clean up the stale tmp
-    _atomic_write_symlink(symlink, target_b)
+    _atomic_write_symlink(symlink, target_a)
+    _atomic_write_symlink(symlink, target_b)  # overwrite
     assert symlink.is_symlink()
     assert symlink.resolve() == target_b.resolve()
-    assert not tmp_symlink.exists()
+    assert os.readlink(symlink) == "target-b"  # relative

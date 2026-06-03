@@ -24,7 +24,6 @@ tmp-file-plus-``os.replace`` for atomicity.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
@@ -33,6 +32,7 @@ import yaml
 
 from gitbulk import paths
 from gitbulk.gh import GHClient, GHError
+from gitbulk.util import atomicio
 
 if TYPE_CHECKING:
     from gitbulk.config.policy import Policy
@@ -153,10 +153,7 @@ def save_cache(cached: CachedMembers) -> None:
         "fetched_at": fetched_at_utc.isoformat(),
         "members": sorted(cached.members),
     }
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w") as f:
-        yaml.safe_dump(payload, f, sort_keys=False)
-    os.replace(tmp_path, path)
+    atomicio.atomic_write_text(path, yaml.safe_dump(payload, sort_keys=False))
 
 
 # ─── freshness ──────────────────────────────────────────────────────────────

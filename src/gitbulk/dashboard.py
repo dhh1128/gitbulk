@@ -6,7 +6,6 @@ See this.i node ``dwq3kpn4`` for the composition contract and
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Iterable
 
@@ -14,6 +13,7 @@ import yaml
 
 from gitbulk import paths
 from gitbulk.subcommands import KNOWN
+from gitbulk.util import atomicio
 
 _EXCERPT_LINES = 15
 
@@ -65,9 +65,7 @@ def _render_section(subcommand: str, run_dir: Path | None) -> str:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    tmp = path.parent / (path.name + ".tmp")
-    tmp.write_text(text)
-    os.replace(tmp, path)
+    atomicio.atomic_write_text(path, text)
 
 
 def rewrite_dashboard(subcommands: Iterable[str] | None = None) -> Path:

@@ -33,6 +33,7 @@ from pathlib import Path
 import yaml
 
 from gitbulk import paths
+from gitbulk.util import atomicio
 
 #: Schema version stamped into the cache file.
 _SCHEMA_VERSION = 1
@@ -121,8 +122,12 @@ def record_ack(slug: str, sha: str, now: datetime) -> None:
         }
     )
     paths.cache_dir().mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        yaml.safe_dump({"version": _SCHEMA_VERSION, "acked": kept})
+    # Atomic write so a concurrent reader (report's recent-merges watchdog)
+    # never sees a torn file. NOTE: the load-modify-save above is still a
+    # cross-process lost-update window — resource #9 gets a dedicated lock in
+    # Phase 2 (node rsclk7nq); Phase 0 only makes the write itself atomic.
+    atomicio.atomic_write_text(
+        path, yaml.safe_dump({"version": _SCHEMA_VERSION, "acked": kept})
     )
 
 

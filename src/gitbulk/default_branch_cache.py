@@ -34,7 +34,6 @@ long-running gitbulk process; the caller just re-fetches.
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -43,6 +42,7 @@ import yaml
 
 from gitbulk import paths
 from gitbulk.gh import GHClient
+from gitbulk.util import atomicio
 
 SCHEMA_VERSION = 1
 
@@ -151,10 +151,7 @@ def save_cache(branches: dict[str, CachedBranch]) -> None:
             for slug, cb in sorted(branches.items())
         },
     }
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w") as f:
-        yaml.safe_dump(payload, f, sort_keys=False)
-    os.replace(tmp_path, path)
+    atomicio.atomic_write_text(path, yaml.safe_dump(payload, sort_keys=False))
 
 
 # ─── freshness ────────────────────────────────────────────────────────────────
