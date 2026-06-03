@@ -18,8 +18,14 @@ dependencies = [
 [project.optional-dependencies]
 test = ["pytest>=7.0", "pytest-cov>=4.0"]
 
+# Authoring/building the documentation site. Not a runtime or test dependency.
+# Build with `uv run --group docs zensical build` (or `... serve` to preview).
+[dependency-groups]
+docs = ["zensical"]
+
 [project.urls]
 Homepage = "https://github.com/dhh1128/gitbulk"
+Documentation = "https://dhh1128.github.io/gitbulk/"
 Repository = "https://github.com/dhh1128/gitbulk"
 Issues = "https://github.com/dhh1128/gitbulk/issues"
 

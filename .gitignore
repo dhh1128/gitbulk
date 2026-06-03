@@ -10,3 +10,7 @@ dist/
 .mypy_cache/
 .ruff_cache/
 .ai-safety-check.*
+
+# Zensical docs build output
+/site/
+.cache/
