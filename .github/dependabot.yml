@@ -26,6 +26,14 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 3
+    # Batch every action bump into ONE PR rather than up to three. The
+    # actions are pinned by commit SHA (with `# vN` comments, which
+    # Dependabot bumps alongside the SHA); reviewing them together keeps
+    # the supply-chain pins current with minimal review noise.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
     commit-message:
       prefix: ci
       include: scope
