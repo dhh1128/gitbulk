@@ -18,16 +18,16 @@ jobs:
       matrix:
         python-version: ["3.10", "3.12"]
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
 
       - name: Set up uv (with cache)
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -47,16 +47,16 @@ jobs:
   release-assets:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
 
       - name: Set up uv (with cache)
-        uses: astral-sh/setup-uv@v7
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78  # v7
         with:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
         with:
           python-version: "3.12"
 
@@ -81,15 +81,32 @@ jobs:
             exit 1
           fi
 
+  # Reject invisible / Trojan-Source Unicode (zero-width, bidi-control,
+  # PUA, variation-selector, tag chars) in shipped source and prompts.
+  # This is the GlassWorm / Trojan-Source defense: such payloads cannot be
+  # caught by eye or ordinary linting. Gate lives in scripts/check_unicode.py
+  # (stdlib-only, so no install step). See docs/threat-model.md (T2).
+  unicode-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
+
+      - name: Reject invisible / Trojan-Source Unicode
+        run: python3 scripts/check_unicode.py
+
   actionlint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
 
       - name: Run actionlint
         run: |
           set -euo pipefail
           version=1.7.12
+          sha256=8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
           curl -fsSL "https://github.com/rhysd/actionlint/releases/download/v${version}/actionlint_${version}_linux_amd64.tar.gz" -o /tmp/actionlint.tgz
+          # Pin the download by content hash so a retargeted/republished asset
+          # can't slip a different binary into CI (supply-chain T4).
+          echo "${sha256}  /tmp/actionlint.tgz" | sha256sum -c -
           tar -xzf /tmp/actionlint.tgz -C /tmp actionlint
           /tmp/actionlint -color
