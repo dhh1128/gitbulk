@@ -101,6 +101,36 @@ _REBASE_PR_CHAIN: tuple[str, ...] = (
 )
 
 
+# Chain for ``prune-branches`` (node prnbr4kq). Clone-free like merge — it
+# operates on remote branches through gh only — so it carries just the
+# UNIVERSAL + PER_REPO gh gates. There is no per-PR member: the command's
+# unit of work is a BRANCH, and its branch-level guardrails (default,
+# protected, open-PR head/base, data-loss, fork, grace) live in the handler,
+# not the chain (chains gate, they don't iterate branches).
+_PRUNE_BRANCHES_CHAIN: tuple[str, ...] = (
+    "gh.authenticated",
+    "config.parseable",
+    "org.members.fresh",
+    "github.reachable",
+    "github.not_archived",
+)
+
+# Chain for ``prune-worktrees`` (node prnwt5nq). Clone-touching: it must read
+# `git worktree list` from each clone, so it layers local.exists +
+# local.remote_matches onto the gh gates. default_branch_in_sync is omitted
+# deliberately — a clone whose default branch drifted can still have its
+# orphaned worktrees pruned safely. Per-worktree guards live in the handler.
+_PRUNE_WORKTREES_CHAIN: tuple[str, ...] = (
+    "gh.authenticated",
+    "config.parseable",
+    "org.members.fresh",
+    "local.exists",
+    "local.remote_matches",
+    "github.reachable",
+    "github.not_archived",
+)
+
+
 @dataclass(frozen=True)
 class Subcommand:
     """Static metadata about one gitbulk subcommand."""
@@ -183,6 +213,24 @@ KNOWN: tuple[Subcommand, ...] = (
         lock_mode="exclusive",
         needs_clone=False,
         invariant_chain=_CLOSE_STALE_CHAIN,
+        sets_attention=True,
+    ),
+    Subcommand(
+        name="prune-branches",
+        help="Delete remote branches whose only PRs are merged or closed.",
+        mutating=True,
+        lock_mode="exclusive",
+        needs_clone=False,
+        invariant_chain=_PRUNE_BRANCHES_CHAIN,
+        sets_attention=True,
+    ),
+    Subcommand(
+        name="prune-worktrees",
+        help="Remove local worktrees whose branch's only PRs are merged/closed.",
+        mutating=True,
+        lock_mode="exclusive",
+        needs_clone=True,
+        invariant_chain=_PRUNE_WORKTREES_CHAIN,
         sets_attention=True,
     ),
     Subcommand(

@@ -161,6 +161,20 @@ def _rebase_pr_handler(args: argparse.Namespace) -> int:
     return rebase_pr_handler(args)
 
 
+def _prune_branches_handler(args: argparse.Namespace) -> int:
+    # Lazy import — keeps the prune pipeline out of the --help path.
+    from gitbulk.commands.prune_branches import prune_branches_handler
+
+    return prune_branches_handler(args)
+
+
+def _prune_worktrees_handler(args: argparse.Namespace) -> int:
+    # Lazy import (worktree + git helpers) for the same reason.
+    from gitbulk.commands.prune_worktrees import prune_worktrees_handler
+
+    return prune_worktrees_handler(args)
+
+
 def _show_handler(args: argparse.Namespace) -> int:
     # Lazy import for the same reason as the other handlers — keeps the
     # locks / paths / runstate-reading machinery out of the --help path.
@@ -285,6 +299,8 @@ _SPECIAL_HANDLERS = {
     "merge": _merge_handler,
     "close-stale": _close_stale_handler,
     "rebase-pr": _rebase_pr_handler,
+    "prune-branches": _prune_branches_handler,
+    "prune-worktrees": _prune_worktrees_handler,
     "show": _show_handler,
 }
 
@@ -605,6 +621,72 @@ def _add_rebase_pr_args(sp: argparse.ArgumentParser) -> None:
     )
 
 
+def _add_prune_common_args(sp: argparse.ArgumentParser, *, what: str) -> None:
+    """Shared flags for the two prune subcommands: --apply opt-in,
+    --code-root, --skip-check, --refresh-org-members. ``what`` fills the
+    --apply help text."""
+    sp.add_argument(
+        "--apply",
+        action="store_true",
+        default=False,
+        help=(
+            f"Actually {what}. Without this flag the command is a dry run "
+            "and prints what it WOULD do (per AGENTS.md 'Mutating "
+            "subcommands default to dry-run'). The guardrails are designed "
+            "to make --apply safe to run unattended."
+        ),
+    )
+    sp.add_argument(
+        "--code-root",
+        metavar="PATH",
+        default=None,
+        help="Override default ~/code/ where local clones live.",
+    )
+    sp.add_argument(
+        "--skip-check",
+        metavar="NAME",
+        action="append",
+        default=None,
+        help=(
+            "Skip the named invariant for this run (may be passed more "
+            "than once). Logs a WARNING and triggers exit-code 4 if no "
+            "other concern fires."
+        ),
+    )
+    sp.add_argument(
+        "--refresh-org-members",
+        action="store_true",
+        default=False,
+        help=(
+            "Force a fresh fetch of the configured humans.org members even "
+            "when the cache is still within its TTL."
+        ),
+    )
+
+
+def _add_prune_branches_args(sp: argparse.ArgumentParser) -> None:
+    """Flags for ``prune-branches`` (node prnbr4kq)."""
+    _add_prune_common_args(
+        sp, what="delete remote branches whose only PRs are merged/closed"
+    )
+
+
+def _add_prune_worktrees_args(sp: argparse.ArgumentParser) -> None:
+    """Flags for ``prune-worktrees`` (node prnwt5nq)."""
+    _add_prune_common_args(
+        sp, what="remove local worktrees whose branch's PRs are merged/closed"
+    )
+    sp.add_argument(
+        "--include-untracked",
+        action="store_true",
+        default=False,
+        help=(
+            "Also remove a worktree that has untracked (but no tracked-file) "
+            "changes. By default an untracked file blocks removal."
+        ),
+    )
+
+
 def _add_merge_args(sp: argparse.ArgumentParser) -> None:
     """Argparse flags specific to the ``merge`` subcommand.
 
@@ -793,10 +875,17 @@ def build_parser() -> argparse.ArgumentParser:
             _add_close_stale_args(sp)
         elif sc.name == "rebase-pr":
             _add_rebase_pr_args(sp)
+        elif sc.name == "prune-branches":
+            _add_prune_branches_args(sp)
+        elif sc.name == "prune-worktrees":
+            _add_prune_worktrees_args(sp)
         elif sc.name == "show":
             _add_show_args(sp)
         # Fleet-subset filters apply to every PR-fetching subcommand.
-        if sc.name in ("report", "dispatch", "merge", "close-stale", "rebase-pr"):
+        if sc.name in (
+            "report", "dispatch", "merge", "close-stale", "rebase-pr",
+            "prune-branches", "prune-worktrees",
+        ):
             _add_filter_args(sp)
 
     # Self-management commands (this.i node dstbr5kq) are NOT fleet

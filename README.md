@@ -18,21 +18,50 @@ on the same local clones — it never touches your working tree or current branc
 
 ## Status
 
-Read-only and read-then-act phases have landed; mutating operations
-(`merge`, `rebase-onto-default`, `close-stale`) are still ahead. Implemented
-today:
+Read-only, read-then-act, and the mutating fleet operations have landed.
+Implemented today:
 
 | Subcommand | What it does | Mutating? |
 |---|---|---|
 | `report` | Run the invariant chain against your open PRs and write a structured triage report (`summary.md` + `state.yaml`). | No |
 | `summarize` | Feed a recent `report` run through Claude with a triage prompt to prioritize. | No |
 | `dispatch` | Spawn headless Claude agents inside disposable worktrees against PRs matching a filter. Defaults to dry-run. | Yes (with `--apply`) |
+| `merge` | Auto-merge PRs that satisfy the per-repo merge policy. Defaults to dry-run. | Yes (with `--apply`) |
+| `rebase-pr` | Rebase your behind/conflicting PRs onto their current base and force-push (with lease). Defaults to dry-run. | Yes (with `--apply`) |
+| `close-stale` | Warn, then close, PRs inactive past the configured threshold. Defaults to dry-run. | Yes (with `--apply`) |
+| `prune-branches` | Delete remote branches whose only PRs are merged/closed, with guardrails (see below). Defaults to dry-run. | Yes (with `--apply`) |
+| `prune-worktrees` | Remove local linked worktrees whose branch's only PRs are merged/closed, then delete the fully-merged local branch. Defaults to dry-run. | Yes (with `--apply`) |
 | `show` | Print the latest run's artifacts for any subcommand, or the dashboard. | No |
 | `ack` | Clear the `ATTENTION` sentinel after you've reviewed it. | No |
 | `invariants` | List the invariant registry and which subcommands use each. | No |
 
-`merge`, `rebase-onto-default`, `close-stale` are scaffolded in the CLI and
-return exit code 99 until Phase 5 lands.
+### Fleet cleanup: `prune-branches` and `prune-worktrees`
+
+These remove the cruft that accumulates around ~150 repos: post-merge
+branches GitHub didn't auto-delete, and worktrees left over from finished PR
+work (`this.i` nodes `prnbr4kq` / `prnwt5nq`). Both default to dry-run and
+take `--apply`; the guardrails are built so `--apply` is safe to run
+unattended (you should rarely need to study a dry run first):
+
+- **Grace period** — a branch/worktree is only touched once its PR has been
+  merged/closed for at least `prune_min_age_days` (default 7, per-repo
+  overridable). Just-merged work is left alone.
+- **No data loss** (`prdls2nq`) — a remote branch is deleted only when its
+  tip is the merged PR's recorded head SHA *or* it is fully contained in the
+  default branch; a worktree's branch is removed only when it has no
+  unpushed commits. Anything with unique work is kept with a reason.
+- **`prune-branches` never deletes** the default branch, a protected branch,
+  the head of an open PR, or the base of an open PR (the stacked-PR case),
+  and never touches fork branches. Deletion goes through the GitHub ref API,
+  not `git push --delete`; the deleted SHA is recorded for recovery.
+- **`prune-worktrees` never touches** the primary clone (local-git safety
+  contract), a dirty worktree (uncommitted changes, untracked files unless
+  `--include-untracked`, or merge/rebase in progress), or a locked one. It
+  uses `git worktree remove` without `--force`, then `git branch -d`
+  (merged-only) so an unmerged branch is kept.
+
+A clean `--apply` run is quiet (no `ATTENTION`); only failures and skipped
+repos surface. Both accept the `--org`/`--repo`/`--filter` fleet filters.
 
 ## Install
 
