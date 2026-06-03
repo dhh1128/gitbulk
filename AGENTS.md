@@ -70,10 +70,22 @@ failure causes subsequent operations to fall back to the main clone.
 
 ### Concurrency
 
-Two `gitbulk` processes must be safe to run at the same time. Read-only
-subcommands take a shared global advisory lock; mutating subcommands take
-an exclusive global lock plus a per-repo lock. Any new subcommand must
-declare its lock requirements explicitly.
+Two `gitbulk` processes must be safe to run at the same time. Locking is
+**resource-scoped**: a lock protects one shared resource and its scope is
+exactly that resource, never wider (this.i node `rsclk7nq`,
+`docs/design/resource-scoped-locking.md`). Each shared resource has its own
+keyed `fcntl.flock`: per-subcommand run-state (`run_state_lock`), per-repo
+clone+remote mutation (`repo_lock`), the org-members and default-branch
+caches, the ATTENTION sentinel, the dashboard, and the watchdog-ack cache.
+The single global `run.lock` of the original two-lock model (`lj5pqn4kr`) is
+being retired in favour of these. A mutating run on repo A and any operation
+on repo B never contend; `show <sub>` never contends with a run of a
+*different* subcommand. New subcommands MUST declare which resource locks
+they take (and in which mode) explicitly, and acquire them in the documented
+order (`org -> default_branches -> repo(slug) -> run_state(sub) -> sentinel
+-> dashboard`) if more than one is ever held at once. Every atomic file
+write uses `gitbulk.util.atomicio` (unique temp names) so concurrent writers
+of the same file never collide.
 
 ### Default branch detection
 
