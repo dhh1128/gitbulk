@@ -300,3 +300,233 @@ def test_is_worktree_in_conflict_git_failure_treated_as_conflict(tmp_path):
         return_value=_completed(stdout="", stderr="fatal", returncode=128),
     ):
         assert is_worktree_in_conflict(wt) is True
+
+
+# ─── prune-worktrees helpers (node prnwt5nq) ───────────────────────────────
+
+from gitbulk.worktree import (  # noqa: E402
+    WorktreeEntry,
+    branch_unpushed_commit_count,
+    delete_merged_local_branch,
+    list_worktrees,
+    remove_linked_worktree,
+    worktree_change_summary,
+    worktree_in_progress_op,
+)
+
+
+_PORCELAIN = """\
+worktree /home/u/code/repo
+HEAD aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+branch refs/heads/main
+
+worktree /home/u/code/repo-feat
+HEAD bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+branch refs/heads/feature/x
+locked
+
+worktree /home/u/code/repo-detached
+HEAD cccccccccccccccccccccccccccccccccccccccc
+detached
+"""
+
+
+def test_list_worktrees_parses_main_linked_detached(tmp_path: Path):
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout=_PORCELAIN),
+    ) as mock_run:
+        entries = list_worktrees(tmp_path / "clone")
+    argv = mock_run.call_args[0][0]
+    assert argv[-3:] == ["worktree", "list", "--porcelain"]
+    assert [e.branch for e in entries] == ["main", "feature/x", None]
+    assert [e.is_main for e in entries] == [True, False, False]
+    assert entries[1].is_locked is True
+    assert entries[2].is_detached is True
+    assert entries[0].head_sha == "a" * 40
+
+
+def test_list_worktrees_handles_bare_main():
+    porcelain = "worktree /srv/bare\nbare\n"
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout=porcelain),
+    ):
+        entries = list_worktrees(Path("/srv/bare"))
+    assert entries[0].is_bare is True
+    assert entries[0].branch is None
+
+
+def test_list_worktrees_raises_on_git_failure():
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(returncode=1, stderr="boom"),
+    ):
+        with pytest.raises(WorktreeError):
+            list_worktrees(Path("/x"))
+
+
+def test_worktree_change_summary_clean():
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout=""),
+    ):
+        assert worktree_change_summary(Path("/wt")) == (False, False, False)
+
+
+def test_worktree_change_summary_tracked_untracked_conflict():
+    out = " M tracked.py\n?? new.txt\nUU merged.py\nX\n"
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout=out),
+    ):
+        tracked, untracked, conflicted = worktree_change_summary(Path("/wt"))
+    assert tracked is True
+    assert untracked is True
+    assert conflicted is True
+
+
+def test_worktree_change_summary_only_untracked():
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout="?? only.txt\n"),
+    ):
+        assert worktree_change_summary(Path("/wt")) == (False, True, False)
+
+
+def test_worktree_change_summary_git_failure_is_all_dirty():
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(returncode=128),
+    ):
+        assert worktree_change_summary(Path("/wt")) == (True, True, True)
+
+
+def test_worktree_in_progress_op_detects_rebase(tmp_path: Path):
+    marker = tmp_path / "rebase-merge"
+    marker.mkdir()
+
+    def fake_run(argv, **k):
+        # rev-parse --git-path <rel> → echo an absolute path; rebase-merge
+        # exists, the rest do not.
+        rel = argv[-1]
+        return _completed(stdout=str(tmp_path / rel))
+
+    with patch("gitbulk.worktree.subprocess.run", side_effect=fake_run):
+        assert worktree_in_progress_op(tmp_path) == "rebase"
+
+
+def test_worktree_in_progress_op_none_when_clean(tmp_path: Path):
+    def fake_run(argv, **k):
+        rel = argv[-1]
+        return _completed(stdout=str(tmp_path / rel))  # none exist
+
+    with patch("gitbulk.worktree.subprocess.run", side_effect=fake_run):
+        assert worktree_in_progress_op(tmp_path) is None
+
+
+def test_worktree_in_progress_op_relative_path(tmp_path: Path):
+    (tmp_path / "MERGE_HEAD").write_text("x")
+
+    def fake_run(argv, **k):
+        rel = argv[-1]
+        # Return a RELATIVE path; function resolves against worktree_path.
+        if rel == "MERGE_HEAD":
+            return _completed(stdout="MERGE_HEAD")
+        return _completed(stdout="does-not-exist")
+
+    with patch("gitbulk.worktree.subprocess.run", side_effect=fake_run):
+        assert worktree_in_progress_op(tmp_path) == "merge"
+
+
+def test_worktree_in_progress_op_rev_parse_failure_fails_safe():
+    def fake_run(argv, **k):
+        return _completed(returncode=1)
+
+    with patch("gitbulk.worktree.subprocess.run", side_effect=fake_run):
+        # First probe (rebase-merge) fails → returns "rebase" (fail safe).
+        assert worktree_in_progress_op(Path("/x")) == "rebase"
+
+
+def test_worktree_in_progress_op_empty_candidate_continues(tmp_path: Path):
+    (tmp_path / "MERGE_HEAD").write_text("x")
+
+    def fake_run(argv, **k):
+        rel = argv[-1]
+        if rel == "MERGE_HEAD":
+            return _completed(stdout="MERGE_HEAD")
+        return _completed(stdout="")  # empty → continue
+
+    with patch("gitbulk.worktree.subprocess.run", side_effect=fake_run):
+        assert worktree_in_progress_op(tmp_path) == "merge"
+
+
+def test_branch_unpushed_commit_count_zero():
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout="0\n"),
+    ) as mock_run:
+        assert branch_unpushed_commit_count(Path("/r"), "feat") == 0
+    argv = mock_run.call_args[0][0]
+    assert argv[-4:] == ["rev-list", "--count", "feat", "--not"] or (
+        "rev-list" in argv and "--remotes" in argv
+    )
+
+
+def test_branch_unpushed_commit_count_nonzero():
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout="4\n"),
+    ):
+        assert branch_unpushed_commit_count(Path("/r"), "feat") == 4
+
+
+def test_branch_unpushed_commit_count_bad_output_raises():
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout="weird"),
+    ):
+        with pytest.raises(WorktreeError):
+            branch_unpushed_commit_count(Path("/r"), "feat")
+
+
+def test_remove_linked_worktree_argv_and_prune(tmp_path: Path):
+    calls = []
+
+    def fake_run(argv, **k):
+        calls.append(list(argv))
+        return _completed()
+
+    wt = tmp_path / "linked"
+    with patch("gitbulk.worktree.subprocess.run", side_effect=fake_run):
+        remove_linked_worktree(tmp_path / "clone", wt)
+    assert calls[0][-3:] == ["worktree", "remove", str(wt)]
+    assert "--force" not in calls[0]
+    assert calls[1][-2:] == ["worktree", "prune"]
+
+
+def test_remove_linked_worktree_refuses_main(tmp_path: Path):
+    clone = tmp_path / "clone"
+    clone.mkdir()
+    with pytest.raises(WorktreeError, match="main worktree"):
+        remove_linked_worktree(clone, clone)
+
+
+def test_delete_merged_local_branch_success():
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(returncode=0),
+    ) as mock_run:
+        assert delete_merged_local_branch(Path("/r"), "feat") is True
+    argv = mock_run.call_args[0][0]
+    assert argv[-3:] == ["branch", "-d", "feat"]
+
+
+def test_delete_merged_local_branch_refused_returns_false():
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(
+            returncode=1, stderr="not fully merged"
+        ),
+    ):
+        assert delete_merged_local_branch(Path("/r"), "feat") is False

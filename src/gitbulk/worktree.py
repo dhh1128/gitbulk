@@ -19,9 +19,17 @@ the main clone, that would breach the local-git safety contract. The
 from __future__ import annotations
 
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 from gitbulk import paths
+
+#: Two-character ``git status --porcelain`` codes that mark a merge
+#: conflict (per git-status(1)). Shared by :func:`is_worktree_in_conflict`
+#: and :func:`worktree_change_summary`.
+_CONFLICT_CODES: frozenset[str] = frozenset(
+    {"UU", "AA", "DD", "AU", "UA", "DU", "UD"}
+)
 
 
 class WorktreeError(RuntimeError):
@@ -202,16 +210,227 @@ def is_worktree_in_conflict(worktree_path: Path) -> bool:
         # rather than silently rm-ing a directory whose state we can't
         # determine.
         return True
-    conflict_codes = {"UU", "AA", "DD", "AU", "UA", "DU", "UD"}
     for line in completed.stdout.splitlines():
-        if len(line) >= 2 and line[:2] in conflict_codes:
+        if len(line) >= 2 and line[:2] in _CONFLICT_CODES:
             return True
     return False
 
 
+# ─── prune-worktrees surface (node prnwt5nq) ───────────────────────────────
+
+
+@dataclass(frozen=True)
+class WorktreeEntry:
+    """One row from ``git worktree list --porcelain``.
+
+    ``is_main`` is True for the clone's primary working tree (always the
+    first entry git lists). prune-worktrees must NEVER remove a main
+    entry — that is the tree the user edits (local-git safety contract).
+    ``branch`` is ``None`` for a detached-HEAD worktree.
+    """
+
+    path: Path
+    head_sha: str
+    branch: str | None
+    is_main: bool
+    is_detached: bool
+    is_locked: bool
+    is_bare: bool
+
+
+def list_worktrees(repo_path: Path) -> list[WorktreeEntry]:
+    """Parse ``git -C repo_path worktree list --porcelain``.
+
+    Returns one :class:`WorktreeEntry` per worktree, the main checkout
+    first. Raises :class:`WorktreeError` if git fails — the caller treats
+    a repo whose worktrees can't be enumerated as "skip with reason"
+    rather than guessing.
+    """
+    completed = _git_run(repo_path, "worktree", "list", "--porcelain")
+    entries: list[WorktreeEntry] = []
+    # Porcelain emits blank-line-separated blocks; each starts with a
+    # ``worktree <path>`` line. Accumulate fields until the block ends.
+    cur: dict = {}
+
+    def _flush() -> None:
+        if not cur:
+            return
+        entries.append(
+            WorktreeEntry(
+                path=Path(cur["worktree"]),
+                head_sha=cur.get("HEAD", ""),
+                branch=cur.get("branch"),
+                is_main=(len(entries) == 0),
+                is_detached=cur.get("detached", False),
+                is_locked=cur.get("locked", False),
+                is_bare=cur.get("bare", False),
+            )
+        )
+        cur.clear()
+
+    for line in completed.stdout.splitlines():
+        if not line.strip():
+            _flush()
+            continue
+        key, _, rest = line.partition(" ")
+        if key == "worktree":
+            cur["worktree"] = rest
+        elif key == "HEAD":
+            cur["HEAD"] = rest
+        elif key == "branch":
+            # rest is like ``refs/heads/feature-x`` → store short name.
+            cur["branch"] = rest[len("refs/heads/"):] if rest.startswith(
+                "refs/heads/"
+            ) else rest
+        elif key == "detached":
+            cur["detached"] = True
+        elif key == "bare":
+            cur["bare"] = True
+        elif key == "locked":
+            cur["locked"] = True
+        # Other keys (prunable, etc.) are ignored.
+    _flush()
+    return entries
+
+
+def worktree_change_summary(worktree_path: Path) -> tuple[bool, bool, bool]:
+    """Return ``(tracked_dirty, has_untracked, conflicted)`` for a worktree.
+
+    ``tracked_dirty`` is True if any tracked file is modified/staged;
+    ``has_untracked`` if any ``??`` entry exists; ``conflicted`` if any
+    conflict code is present. On git failure all three are True so the
+    caller refuses to remove a worktree whose state it cannot read.
+    """
+    completed = subprocess.run(
+        ["git", "-C", str(worktree_path), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return (True, True, True)
+    tracked_dirty = False
+    has_untracked = False
+    conflicted = False
+    for line in completed.stdout.splitlines():
+        if len(line) < 2:
+            continue
+        code = line[:2]
+        if code == "??":
+            has_untracked = True
+        elif code in _CONFLICT_CODES:
+            conflicted = True
+            tracked_dirty = True
+        else:
+            tracked_dirty = True
+    return (tracked_dirty, has_untracked, conflicted)
+
+
+#: ``git`` relative paths whose existence signals an interrupted operation.
+#: Mapped to the operation name surfaced in the skip reason.
+_IN_PROGRESS_PATHS: tuple[tuple[str, str], ...] = (
+    ("rebase-merge", "rebase"),
+    ("rebase-apply", "rebase"),
+    ("MERGE_HEAD", "merge"),
+    ("CHERRY_PICK_HEAD", "cherry-pick"),
+    ("REVERT_HEAD", "revert"),
+)
+
+
+def worktree_in_progress_op(worktree_path: Path) -> str | None:
+    """Return the name of an in-progress git operation, or ``None``.
+
+    Detects a paused rebase/merge/cherry-pick/revert even when there are
+    no conflict markers (a clean pause). Such a worktree holds state we
+    must not destroy, so the prune handler skips it.
+    """
+    for rel, name in _IN_PROGRESS_PATHS:
+        completed = subprocess.run(
+            ["git", "-C", str(worktree_path), "rev-parse", "--git-path", rel],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0:
+            # Can't resolve git-path → can't prove it's clean → treat as
+            # in-progress (fail safe).
+            return name
+        candidate = completed.stdout.strip()
+        if not candidate:
+            continue
+        # ``--git-path`` returns a path relative to git's cwd (the
+        # worktree) unless already absolute.
+        resolved = Path(candidate)
+        if not resolved.is_absolute():
+            resolved = worktree_path / candidate
+        if resolved.exists():
+            return name
+    return None
+
+
+def branch_unpushed_commit_count(repo_path: Path, branch: str) -> int:
+    """Commits on ``branch`` that exist on NO remote-tracking branch.
+
+    ``git rev-list --count <branch> --not --remotes``. ``0`` means every
+    commit on the branch is already on some remote — deleting the local
+    branch loses nothing (the local half of the data-loss guard,
+    node prdls2nq). Raises :class:`WorktreeError` on git failure.
+    """
+    completed = _git_run(
+        repo_path, "rev-list", "--count", branch, "--not", "--remotes"
+    )
+    try:
+        return int(completed.stdout.strip())
+    except ValueError as exc:
+        raise WorktreeError(
+            f"branch_unpushed_commit_count({branch!r}): unexpected output "
+            f"{completed.stdout.strip()!r}"
+        ) from exc
+
+
+def remove_linked_worktree(repo_path: Path, worktree_path: Path) -> None:
+    """Remove a LINKED worktree via ``git worktree remove`` (no --force).
+
+    Path-verified: refuses if ``worktree_path`` resolves to ``repo_path``
+    itself (the main worktree). Without ``--force``, git itself refuses a
+    dirty or locked worktree — a second line of defense behind the
+    handler's own guards. Follows up with ``git worktree prune`` to clear
+    any now-stale admin entries. Per node wtrm6kpq this is the one blessed
+    mutating local operation.
+    """
+    if worktree_path.resolve() == repo_path.resolve():
+        raise WorktreeError(
+            f"refusing to remove the main worktree: {worktree_path}"
+        )
+    _git_run(repo_path, "worktree", "remove", str(worktree_path))
+    _git_run(repo_path, "worktree", "prune")
+
+
+def delete_merged_local_branch(repo_path: Path, branch: str) -> bool:
+    """Delete a local branch with ``git branch -d`` (merged-only).
+
+    ``-d`` (lowercase) refuses to delete a branch not fully merged into
+    its upstream or HEAD — a built-in data-loss guard. Returns True if
+    the branch was deleted, False if git refused (unmerged) or the branch
+    was absent. Never raises for the refusal case: a kept branch is a
+    valid, safe outcome.
+    """
+    completed = _git_run(
+        repo_path, "branch", "-d", branch, check=False
+    )
+    return completed.returncode == 0
+
+
 __all__ = [
+    "WorktreeEntry",
     "WorktreeError",
+    "branch_unpushed_commit_count",
     "create_worktree",
+    "delete_merged_local_branch",
     "is_worktree_in_conflict",
+    "list_worktrees",
+    "remove_linked_worktree",
     "remove_worktree",
+    "worktree_change_summary",
+    "worktree_in_progress_op",
 ]
