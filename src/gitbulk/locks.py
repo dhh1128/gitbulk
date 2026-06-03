@@ -1,9 +1,23 @@
 """POSIX advisory locks for gitbulk's concurrency model.
 
-Two context managers: ``global_lock`` (shared or exclusive at
-``cache_dir()/run.lock``) and ``repo_lock`` (always exclusive at
-``locks_dir()/<slug>.lock``). See this.i nodes ``lj5pqn4kr`` (why
-two locks) and ``hk5pq3nm`` (the API contract).
+Resource-scoped locking (node ``rsclk7nq``, superseding the two-lock model of
+``lj5pqn4kr``): one keyed ``fcntl.flock`` per shared resource, each acquired
+only around the section that touches it. Context managers:
+
+  - ``run_state_lock(target, mode)`` — per-subcommand run-state (resource #1)
+  - ``repo_lock(slug, mode)``        — per-repo clone + remote (resources #6-8)
+  - ``org_lock(org)``                — org-members cache (resource #2)
+  - ``default_branches_lock()``      — default-branches cache (resource #3)
+  - ``sentinel_lock()``              — ATTENTION sentinel (resource #4)
+  - ``dashboard_lock()``             — dashboard.md (resource #5)
+  - ``watchdog_ack_lock()``          — watchdog-ack cache (resource #9)
+  - ``global_lock(mode)``            — the legacy global run.lock, being
+                                       retired as callers migrate to the above.
+
+To avoid deadlock, never hold two at once (the design is flat/non-nested); if
+nesting is ever unavoidable, acquire in this order: org -> default_branches ->
+repo(slug) -> run_state(sub) -> sentinel -> dashboard. See ``hk5pq3nm`` for the
+underlying ``_file_lock`` contract (timeout, holder metadata, pid-liveness).
 """
 
 from __future__ import annotations
@@ -169,13 +183,130 @@ def global_lock(
 @contextmanager
 def repo_lock(
     slug: str,
+    mode: Literal["shared", "exclusive"] = "exclusive",
     *,
     timeout: float | None = None,
     subcommand: str | None = None,
 ) -> Iterator[None]:
-    """Hold a per-repo exclusive lock for the duration of the ``with`` block."""
+    """Hold a per-repo lock (clone + remote) for the ``with`` block.
+
+    Resource #6/#7/#8 of node ``rsclk7nq``: serializes all gitbulk work on one
+    repository. ``mode`` defaults to ``"exclusive"`` (mutating git or any
+    remote mutation); pass ``"shared"`` for read-only git (clone preflights).
+    The previously always-exclusive contract of ``hk5pq3nm.b`` is relaxed here.
+    """
     with _file_lock(
         paths.repo_lock_file(slug),
+        mode,
+        timeout=timeout,
+        subcommand=subcommand,
+    ):
+        yield
+
+
+@contextmanager
+def run_state_lock(
+    target: str,
+    mode: Literal["shared", "exclusive"],
+    *,
+    timeout: float | None = None,
+    subcommand: str | None = None,
+) -> Iterator[None]:
+    """Hold the run-state lock for subcommand ``target`` (resource #1).
+
+    Guards the ``latest-<target>`` symlink swap and ``gc.prune_runs(target)``
+    against readers. Writers (a run of ``target`` finishing) take exclusive;
+    ``show``/dashboard reads take shared. Keyed by ``target`` (the run-state
+    subcommand), which is independent of ``subcommand`` (the command actually
+    running — e.g. ``show`` reads run-state ``prune-worktrees``).
+    """
+    with _file_lock(
+        paths.named_lock_file(f"runstate-{target}"),
+        mode,
+        timeout=timeout,
+        subcommand=subcommand,
+    ):
+        yield
+
+
+@contextmanager
+def org_lock(
+    org: str,
+    *,
+    timeout: float | None = None,
+    subcommand: str | None = None,
+) -> Iterator[None]:
+    """Hold the org-members-cache lock for ``org`` (resource #2, exclusive)."""
+    with _file_lock(
+        paths.named_lock_file(f"org-{org}"),
+        "exclusive",
+        timeout=timeout,
+        subcommand=subcommand,
+    ):
+        yield
+
+
+@contextmanager
+def default_branches_lock(
+    *,
+    timeout: float | None = None,
+    subcommand: str | None = None,
+) -> Iterator[None]:
+    """Hold the default-branches-cache lock (resource #3, exclusive)."""
+    with _file_lock(
+        paths.named_lock_file("default-branches"),
+        "exclusive",
+        timeout=timeout,
+        subcommand=subcommand,
+    ):
+        yield
+
+
+@contextmanager
+def sentinel_lock(
+    *,
+    timeout: float | None = None,
+    subcommand: str | None = None,
+) -> Iterator[None]:
+    """Hold the ATTENTION-sentinel lock (resource #4, exclusive)."""
+    with _file_lock(
+        paths.named_lock_file("attention"),
+        "exclusive",
+        timeout=timeout,
+        subcommand=subcommand,
+    ):
+        yield
+
+
+@contextmanager
+def dashboard_lock(
+    *,
+    timeout: float | None = None,
+    subcommand: str | None = None,
+) -> Iterator[None]:
+    """Hold the dashboard.md lock (resource #5, exclusive)."""
+    with _file_lock(
+        paths.named_lock_file("dashboard"),
+        "exclusive",
+        timeout=timeout,
+        subcommand=subcommand,
+    ):
+        yield
+
+
+@contextmanager
+def watchdog_ack_lock(
+    *,
+    timeout: float | None = None,
+    subcommand: str | None = None,
+) -> Iterator[None]:
+    """Hold the watchdog-ack-cache lock (resource #9, exclusive).
+
+    Guards the load->modify->save in ``watchdog_ack.record_ack`` against the
+    cross-process lost-update window (the write itself is already atomic).
+    """
+    with _file_lock(
+        paths.named_lock_file("watchdog-acked"),
         "exclusive",
         timeout=timeout,
         subcommand=subcommand,

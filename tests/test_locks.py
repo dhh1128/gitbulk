@@ -461,3 +461,96 @@ def test_acquire_succeeds_when_holder_releases_mid_wait(isolated_cache):
     finally:
         t.join(timeout=2.0)
         os.close(fd_holder)
+
+
+# ─── Resource-scoped locks (node rsclk7nq) ──────────────────────────────────
+
+
+def _capture_flock(monkeypatch):
+    captured: list = []
+    monkeypatch.setattr(fcntl, "flock", lambda fd, op: captured.append(op))
+    return captured
+
+
+def test_run_state_lock_shared_uses_LOCK_SH(isolated_cache, monkeypatch):
+    captured = _capture_flock(monkeypatch)
+    with locks.run_state_lock("prune-worktrees", "shared"):
+        pass
+    assert captured == [fcntl.LOCK_SH]
+
+
+def test_run_state_lock_exclusive_uses_LOCK_EX(isolated_cache, monkeypatch):
+    captured = _capture_flock(monkeypatch)
+    with locks.run_state_lock("merge", "exclusive"):
+        pass
+    assert captured == [fcntl.LOCK_EX]
+
+
+def test_run_state_lock_is_keyed_by_target(isolated_cache):
+    """Different targets resolve to different lock files (so they never contend)."""
+    with locks.run_state_lock("prune-branches", "exclusive", subcommand="prune-branches"):
+        a = paths.named_lock_file("runstate-prune-branches")
+        assert a.exists()
+        meta = json.loads(a.read_text())
+        # The metadata subcommand (running command) is independent of the key.
+        assert meta["subcommand"] == "prune-branches"
+    b = paths.named_lock_file("runstate-prune-worktrees")
+    assert a != b
+
+
+def test_run_state_lock_label_independent_of_target(isolated_cache):
+    """`show` locks run-state `prune-worktrees` while the holder is `show`."""
+    with locks.run_state_lock("prune-worktrees", "shared", subcommand="show"):
+        path = paths.named_lock_file("runstate-prune-worktrees")
+        assert json.loads(path.read_text())["subcommand"] == "show"
+
+
+def test_repo_lock_shared_mode_uses_LOCK_SH(isolated_cache, monkeypatch):
+    captured = _capture_flock(monkeypatch)
+    with locks.repo_lock("owner/repo", "shared"):
+        pass
+    assert captured == [fcntl.LOCK_SH]
+
+
+def test_repo_lock_default_mode_is_exclusive(isolated_cache, monkeypatch):
+    captured = _capture_flock(monkeypatch)
+    with locks.repo_lock("owner/repo"):
+        pass
+    assert captured == [fcntl.LOCK_EX]
+
+
+@pytest.mark.parametrize(
+    "factory, lock_filename",
+    [
+        (lambda: locks.org_lock("provenant-dev"), "org-provenant-dev.lock"),
+        (lambda: locks.default_branches_lock(), "default-branches.lock"),
+        (lambda: locks.sentinel_lock(), "attention.lock"),
+        (lambda: locks.dashboard_lock(), "dashboard.lock"),
+        (lambda: locks.watchdog_ack_lock(), "watchdog-acked.lock"),
+    ],
+)
+def test_singleton_locks_are_exclusive_and_write_expected_file(
+    isolated_cache, monkeypatch, factory, lock_filename
+):
+    captured = _capture_flock(monkeypatch)
+    with factory():
+        pass
+    assert captured == [fcntl.LOCK_EX]
+    # With flock mocked the file is still created by _file_lock's os.open.
+    assert (paths.locks_dir() / lock_filename).exists()
+
+
+def test_singleton_lock_writes_metadata(isolated_cache):
+    with locks.org_lock("provenant-dev", subcommand="report"):
+        path = paths.named_lock_file("org-provenant-dev")
+        assert json.loads(path.read_text())["subcommand"] == "report"
+
+
+@pytest.mark.parametrize("bad", ["a/b", "a\\b", "..", ".", ""])
+def test_named_lock_file_rejects_unsafe_names(bad):
+    with pytest.raises(ValueError, match="invalid lock name"):
+        paths.named_lock_file(bad)
+
+
+def test_named_lock_file_valid_name(isolated_cache):
+    assert paths.named_lock_file("runstate-merge") == paths.locks_dir() / "runstate-merge.lock"
