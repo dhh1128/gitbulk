@@ -49,6 +49,7 @@ _DEFAULTS_KEYS = {
     "stale_cooloff_days",
     "stale_policy",
     "retain_runs",
+    "prune_min_age_days",
     "skip_checks",
     "extra_checks",
 }
@@ -77,6 +78,10 @@ class Defaults:
     #: thresholds). ``never`` disables close-stale for this repo.
     stale_policy: str = "warn-and-close"
     retain_runs: int = 30
+    #: Grace period for the prune subcommands (node prgrc3kp). A branch or
+    #: worktree whose PR was merged/closed fewer than this many days ago is
+    #: left alone, so just-merged work (hotfixes, deploy refs) is not swept.
+    prune_min_age_days: int = 7
     skip_checks: tuple[str, ...] = ()
     extra_checks: tuple[str, ...] = ()
 
@@ -105,6 +110,7 @@ class RepoOverride:
     stale_cooloff_days: int | None = None
     stale_policy: str | None = None
     retain_runs: int | None = None
+    prune_min_age_days: int | None = None
     skip_checks: tuple[str, ...] = ()  # appended to defaults
     extra_checks: tuple[str, ...] = ()  # appended to defaults
 
@@ -215,6 +221,10 @@ def _parse_defaults(raw: dict[str, Any], where: str) -> Defaults:
         kwargs["retain_runs"] = _ensure_int(
             raw["retain_runs"], f"{where}.retain_runs", minimum=1
         )
+    if "prune_min_age_days" in raw:
+        kwargs["prune_min_age_days"] = _ensure_int(
+            raw["prune_min_age_days"], f"{where}.prune_min_age_days", minimum=0
+        )
     if "skip_checks" in raw:
         kwargs["skip_checks"] = _ensure_str_list(
             raw["skip_checks"], f"{where}.skip_checks"
@@ -291,6 +301,10 @@ def _parse_repo_override(raw: dict[str, Any], where: str) -> RepoOverride:
     if "retain_runs" in raw:
         kwargs["retain_runs"] = _ensure_int(
             raw["retain_runs"], f"{where}.retain_runs", minimum=1
+        )
+    if "prune_min_age_days" in raw:
+        kwargs["prune_min_age_days"] = _ensure_int(
+            raw["prune_min_age_days"], f"{where}.prune_min_age_days", minimum=0
         )
     if "skip_checks" in raw:
         kwargs["skip_checks"] = _ensure_str_list(
@@ -414,6 +428,7 @@ def policy_for(policy: Policy, slug: str) -> Defaults:
         "stale_cooloff_days",
         "stale_policy",
         "retain_runs",
+        "prune_min_age_days",
     ):
         v = getattr(override, key)
         if v is not None:

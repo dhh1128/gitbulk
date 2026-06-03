@@ -39,7 +39,14 @@ from typing import (
     runtime_checkable,
 )
 
-from gitbulk.pr_info import CheckRun, PRComment, PRInfo, TimelineEvent
+from gitbulk.pr_info import (
+    BranchRef,
+    CheckRun,
+    ClosedPRRef,
+    PRComment,
+    PRInfo,
+    TimelineEvent,
+)
 
 
 @runtime_checkable
@@ -322,6 +329,43 @@ class GHClient(Protocol):
         """
         ...
 
+    # ─── prune-branches / prune-worktrees surface (nodes prnbr4kq / prnwt5nq) ──
+
+    def list_branches(
+        self, slug: str, *, timeout: float | None = None
+    ) -> list[BranchRef]:
+        """Return every branch on ``slug`` with its tip SHA and the
+        branch-protection flag. Read-only."""
+        ...
+
+    def closed_prs_for_head(
+        self, slug: str, head_ref: str, *, timeout: float | None = None
+    ) -> list[ClosedPRRef]:
+        """Return the closed-or-merged PRs whose head branch on the
+        UPSTREAM repo is ``head_ref`` (newest first). Read-only.
+
+        Filters server-side by ``head=<owner>:<head_ref>`` so it returns
+        only PRs that originated on the upstream, never fork PRs that
+        happen to share a branch name."""
+        ...
+
+    def branch_ahead_by(
+        self, slug: str, base: str, branch: str, *, timeout: float | None = None
+    ) -> int:
+        """Return how many commits ``branch`` has that ``base`` does not
+        (``ahead_by`` from the compare API). ``0`` means ``branch`` is
+        fully contained in ``base``. Read-only — the data-loss guard
+        (prdls2nq) uses this."""
+        ...
+
+    def delete_branch_ref(
+        self, slug: str, branch: str, *, timeout: float | None = None
+    ) -> None:
+        """Delete the remote branch ``branch`` on ``slug`` via the git-ref
+        API (node prdel4rq). The one mutating method the prune surface
+        adds."""
+        ...
+
 
 class GHError(RuntimeError):
     """Raised when a gh invocation fails in a way the caller is expected
@@ -391,6 +435,16 @@ class FakeGHClient:
         ] | None = None,
         repo_permissions: Mapping[str, str] | None = None,
         archived: Mapping[str, "bool | Exception"] | None = None,
+        branches: Mapping[str, "list[BranchRef] | Exception"] | None = None,
+        closed_prs_for_head: Mapping[
+            tuple[str, str], "list[ClosedPRRef] | Exception"
+        ] | None = None,
+        branch_ahead_by: Mapping[
+            tuple[str, str, str], "int | Exception"
+        ] | None = None,
+        delete_branch_responses: Mapping[
+            tuple[str, str], "None | Exception"
+        ] | None = None,
     ) -> None:
         self._user = user
         self._org_members = dict(org_members) if org_members is not None else None
@@ -441,6 +495,22 @@ class FakeGHClient:
         self._archived: dict[str, "bool | Exception"] = (
             dict(archived) if archived is not None else {}
         )
+        self._branches = dict(branches) if branches is not None else None
+        self._closed_prs_for_head = (
+            dict(closed_prs_for_head)
+            if closed_prs_for_head is not None
+            else None
+        )
+        self._branch_ahead_by = (
+            dict(branch_ahead_by) if branch_ahead_by is not None else None
+        )
+        self._delete_branch_responses = (
+            dict(delete_branch_responses)
+            if delete_branch_responses is not None
+            else None
+        )
+        #: Records every delete_branch_ref invocation for assertions.
+        self.delete_branch_calls: list[dict[str, Any]] = []
         # Per-call argument records so tests can assert merge_pr was
         # invoked with the right method / delete_branch flags.
         self.merge_calls: list[dict[str, Any]] = []
@@ -464,6 +534,10 @@ class FakeGHClient:
             "approve_pr": 0,
             "viewer_repo_permission": 0,
             "is_archived": 0,
+            "list_branches": 0,
+            "closed_prs_for_head": 0,
+            "branch_ahead_by": 0,
+            "delete_branch_ref": 0,
         }
 
     def authenticated_user(self, *, timeout: float | None = None) -> dict[str, Any]:
@@ -737,6 +811,69 @@ class FakeGHClient:
                 "not configured"
             )
         return list(self._check_runs.get((slug, sha), []))
+
+    def list_branches(
+        self, slug: str, *, timeout: float | None = None
+    ) -> list[BranchRef]:
+        self.call_count["list_branches"] += 1
+        if self._branches is None or slug not in self._branches:
+            raise GHError(f"FakeGHClient: list_branches({slug!r}) not configured")
+        value = self._branches[slug]
+        if isinstance(value, Exception):
+            raise value
+        return list(value)
+
+    def closed_prs_for_head(
+        self, slug: str, head_ref: str, *, timeout: float | None = None
+    ) -> list[ClosedPRRef]:
+        self.call_count["closed_prs_for_head"] += 1
+        if (
+            self._closed_prs_for_head is None
+            or (slug, head_ref) not in self._closed_prs_for_head
+        ):
+            raise GHError(
+                f"FakeGHClient: closed_prs_for_head({slug!r}, {head_ref!r}) "
+                "not configured"
+            )
+        value = self._closed_prs_for_head[(slug, head_ref)]
+        if isinstance(value, Exception):
+            raise value
+        return list(value)
+
+    def branch_ahead_by(
+        self, slug: str, base: str, branch: str, *, timeout: float | None = None
+    ) -> int:
+        self.call_count["branch_ahead_by"] += 1
+        if (
+            self._branch_ahead_by is None
+            or (slug, base, branch) not in self._branch_ahead_by
+        ):
+            raise GHError(
+                f"FakeGHClient: branch_ahead_by({slug!r}, {base!r}, "
+                f"{branch!r}) not configured"
+            )
+        value = self._branch_ahead_by[(slug, base, branch)]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    def delete_branch_ref(
+        self, slug: str, branch: str, *, timeout: float | None = None
+    ) -> None:
+        self.call_count["delete_branch_ref"] += 1
+        self.delete_branch_calls.append({"slug": slug, "branch": branch})
+        if (
+            self._delete_branch_responses is not None
+            and (slug, branch) in self._delete_branch_responses
+        ):
+            value = self._delete_branch_responses[(slug, branch)]
+            if isinstance(value, Exception):
+                raise value
+            return None
+        # Unconfigured delete defaults to success — tests that care about
+        # failure configure an Exception explicitly (mirrors merge_responses
+        # ergonomics inverted: deletes are the common happy path).
+        return None
 
 
 # ─── ProductionGHClient ─────────────────────────────────────────────────────
@@ -1525,6 +1662,139 @@ class ProductionGHClient:
                 )
             )
         return out
+
+    # ─── prune surface (nodes prnbr4kq / prnwt5nq) ─────────────────────────
+
+    def list_branches(
+        self, slug: str, *, timeout: float | None = None
+    ) -> list[BranchRef]:
+        # verified non-deprecated against gh CLI 2026-06-03
+        # (REST /repos/<slug>/branches — current, returns name/commit.sha/
+        # protected; --paginate merges Link-header pages)
+        stdout = self._run(
+            (
+                "api",
+                f"repos/{slug}/branches",
+                "--paginate",
+                "--jq",
+                ".[] | {name, sha: .commit.sha, protected}",
+            ),
+            timeout=timeout,
+        )
+        out: list[BranchRef] = []
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            out.append(
+                BranchRef(
+                    name=row.get("name") or "",
+                    sha=row.get("sha") or "",
+                    protected=bool(row.get("protected")),
+                )
+            )
+        return out
+
+    def closed_prs_for_head(
+        self, slug: str, head_ref: str, *, timeout: float | None = None
+    ) -> list[ClosedPRRef]:
+        # verified non-deprecated against gh CLI 2026-06-03
+        # (REST /repos/<slug>/pulls?state=closed&head=<owner>:<ref> —
+        # head filter scopes to the upstream owner so fork PRs sharing a
+        # branch name are excluded. jq tolerates a null head.repo (deleted
+        # fork) by returning null for .head.repo.full_name.)
+        owner = slug.split("/", 1)[0]
+        stdout = self._run(
+            (
+                "api",
+                f"repos/{slug}/pulls?state=closed&head={owner}:{head_ref}"
+                "&per_page=100",
+                "--paginate",
+                "--jq",
+                ".[] | {number, title, url: .html_url, merged_at, "
+                "closed_at, base_ref: .base.ref, head_ref: .head.ref, "
+                "head_sha: .head.sha, head_repo: .head.repo.full_name}",
+            ),
+            timeout=timeout,
+        )
+        out: list[ClosedPRRef] = []
+        for line in stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            merged_at = row.get("merged_at")
+            closed_at = row.get("closed_at")
+            merged = merged_at is not None
+            # closed_at is always set for a closed PR; fall back to
+            # merged_at defensively if GitHub ever omits it.
+            stamp = merged_at if merged else closed_at
+            if stamp is None:
+                # No usable timestamp → cannot grace-check → skip the row
+                # (the prune handler treats an absent ref as "no closed PR").
+                continue
+            out.append(
+                ClosedPRRef(
+                    number=row.get("number") or 0,
+                    title=row.get("title") or "",
+                    url=row.get("url") or "",
+                    merged=merged,
+                    base_ref=row.get("base_ref") or "",
+                    head_ref=row.get("head_ref") or "",
+                    head_sha=row.get("head_sha") or "",
+                    head_repo_slug=row.get("head_repo"),
+                    closed_at=_parse_iso8601(stamp),
+                )
+            )
+        return out
+
+    def branch_ahead_by(
+        self, slug: str, base: str, branch: str, *, timeout: float | None = None
+    ) -> int:
+        # verified non-deprecated against gh CLI 2026-06-03
+        # (REST /repos/<slug>/compare/<base>...<head> — .ahead_by is the
+        # count of commits in <head> not reachable from <base>)
+        stdout = self._run(
+            (
+                "api",
+                f"repos/{slug}/compare/{base}...{branch}",
+                "--jq",
+                ".ahead_by",
+            ),
+            timeout=timeout,
+        )
+        stripped = stdout.strip()
+        try:
+            return int(stripped)
+        except ValueError as exc:
+            raise GHError(
+                f"branch_ahead_by({slug!r}, {base!r}, {branch!r}): "
+                f"unexpected ahead_by value {stripped!r}"
+            ) from exc
+
+    def delete_branch_ref(
+        self, slug: str, branch: str, *, timeout: float | None = None
+    ) -> None:
+        # verified non-deprecated against gh CLI 2026-06-03
+        # (REST DELETE /repos/<slug>/git/refs/heads/<branch> — the
+        # documented programmatic branch-deletion path, node prdel4rq.
+        # The .agent-bin shim blocks `git push --delete`, not this.)
+        self._run(
+            (
+                "api",
+                "-X",
+                "DELETE",
+                f"repos/{slug}/git/refs/heads/{branch}",
+            ),
+            timeout=timeout,
+        )
 
 
 #: GraphQL document used by :meth:`ProductionGHClient.fetch_pr_comments`.

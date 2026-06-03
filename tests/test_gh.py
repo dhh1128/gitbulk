@@ -617,3 +617,95 @@ def test_viewer_repo_permission_raises_when_slug_unknown():
 def test_fake_satisfies_protocol_with_new_methods():
     fake = FakeGHClient()
     assert isinstance(fake, GHClient)
+
+
+# ─── prune surface: FakeGHClient (nodes prnbr4kq / prnwt5nq) ───────────────
+
+
+def _branch(name="feat", sha="b" * 40, protected=False):
+    from gitbulk.pr_info import BranchRef
+    return BranchRef(name=name, sha=sha, protected=protected)
+
+
+def _closed(number=1, merged=True, head_ref="feat", head_sha="c" * 40,
+            head_repo_slug="dhh1128/gitbulk"):
+    from gitbulk.pr_info import ClosedPRRef
+    return ClosedPRRef(
+        number=number, title=f"PR {number}", url="u", merged=merged,
+        base_ref="main", head_ref=head_ref, head_sha=head_sha,
+        head_repo_slug=head_repo_slug,
+        closed_at=datetime(2026, 5, 1, tzinfo=timezone.utc),
+    )
+
+
+def test_fake_list_branches_returns_configured():
+    fake = FakeGHClient(branches={"o/r": [_branch("main", protected=True)]})
+    out = fake.list_branches("o/r")
+    assert [b.name for b in out] == ["main"]
+    assert fake.call_count["list_branches"] == 1
+
+
+def test_fake_list_branches_unconfigured_raises():
+    with pytest.raises(GHError, match="list_branches"):
+        FakeGHClient().list_branches("o/r")
+
+
+def test_fake_list_branches_exception_value_raises():
+    fake = FakeGHClient(branches={"o/r": GHError("boom")})
+    with pytest.raises(GHError, match="boom"):
+        fake.list_branches("o/r")
+
+
+def test_fake_closed_prs_for_head_returns_configured():
+    fake = FakeGHClient(closed_prs_for_head={("o/r", "feat"): [_closed()]})
+    out = fake.closed_prs_for_head("o/r", "feat")
+    assert out[0].number == 1
+    assert fake.call_count["closed_prs_for_head"] == 1
+
+
+def test_fake_closed_prs_for_head_unconfigured_raises():
+    with pytest.raises(GHError, match="closed_prs_for_head"):
+        FakeGHClient().closed_prs_for_head("o/r", "feat")
+
+
+def test_fake_closed_prs_for_head_exception_value_raises():
+    fake = FakeGHClient(closed_prs_for_head={("o/r", "feat"): GHError("x")})
+    with pytest.raises(GHError, match="x"):
+        fake.closed_prs_for_head("o/r", "feat")
+
+
+def test_fake_branch_ahead_by_returns_configured():
+    fake = FakeGHClient(branch_ahead_by={("o/r", "main", "feat"): 0})
+    assert fake.branch_ahead_by("o/r", "main", "feat") == 0
+    assert fake.call_count["branch_ahead_by"] == 1
+
+
+def test_fake_branch_ahead_by_unconfigured_raises():
+    with pytest.raises(GHError, match="branch_ahead_by"):
+        FakeGHClient().branch_ahead_by("o/r", "main", "feat")
+
+
+def test_fake_branch_ahead_by_exception_value_raises():
+    fake = FakeGHClient(branch_ahead_by={("o/r", "m", "f"): GHError("e")})
+    with pytest.raises(GHError, match="e"):
+        fake.branch_ahead_by("o/r", "m", "f")
+
+
+def test_fake_delete_branch_ref_default_success_records_call():
+    fake = FakeGHClient()
+    assert fake.delete_branch_ref("o/r", "feat") is None
+    assert fake.delete_branch_calls == [{"slug": "o/r", "branch": "feat"}]
+    assert fake.call_count["delete_branch_ref"] == 1
+
+
+def test_fake_delete_branch_ref_configured_success():
+    fake = FakeGHClient(delete_branch_responses={("o/r", "feat"): None})
+    assert fake.delete_branch_ref("o/r", "feat") is None
+
+
+def test_fake_delete_branch_ref_configured_exception_raises():
+    fake = FakeGHClient(delete_branch_responses={("o/r", "feat"): GHError("nope")})
+    with pytest.raises(GHError, match="nope"):
+        fake.delete_branch_ref("o/r", "feat")
+    # Call is still recorded before the raise.
+    assert fake.delete_branch_calls == [{"slug": "o/r", "branch": "feat"}]

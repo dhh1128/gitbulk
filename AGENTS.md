@@ -47,7 +47,19 @@ MUST clean up the worktree in a `finally` block.
 
 Any code path that calls `git -C ~/code/<repo>` with a mutating subcommand
 is a defect. Read-only subcommands (`rev-parse`, `status --porcelain`,
-`config --get`, `remote get-url`, `branch --show-current`, `log`) are fine.
+`config --get`, `remote get-url`, `branch --show-current`, `log`,
+`worktree list`) are fine.
+
+**One blessed local mutation (node `wtrm6kpq`):** `gitbulk prune-worktrees`
+may run `git -C <clone> worktree remove <linked-worktree>` (and, for a
+fully-merged branch, `git -C <clone> branch -d <branch>`). This is permitted
+*only* because it never touches the working tree, index, `HEAD`, or current
+branch of the **primary** clone the user edits — it removes a separate
+*linked* worktree and prunes admin metadata. It is gated on the same
+path verification `create_worktree` uses: the target MUST resolve to a real
+linked worktree of the clone and MUST NOT be the main worktree path. Removal
+uses `git worktree remove` **without** `--force` (so git's own dirty/lock
+refusals stand), never `rm -rf`.
 
 ### Worktree path verification
 

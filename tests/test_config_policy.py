@@ -88,6 +88,49 @@ def test_retain_runs_default():
     assert Defaults().retain_runs == 30
 
 
+# ─── prune_min_age_days (node prgrc3kp) ────────────────────────────────────
+
+
+def test_prune_min_age_days_default():
+    from gitbulk.config.policy import Defaults
+    assert Defaults().prune_min_age_days == 7
+
+
+def test_prune_min_age_days_explicit_in_defaults(tmp_path):
+    content = "defaults:\n  prune_min_age_days: 30\n"
+    policy = load_policy(_write_policy(tmp_path, content))
+    assert policy.defaults.prune_min_age_days == 30
+
+
+def test_prune_min_age_days_zero_allowed(tmp_path):
+    content = "defaults:\n  prune_min_age_days: 0\n"
+    policy = load_policy(_write_policy(tmp_path, content))
+    assert policy.defaults.prune_min_age_days == 0
+
+
+def test_prune_min_age_days_rejects_negative(tmp_path):
+    content = "defaults:\n  prune_min_age_days: -1\n"
+    with pytest.raises(ConfigError, match="prune_min_age_days"):
+        load_policy(_write_policy(tmp_path, content))
+
+
+def test_prune_min_age_days_per_repo_override(tmp_path):
+    content = """
+defaults:
+  prune_min_age_days: 7
+repos:
+  owner/keep-longer:
+    prune_min_age_days: 30
+  owner/normal:
+    merge_policy: ci-only
+"""
+    policy = load_policy(_write_policy(tmp_path, content))
+    assert policy.defaults.prune_min_age_days == 7
+    assert policy_for(policy, "owner/keep-longer").prune_min_age_days == 30
+    assert policy_for(policy, "owner/normal").prune_min_age_days == 7
+    assert policy_for(policy, "owner/other").prune_min_age_days == 7
+
+
 # ─── merge_method ─────────────────────────────────────────────────────────
 
 

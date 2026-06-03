@@ -100,6 +100,52 @@ class PRComment:
 
 
 @dataclass(frozen=True)
+class BranchRef:
+    """One remote branch row from ``GET /repos/<slug>/branches``.
+
+    Used by ``gitbulk prune-branches`` (node prnbr4kq). ``protected`` is
+    the branch-protection flag GitHub returns inline, so the prune
+    guardrail never needs a second call to refuse a protected branch.
+    ``sha`` is the branch tip, used by the data-loss guard (prdls2nq) to
+    compare against a merged PR's recorded head SHA.
+    """
+
+    name: str
+    sha: str
+    protected: bool
+
+
+@dataclass(frozen=True)
+class ClosedPRRef:
+    """A closed-or-merged PR, as seen by the prune subcommands (node
+    prnbr4kq / prnwt5nq).
+
+    Distinct from :class:`PRInfo` (which models an OPEN PR with merge-gate
+    fields) because prune needs different facts: whether the PR merged,
+    when it closed (for the grace period, node prgrc3kp), and whether the
+    head lived on the upstream or a fork (gitbulk never deletes fork
+    branches). ``head_repo_slug`` is the head repository's ``full_name``;
+    it is ``None`` when GitHub no longer reports it (e.g. a deleted fork).
+    ``closed_at`` is ``merged_at`` for a merged PR, else ``closed_at``.
+    """
+
+    number: int
+    title: str
+    url: str
+    merged: bool
+    base_ref: str
+    head_ref: str
+    head_sha: str
+    head_repo_slug: str | None
+    closed_at: datetime
+
+    @property
+    def state(self) -> str:
+        """``"MERGED"`` or ``"CLOSED"`` — convenience for summary text."""
+        return "MERGED" if self.merged else "CLOSED"
+
+
+@dataclass(frozen=True)
 class TimelineEvent:
     """One PR-timeline event relevant to the continuously-ready window.
 

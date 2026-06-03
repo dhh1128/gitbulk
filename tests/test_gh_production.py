@@ -2049,3 +2049,136 @@ def test_viewer_repo_permission_non_dict_payload_returns_none():
     with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
         client = ProductionGHClient()
         assert client.viewer_repo_permission("a/b") == "none"
+
+
+# ─── list_branches (node prnbr4kq) ─────────────────────────────────────────
+
+
+def test_list_branches_parses_rows_and_skips_garbage():
+    stdout = (
+        '{"name":"main","sha":"aaa","protected":true}\n'
+        "\n"  # blank line tolerated
+        "not-json\n"  # bad line skipped
+        '{"name":"feat/x","sha":"bbb","protected":false}\n'
+    )
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=stdout))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        branches = client.list_branches("o/r")
+    args, _ = mock_run.call_args
+    argv = args[0]
+    assert argv[1:] == [
+        "api",
+        "repos/o/r/branches",
+        "--paginate",
+        "--jq",
+        ".[] | {name, sha: .commit.sha, protected}",
+    ]
+    assert [(b.name, b.sha, b.protected) for b in branches] == [
+        ("main", "aaa", True),
+        ("feat/x", "bbb", False),
+    ]
+
+
+def test_list_branches_respects_timeout():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=""))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        ProductionGHClient().list_branches("o/r", timeout=9.0)
+    _, kwargs = mock_run.call_args
+    assert kwargs["timeout"] == 9.0
+
+
+# ─── closed_prs_for_head (node prnbr4kq) ───────────────────────────────────
+
+
+def test_closed_prs_for_head_merged_and_closed():
+    stdout = (
+        '{"number":1,"title":"merged one","url":"u1","merged_at":'
+        '"2026-05-01T00:00:00Z","closed_at":"2026-05-01T00:00:00Z",'
+        '"base_ref":"main","head_ref":"feat","head_sha":"s1",'
+        '"head_repo":"o/r"}\n'
+        '{"number":2,"title":"closed one","url":"u2","merged_at":null,'
+        '"closed_at":"2026-05-02T00:00:00Z","base_ref":"main",'
+        '"head_ref":"feat","head_sha":"s2","head_repo":null}\n'
+        "garbage\n"
+        '{"number":3,"title":"no stamp","url":"u3","merged_at":null,'
+        '"closed_at":null,"base_ref":"main","head_ref":"feat",'
+        '"head_sha":"s3","head_repo":"o/r"}\n'
+    )
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=stdout))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        refs = ProductionGHClient().closed_prs_for_head("o/r", "feat")
+    args, _ = mock_run.call_args
+    argv = args[0]
+    assert argv[1] == "api"
+    assert argv[2] == "repos/o/r/pulls?state=closed&head=o:feat&per_page=100"
+    assert "--paginate" in argv
+    # Row 3 (no usable timestamp) is dropped; rows 1 (merged) and 2 (closed) kept.
+    assert [(r.number, r.merged, r.state, r.head_repo_slug) for r in refs] == [
+        (1, True, "MERGED", "o/r"),
+        (2, False, "CLOSED", None),
+    ]
+    assert refs[0].closed_at == datetime(2026, 5, 1, tzinfo=timezone.utc)
+
+
+def test_closed_prs_for_head_empty():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout="\n  \n"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        assert ProductionGHClient().closed_prs_for_head("o/r", "x") == []
+
+
+# ─── branch_ahead_by (nodes prnbr4kq / prdls2nq) ───────────────────────────
+
+
+def test_branch_ahead_by_returns_int():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout="0\n"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        result = ProductionGHClient().branch_ahead_by("o/r", "main", "feat")
+    args, _ = mock_run.call_args
+    argv = args[0]
+    assert argv[1:] == [
+        "api",
+        "repos/o/r/compare/main...feat",
+        "--jq",
+        ".ahead_by",
+    ]
+    assert result == 0
+
+
+def test_branch_ahead_by_nonzero():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout="3"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        assert ProductionGHClient().branch_ahead_by("o/r", "main", "f") == 3
+
+
+def test_branch_ahead_by_unexpected_value_raises():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout="not-a-number"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        with pytest.raises(GHError, match="ahead_by"):
+            ProductionGHClient().branch_ahead_by("o/r", "main", "f")
+
+
+# ─── delete_branch_ref (node prdel4rq) ─────────────────────────────────────
+
+
+def test_delete_branch_ref_argv():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=""))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        ProductionGHClient().delete_branch_ref("o/r", "feat/x")
+    args, kwargs = mock_run.call_args
+    argv = args[0]
+    assert argv[1:] == [
+        "api",
+        "-X",
+        "DELETE",
+        "repos/o/r/git/refs/heads/feat/x",
+    ]
+
+
+def test_delete_branch_ref_propagates_gherror():
+    side_effect = _make_run_mock(
+        _CompletedFake(1, stderr="404 Not Found")
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        with pytest.raises(GHError):
+            ProductionGHClient().delete_branch_ref("o/r", "gone")

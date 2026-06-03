@@ -687,6 +687,150 @@ Gitbulk Triage Tool = goal:
         boolean knob then.
       approved-by: daniel, 2026-05-28
 
+    # ─── PRUNE COMMANDS (fleet cleanup, node xq4npk7r realized) ──────────────
+
+    Prune Branches Subcommand = decision:
+      id: prnbr4kq
+      why: >
+        ``gitbulk prune-branches`` deletes remote branches whose ONLY pull
+        requests are merged-or-closed, so the post-merge cruft xq4npk7r
+        names ("undeleted post-merge remote branches") stops accumulating
+        at fleet scale. It is the remote half of the deferred jw3kpn4q
+        cleanup work, promoted to a first-class command rather than a
+        catch-all ``gc``: the candidate set (remote branches) and its
+        guardrails are distinct enough from the local worktree half
+        (node prnwt5nq) that one combined command would muddle two safety
+        models. Like merge it needs no clone — it works purely through gh
+        — so needs_clone is False and the local-git safety contract is not
+        even in play for this command.
+
+        Deletion goes through the GitHub ref API (node prdel4rq), never
+        ``git push --delete``. A branch is deleted only when ALL hold,
+        biasing to skip-with-reason on any ambiguity or gh error
+        (design-notes §11 principle): (a) it is NOT the repo's current
+        default branch; (b) it is NOT protected by a branch-protection
+        rule; (c) it is NOT the head of any OPEN pr (a branch can carry
+        several PRs — one merged does not free it); (d) it is NOT the base
+        of any OPEN pr (the stacked-PR dependency — deleting it orphans the
+        dependent PR; this is the "other things depend on it" case the user
+        called out); (e) it loses no commits (node prdls2nq); (f) the head
+        repository of the merged/closed PR IS the upstream, never a fork —
+        gitbulk never pushes to a fork it does not own; (g) the PR is older
+        than the grace period (node prgrc3kp). Open-PR head/base indexing
+        uses an ALL-AUTHORS open-PR fetch, not my_open_prs (author:@me):
+        someone else's open PR can depend on the branch just as easily.
+      approved-by: daniel, 2026-06-03
+
+    Prune Worktrees Subcommand = decision:
+      id: prnwt5nq
+      why: >
+        ``gitbulk prune-worktrees`` removes LINKED git worktrees whose
+        checked-out branch's only PRs are merged-or-closed — the local half
+        of xq4npk7r's "orphaned worktrees" cleanup. Scope decision (chosen
+        2026-06-03 over "only gitbulk-created worktrees under worktree_root"):
+        discover ALL linked worktrees via ``git worktree list --porcelain``
+        across every configured clone, so worktrees the user created by hand
+        for PR work are pruned too, not only gitbulk's own dispatch/rebase
+        leftovers. The narrower option was rejected because the user's stated
+        goal is "delete local worktrees I made for closed/merged PRs," which
+        the gitbulk-only scope would miss entirely.
+
+        A worktree is removed only when ALL hold (skip-with-reason
+        otherwise): (a) it is a LINKED worktree, NEVER the clone's primary
+        working tree — the local-git safety contract (7mxr4pql) forbids
+        touching the tree the user edits; path-verified the same way
+        create_worktree verifies its target; (b) its working tree is clean
+        — ``git status --porcelain`` empty; (c) it has no untracked files
+        (treated as uncommitted; ``--include-untracked`` overrides); (d) it
+        is NOT locked (``git worktree lock`` is an explicit "keep this");
+        (e) it has no unique unmerged commits (node prdls2nq); (f) it is not
+        detached / mid-rebase / mid-merge / in git-conflict state (reuse
+        is_worktree_in_conflict) — states we cannot reason about safely;
+        (g) its branch has a closed/merged PR association past the grace
+        period (prgrc3kp). Removal uses ``git worktree remove`` WITHOUT
+        --force (force would defeat guards b–c) then ``git worktree prune``;
+        never rm -rf. After removing the worktree, the now-orphaned LOCAL
+        branch is deleted too IFF it is fully merged (no unique commits),
+        per the 2026-06-03 decision — symmetric with guard (e); a branch
+        with unique commits is kept.
+      approved-by: daniel, 2026-06-03
+
+    Prune Grace Period = decision:
+      id: prgrc3kp
+      why: >
+        Both prune commands ignore a branch/worktree whose PR was
+        merged-or-closed more recently than ``prune_min_age_days`` (default
+        7, per-repo overridable like every other Defaults knob). Rationale:
+        a just-merged branch is the one most likely to still be wanted — a
+        hotfix off it, a deploy that references it, a revert in flight — and
+        the whole point of running these without --dry-run (the user's
+        stated intent) is high confidence, which a cool-off buys cheaply.
+        7 chosen over 0/1: a week comfortably outpasses same-day churn and
+        any reasonable CD/rollback window while still clearing the backlog.
+        The grace period is measured from the PR's mergedAt (merged) or
+        closedAt (closed), not the branch's last-commit date, because PR
+        lifecycle — not commit recency — is what "associated with a
+        closed/merged PR" means.
+      approved-by: daniel, 2026-06-03
+
+    Prune Data-Loss Guard = decision:
+      id: prdls2nq
+      why: >
+        The unifying safety principle across both prune commands: never
+        delete a ref or worktree whose deletion would lose commits that
+        exist nowhere else. Concretely, a remote branch is prunable only if
+        its tip is EITHER the exact head SHA GitHub recorded for the merged
+        PR (nothing was pushed after the merge) OR reachable from the
+        repo's default branch (fully merged). A local worktree's branch is
+        prunable only if every commit on it is reachable from the merged PR
+        head or from the remote/default branch. This is what makes acting on
+        CLOSED-but-unmerged PRs safe (the 2026-06-03 "merged + closed, data-
+        loss guarded" choice): an abandoned closed branch is pruned only
+        when it turns out to hold no unique work, otherwise it is kept with
+        a reason. It also handles squash/rebase merges, where the PR head
+        SHA is NOT an ancestor of default: the recorded-head-SHA arm
+        accepts them via GitHub's authoritative "merged" signal rather than
+        an ancestry test that would (wrongly) report data loss. On any
+        inconclusive check (gh/git error, unknown SHA) the guard fails
+        closed → skip.
+      approved-by: daniel, 2026-06-03
+
+    Prune Deletes Remote Branch Via Ref API = decision:
+      id: prdel4rq
+      why: >
+        prune-branches deletes a remote branch with
+        ``gh api -X DELETE repos/{slug}/git/refs/heads/{branch}``, not
+        ``git push origin --delete``. Three reasons: (1) it keeps the
+        command clone-free (like merge), so a missing/dirty local clone
+        never blocks remote cleanup; (2) ``git push --delete`` is exactly
+        the destructive push mode the .agent-bin shim blocks during AI
+        development, whereas the ref API is the documented, scriptable path
+        for unattended deletion; (3) it is one network call with a clear
+        success/refusal signal. Verified non-deprecated against the gh CLI
+        at wiring time per AGENTS.md. GitHub still permits restoring a
+        deleted branch of a merged PR from its UI, and gitbulk records the
+        deleted SHA in run state first, so the operation is recoverable.
+      approved-by: daniel, 2026-06-03
+
+    Worktree Removal Extends The Safety Contract = decision:
+      id: wtrm6kpq
+      why: >
+        The local-git safety contract (7mxr4pql) enumerates only read-only
+        ``git -C <clone>`` subcommands as permitted. prune-worktrees needs
+        one more mutating local operation: ``git worktree remove`` of a
+        LINKED worktree (and the subsequent local-branch delete for a
+        fully-merged branch). This is consistent with the contract's intent
+        — it never touches the working tree, index, HEAD, or current branch
+        of the PRIMARY clone the user edits; it removes a SEPARATE linked
+        worktree and prunes administrative metadata. The contract text (and
+        AGENTS.md) is extended to bless exactly this, gated on the same
+        path-verification create_worktree uses (target must resolve to a
+        real linked worktree of the clone, never the main worktree path).
+        Rejected: leaving prune-worktrees to shell out to rm -rf outside the
+        contract — that would bypass git's own dirty/lock refusals and the
+        worktree admin cleanup, i.e. strictly less safe.
+      approved-by: daniel, 2026-06-03
+
     # ─── WORKTREE & LOCAL CLONE HANDLING ─────────────────────────────────────
 
     Worktree Root Under XDG Cache = decision:
