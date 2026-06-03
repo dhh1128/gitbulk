@@ -1,6 +1,7 @@
 # gitbulk
 
 [![CI](https://github.com/dhh1128/gitbulk/actions/workflows/ci.yml/badge.svg)](https://github.com/dhh1128/gitbulk/actions/workflows/ci.yml)
+[![Docs](https://github.com/dhh1128/gitbulk/actions/workflows/deploy-docs.yml/badge.svg)](https://dhh1128.github.io/gitbulk/)
 
 Nightly fleet-maintenance tool for a developer who works across many GitHub
 repositories.
@@ -16,63 +17,13 @@ repos that need work no PR yet exists for.
 It is designed to be safe to run from cron alongside ongoing development work
 on the same local clones — it never touches your working tree or current branch.
 
-## Status
+## 📖 Documentation
 
-Read-only, read-then-act, and the mutating fleet operations have landed.
-Implemented today:
+**Full user documentation lives at <https://dhh1128.github.io/gitbulk/>** —
+install, configuration, the command reference, running from cron, and more.
 
-| Subcommand | What it does | Mutating? |
-|---|---|---|
-| `report` | Run the invariant chain against your open PRs and write a structured triage report (`summary.md` + `state.yaml`). | No |
-| `summarize` | Feed a recent `report` run through Claude with a triage prompt to prioritize. | No |
-| `dispatch` | Spawn headless Claude agents inside disposable worktrees against PRs matching a filter. Defaults to dry-run. | Yes (with `--apply`) |
-| `merge` | Auto-merge PRs that satisfy the per-repo merge policy. Defaults to dry-run. | Yes (with `--apply`) |
-| `rebase-pr` | Rebase your behind/conflicting PRs onto their current base and force-push (with lease). Defaults to dry-run. | Yes (with `--apply`) |
-| `close-stale` | Warn, then close, PRs inactive past the configured threshold. Defaults to dry-run. | Yes (with `--apply`) |
-| `prune-branches` | Delete remote branches whose only PRs are merged/closed, with guardrails (see below). Defaults to dry-run. | Yes (with `--apply`) |
-| `prune-worktrees` | Remove local linked worktrees whose branch's only PRs are merged/closed, then delete the fully-merged local branch. Defaults to dry-run. | Yes (with `--apply`) |
-| `show` | Print the latest run's artifacts for any subcommand, or the dashboard. | No |
-| `ack` | Clear the `ATTENTION` sentinel after you've reviewed it. | No |
-| `invariants` | List the invariant registry and which subcommands use each. | No |
-
-### Fleet cleanup: `prune-branches` and `prune-worktrees`
-
-These remove the cruft that accumulates around ~150 repos: post-merge
-branches GitHub didn't auto-delete, and worktrees left over from finished PR
-work (`this.i` nodes `prnbr4kq` / `prnwt5nq`). Both default to dry-run and
-take `--apply`; the guardrails are built so `--apply` is safe to run
-unattended (you should rarely need to study a dry run first):
-
-- **Grace period** — a branch/worktree is only touched once its PR has been
-  merged/closed for at least `prune_min_age_days` (default 7, per-repo
-  overridable). Just-merged work is left alone.
-- **No data loss** (`prdls2nq`) — a remote branch is deleted only when its
-  tip is the merged PR's recorded head SHA *or* it is fully contained in the
-  default branch; a worktree's branch is removed only when it has no
-  unpushed commits. Anything with unique work is kept with a reason.
-- **`prune-branches` never deletes** the default branch, a protected branch,
-  the head of an open PR, or the base of an open PR (the stacked-PR case),
-  and never touches fork branches. Deletion goes through the GitHub ref API,
-  not `git push --delete`; the deleted SHA is recorded for recovery.
-- **`prune-worktrees` never touches** the primary clone (local-git safety
-  contract), a dirty worktree (uncommitted changes, untracked files unless
-  `--include-untracked`, or merge/rebase in progress), or a locked one. It
-  uses `git worktree remove` without `--force`, then `git branch -d`
-  (merged-only) so an unmerged branch is kept.
-
-A clean `--apply` run is quiet (no `ATTENTION`); only failures and skipped
-repos surface. Both accept the `--org`/`--repo`/`--filter` fleet filters.
-
-## Install
-
-gitbulk ships two ways (this.i node `dstbr5kq`). Both require the
-[GitHub CLI](https://cli.github.com/) (`gh`) and `git`, authenticated for
-your account — gitbulk shells out to them for everything.
-
-### As a single binary (recommended for using it)
-
-Download the release asset with `gh` (works while the repo is private,
-since `gh` is authenticated) and let it install itself onto your PATH:
+Quick install (requires [`gh`](https://cli.github.com/) and `git`,
+authenticated for your account):
 
 ```bash
 gh release download --repo dhh1128/gitbulk --pattern gitbulk --dir /tmp \
@@ -80,217 +31,62 @@ gh release download --repo dhh1128/gitbulk --pattern gitbulk --dir /tmp \
   && /tmp/gitbulk install
 ```
 
-`gitbulk install` copies the binary into `~/.local/bin` (the XDG user-bin
-directory, and exactly where `bin/gitbulk-cron` looks), marks it
-executable, and prints a shell-specific `PATH` hint if that directory is
-not already on your `PATH`. Pass `--dir <path>` to install elsewhere. If
-the one-liner can't run at all, see
-[`src/gitbulk/manual-install-instructions.md`](src/gitbulk/manual-install-instructions.md).
+The rest of this README is for **contributors**. If you just want to *use*
+gitbulk, head to the [documentation site](https://dhh1128.github.io/gitbulk/).
 
-The binary is a self-contained zipapp; it needs only Python 3.10+ on the
-machine (PyYAML is vendored in). It is **not** truly standalone — it runs
-under the system `python3`.
+---
 
-### Updating
+## Developing
 
 ```bash
-gitbulk update            # download + verify (sha256) + atomically replace
-gitbulk update --check    # just report whether a newer release exists
-```
-
-`update` never replaces the binary mid-command and never fires from cron:
-a "newer version available" notice only appears on an interactive terminal,
-and is suppressed by `--no-update-check` or `GITBULK_NO_UPDATE_CHECK=1`
-(which `bin/gitbulk-cron` sets). If you installed gitbulk with pip/pipx
-instead of the binary, `gitbulk update` declines to clobber it and points
-you at `pip install -U gitbulk` / `pipx upgrade gitbulk`.
-
-### From source (for development)
-
-```bash
-cd ~/code/gitbulk
+git clone https://github.com/dhh1128/gitbulk
+cd gitbulk
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[test]"
 pytest
 ```
 
-## Configuration
+That last `pytest` should come back green at **100% branch coverage on
+`src/gitbulk/`** — that gate is enforced in CI, and any gap requires an
+approved `deviation:` node (see below).
 
-Two files, by default at `~/.config/gitbulk/`:
+### The rules
 
-- `repos.txt` — one `owner/repo` per line; `#` comments and blank lines ignored.
-- `gitbulk.yaml` — policy and bot/human classification config.
+This repo follows a structured, intent-first methodology. Two documents are
+load-bearing and must be read before you change anything:
 
-Examples ship in `config/`.
+- **[`AGENTS.md`](AGENTS.md)** — the non-negotiable behavioral contract for
+  anyone, human or AI, modifying this repo. TDD is mandatory here
+  (`read-run-change-run-commit`); the [local-git safety
+  contract](https://dhh1128.github.io/gitbulk/reference/#local-git-safety-contract)
+  is the most important rule.
+- **[`this.i`](this.i)** — the authoritative design-decision tree. Every
+  load-bearing decision is a node with an opaque base32 id and a
+  rebuttal-surface rationale, committed **before** the code commit it
+  justifies.
 
-## Inspecting runs
+Supporting docs (also published under **Development** on the docs site):
 
-Every subcommand writes a per-run directory under
-`~/.cache/gitbulk/runs/<timestamp>-<subcommand>/` containing
-`summary.md`, `state.yaml`, `invariants.log`, `errors.log`, and
-`manifest.yaml`. A `latest-<subcommand>` symlink points at the newest
-run, and `dashboard.md` aggregates one excerpt per subcommand.
+- [`docs/methodology.md`](docs/methodology.md) — the development discipline.
+- [`docs/architecture.md`](docs/architecture.md) — component and data-flow
+  overview.
+- [`docs/design-notes.md`](docs/design-notes.md) — narrative explainer for
+  `this.i`; the phase plan.
 
-`gitbulk show` is the human-facing way to read them:
+### Editing the documentation site
 
-```bash
-gitbulk show                       # dashboard (~/.cache/gitbulk/dashboard.md)
-gitbulk show report                # latest report's summary.md
-gitbulk show report --state        # state.yaml (structured PR records)
-gitbulk show report --invariants   # invariants.log (JSONL audit trail)
-gitbulk show report --errors       # errors.log (JSONL)
-gitbulk show report --manifest     # manifest.yaml (argv, config snapshot)
-gitbulk show report --path         # just the run-dir path (for scripting)
-```
-
-## Output and color
-
-gitbulk colorizes its summary and error lines with a semantic outcome
-marker — green `✓` for a clean run, yellow `⚠` when something needs
-attention, red `✗`/red text for errors. Color is purely emphasis: it is
-auto-suppressed whenever it would be noise or corruption, so piped and
-redirected output is byte-identical to a no-color run and safe to parse.
-
-Resolution is per stream (stdout and stderr independently), in this
-precedence:
-
-| Signal | Effect |
-| --- | --- |
-| `NO_COLOR` set (any value) | force **off** — the [no-color.org](https://no-color.org) standard; wins over `FORCE_COLOR` |
-| `FORCE_COLOR` / `CLICOLOR_FORCE` set | force **on**, even when piped (e.g. `… \| less -R`) |
-| `TERM=dumb` | off |
-| stream is a TTY | on, else off |
-
-There is no `--color` flag; the environment variables cover the cases:
-`NO_COLOR=1 gitbulk report` to disable, `FORCE_COLOR=1 gitbulk report | tee run.log`
-to keep color through a pipe. Status glyphs fall back to ASCII
-(`[ok] [!] [x]`) on terminals whose encoding can't render Unicode.
-
-## Running from cron
-
-`bin/gitbulk-cron` is the recommended cron entry point: it serializes overlapping
-invocations, captures full stdout/stderr to a timestamped log under
-`~/.cache/gitbulk/cron/`, maintains exit-code-aware symlinks
-(`last-failure.log`, `last-attention.log`, `last-audit.log`), and prunes logs
-older than `$GITBULK_CRON_RETAIN_DAYS` (default 30). The inner `gitbulk` exit
-code is preserved as the wrapper's own exit code, and the wrapper writes its
-status line to stdout — the thing cron mails — **only** on a structural failure
-(exit 1 or an unexpected code). So `MAILTO` is a failure-only channel: routine
-"PRs need attention" nights (exit 2/3) stay quiet on email and surface through
-the `ATTENTION` sentinel instead (see
-[Surfacing attention in your shell](#surfacing-attention-in-your-shell)).
-
-Typical crontab:
-
-```cron
-# MAILTO: a structural failure (exit 1 / unexpected) emails you here; quiet
-# nights send nothing. Don't leave it UNSET — cron then mails the bare local
-# user, which a real relay (e.g. msmtp -> Gmail) rejects as an invalid address.
-# Set a real address, or MAILTO="" to disable mail entirely.
-MAILTO=you@example.com
-
-# Tell the wrapper where gitbulk lives only if it isn't on ~/.local/bin:
-#   GITBULK_BIN=/home/you/venvs/gitbulk/bin/gitbulk
-# Otherwise the wrapper finds a ~/.local/bin install via its default PATH.
-
-# Read-only report at 03:00 on weekdays (Mon-Fri here; drop the `1-5` for every
-# day). Safe alongside local work; exit 2/3 refreshes ~/.cache/gitbulk/ATTENTION
-# for your shell prompt to flag.
-0 3 * * 1-5 /home/you/code/gitbulk/bin/gitbulk-cron report
-
-# Weekly Claude-assisted triage at 04:00 Mondays. Reads the latest report,
-# sends it through Claude, writes a prioritized summary.md.
-0 4 * * 1 /home/you/code/gitbulk/bin/gitbulk-cron summarize
-
-# Weekly dispatch at 05:00 Saturdays. --apply is the explicit opt-in; without
-# it the run is a dry-run that prints what it WOULD do. Create the prompt file
-# first. Per-PR worktrees live under ~/.cache/gitbulk/worktrees/<runid>/ and
-# are cleaned up automatically.
-0 5 * * 6 /home/you/code/gitbulk/bin/gitbulk-cron dispatch --apply --prompt ~/.config/gitbulk/prompts/dispatch.md
-```
-
-Exit-code semantics that drive both your inbox and the `ATTENTION` sentinel
-(this.i node `tp4kq2nr`):
-
-| Code | Meaning |
-|---|---|
-| 0 | Nothing to flag. |
-| 1 | Structural failure (bad config, gh not authed, network, lock timeout). |
-| 2 | At least one PR needs your attention — `ATTENTION` sentinel set. |
-| 3 | At least one repo skipped by an invariant — `ATTENTION` sentinel set. |
-| 4 | Run with `--skip-check` overrides applied (audit signal only). |
-| 99 | Subcommand not yet implemented. |
-
-Email is reserved for exit 1 / unexpected. Exit 2/3 would fire almost nightly
-for a large fleet, so they don't email; they refresh the `ATTENTION` sentinel,
-which your shell prompt can surface instead.
-
-### Surfacing attention in your shell
-
-Each run writes `~/.cache/gitbulk/ATTENTION` (JSON: exit code, run id, one-line
-summary) when PRs need a look or a run failed. Add a prompt indicator that reads
-it directly — no `gitbulk` process is spawned per prompt. For bash, in
-`~/.bashrc`:
+The published site is built from [`docs/`](docs/) with
+[Zensical](https://github.com/squidfunk/zensical) (the config is
+[`zensical.toml`](zensical.toml)). Preview your changes locally:
 
 ```bash
-__gitbulk_attention() {
-    local f="${XDG_CACHE_HOME:-$HOME/.cache}/gitbulk/ATTENTION"
-    [ -r "$f" ] || return 0
-    local code=""
-    command -v jq >/dev/null 2>&1 && code=$(jq -r '.exit_code // empty' "$f" 2>/dev/null)
-    if [ "$code" = "1" ]; then
-        printf '%s' $'\001\e[1;31m\002✖ gitbulk\001\e[0m\002 '   # exit 1: red
-    else
-        printf '%s' $'\001\e[1;33m\002⚠ gitbulk\001\e[0m\002 '   # attention: yellow
-    fi
-}
-# Prepend once (idempotent if this file is re-sourced).
-case "$PS1" in *__gitbulk_attention*) ;; *) PS1='$(__gitbulk_attention)'"$PS1" ;; esac
+uv run --group docs zensical serve     # live-reload preview
+uv run --group docs zensical build     # one-off build into ./site
 ```
 
-A red `✖ gitbulk` means a structural failure (you were also emailed); a yellow
-`⚠ gitbulk` means PRs need attention. Run `gitbulk show report` for the detail.
-
-The sentinel clears as soon as you've actually looked — you rarely need
-`gitbulk ack`:
-
-- **`gitbulk show <sub>`** clears the sentinel when the run you're viewing is
-  the one that raised it (it matches on subcommand + run id). Viewing a
-  *different* subcommand's run leaves the alert in place, so a glance at
-  `show report` never silently dismisses, say, a `dispatch` failure.
-- **`gitbulk show`** with no argument (the dashboard) clears whatever alert is
-  outstanding — the dashboard surfaces every subcommand's latest summary.
-- **A clean run supersedes its own alert**: if last night's `report` flagged
-  PRs and today's `report` comes back clean (exit 0), the stale alert clears
-  itself. Only the *same* subcommand supersedes — a clean `report` won't clear
-  a `merge` alert.
-- **`gitbulk ack`** is still the explicit catch-all: it clears any sentinel,
-  including a legacy/corrupt one or a fallback alert with no recorded run id.
-
-When `show` clears an alert it prints a one-line note to stderr (so it never
-corrupts an artifact you're piping from stdout).
-
-## Local-git safety contract
-
-`gitbulk` never modifies the working tree, index, or current branch of any
-local clone under `~/code/`. Any operation that needs a checkout uses
-`git worktree add` and cleans up afterward. Two copies of `gitbulk` may run
-concurrently; a global advisory lock allows multiple read-only runs in parallel
-but serializes mutating operations.
-
-## Development methodology
-
-This repo follows a structured, intent-first methodology (see
-[`docs/methodology.md`](docs/methodology.md)): every load-bearing design
-decision is recorded in [`this.i`](this.i) as a node with an opaque base32 id
-and a rebuttal-surface rationale, committed **before** the code commit it
-justifies. Phase boundaries are explicit gates with named adversarial reviewer
-roles. TDD is mandatory; 100% branch coverage on `src/gitbulk/` is enforced
-in CI, with any gap requiring an approved `deviation:` node.
-
-If you are an AI agent or human contributor, [`AGENTS.md`](AGENTS.md) is the
-authoritative behavioral contract — read it before any change.
+A push to `main` that touches `docs/` or `zensical.toml` redeploys the site via
+[`.github/workflows/deploy-docs.yml`](.github/workflows/deploy-docs.yml).
 
 ## Releasing
 
@@ -320,11 +116,9 @@ gitbulk bundle ./dist/gitbulk
 
 ## See also
 
+- [Documentation site](https://dhh1128.github.io/gitbulk/) — the user manual.
 - [`AGENTS.md`](AGENTS.md) — non-negotiable rules for AI agents (and humans) modifying this repo.
 - [`this.i`](this.i) — authoritative design-decision tree (intent layer).
-- [`docs/methodology.md`](docs/methodology.md) — the development discipline this repo follows.
-- [`docs/design-notes.md`](docs/design-notes.md) — narrative explainer for `this.i`; phase plan.
-- [`docs/architecture.md`](docs/architecture.md) — high-level component and data-flow overview.
 
 ## License
 
