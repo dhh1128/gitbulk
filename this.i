@@ -1488,12 +1488,16 @@ Gitbulk Triage Tool = goal:
         gh-fetch / preflight phases run under NO lock. This both removes the
         coarse blocking and shrinks every hold to milliseconds.
 
-        DEADLOCK SAFETY: the structure is FLAT and NON-NESTED — at most one
-        lock is held at a time (org/default_branches are primed before the
-        per-repo loop; repo_lock is the only in-loop lock and is released
-        each iteration). With no nesting, deadlock is impossible by
-        construction. Backstop order for any FUTURE nesting, documented at
-        the lock definitions:
+        DEADLOCK SAFETY: the structure is PREDOMINANTLY FLAT — at most one
+        lock is held at a time in almost all paths (org/default_branches are
+        primed before the per-repo loop; repo_lock is the only in-loop lock
+        and is released each iteration). The ONE sanctioned nesting is
+        `show <sub>`'s sentinel clear, which holds sentinel_lock while still
+        holding run_state_lock(sub, SH) — i.e. run_state -> sentinel, the
+        canonical order below; nothing acquires those two in reverse (the
+        mutators take run_state at complete() and sentinel at set_attention
+        SEPARATELY, never nested), so no cycle can form. Acquisition order
+        for any nesting, documented at the lock definitions:
           org -> default_branches -> repo(slug) -> run_state(sub)
               -> sentinel -> dashboard
 

@@ -125,12 +125,18 @@ against `gc.prune_runs("report")`.
 
 ## 6. Deadlock argument
 
-The recommended structure is **flat and non-nested** — each `with` block closes
-before the next opens, so at most one lock is ever held at a time (the per-repo
-`repo_lock` is the only one taken inside a loop, and it is released each
-iteration; `org`/`default_branches` are primed *before* the loop, so no
-`repo_lock`-while-holding-cache-lock nesting occurs). With no nesting, deadlock
-is impossible by construction.
+The structure is **predominantly flat** — each `with` block closes before the
+next opens, so in almost all paths at most one lock is held at a time (the
+per-repo `repo_lock` is the only one taken inside a loop, and it is released
+each iteration; `org`/`default_branches` are primed *before* the loop, so no
+`repo_lock`-while-holding-cache-lock nesting occurs).
+
+The **one sanctioned nesting** is `show <sub>`'s sentinel clear: it runs under
+`sentinel_lock` while still holding `run_state_lock(sub, SH)`. That is
+`run_state → sentinel`, which is the canonical order below, and nothing ever
+acquires those two in the reverse order (the mutators take `run_state` at
+`complete()` and `sentinel` at `set_attention` *separately*, never nested), so
+no cycle can form. Deadlock is therefore still impossible by construction.
 
 **Backstop** for any future code that *must* nest — one total acquisition order,
 documented at the lock definitions:

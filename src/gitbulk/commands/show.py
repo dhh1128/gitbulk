@@ -5,11 +5,15 @@ writes. Operators read the dashboard or a specific artifact (summary.md,
 state.yaml, invariants.log, errors.log, manifest.yaml, or just the
 run-dir path) without having to remember the cache layout themselves.
 
-Per this.i node ``tmlk5pq3``, this is a read-only subcommand: it takes
-the global *shared* lock with a 300-second timeout so a concurrent
-mutating run cannot swap the ``latest-<subcommand>`` symlink under us
-mid-read. It does NOT call :meth:`RunState.begin` — no new run dir is
-created; the handler purely consumes prior runs (node ``kp7nw4mq``).
+Resource-scoped locking (node ``rsclk7nq``): ``show <sub>`` takes the
+*shared* ``run_state_lock(<sub>)`` (300s budget, node ``tmlk5pq3``) so a
+concurrent run of that SAME subcommand cannot swap its ``latest-<sub>``
+symlink or gc-prune its run dir mid-read — and, crucially, a run of a
+DIFFERENT subcommand never blocks the read. The sentinel clear runs under
+``sentinel_lock`` (resource #4). Bare ``show`` reads the pre-rendered,
+atomically-written ``dashboard.md`` directly, so it needs no run-state lock —
+only ``sentinel_lock`` for the clear. ``show`` does NOT call
+:meth:`RunState.begin` — no new run dir is created (node ``kp7nw4mq``).
 
 Exit codes:
   0 EXIT_OK                 — printed the requested artifact
@@ -24,7 +28,7 @@ import sys
 from pathlib import Path
 
 from gitbulk import paths, sentinel
-from gitbulk.locks import LockTimeoutError, global_lock
+from gitbulk.locks import LockTimeoutError, run_state_lock, sentinel_lock
 from gitbulk.subcommands import NAMES
 from gitbulk.util.style import error_line
 
@@ -113,8 +117,11 @@ def _emit_dashboard() -> int:
     """
     dash = paths.dashboard_file()
     if dash.exists():
+        # dashboard.md is written atomically (unique tmp + os.replace), so a
+        # plain read never sees a torn file — no run-state lock needed here.
         sys.stdout.write(dash.read_text())
-        cleared = sentinel.clear_and_describe()
+        with sentinel_lock(timeout=_LOCK_TIMEOUT_SECONDS, subcommand="show"):
+            cleared = sentinel.clear_and_describe()
         if cleared is not None:
             _note_cleared(cleared)
         return EXIT_OK
@@ -181,7 +188,12 @@ def _clear_if_viewing_flagged_run(subcommand: str, run_dir: Path) -> None:
     runid = _runid_from_run_dir(run_dir, subcommand)
     if runid is None:
         return
-    cleared = sentinel.clear_if_matches(subcommand, runid)
+    # sentinel_lock (resource #4) guards the parse+unlink check-then-act. When
+    # reached from the `show <sub>` path this nests inside run_state_lock(sub,
+    # SH); that is the one sanctioned nesting and follows the canonical order
+    # (run_state -> sentinel), so it cannot deadlock (node rsclk7nq).
+    with sentinel_lock(timeout=_LOCK_TIMEOUT_SECONDS, subcommand="show"):
+        cleared = sentinel.clear_if_matches(subcommand, runid)
     if cleared is not None:
         _note_cleared(cleared)
 
@@ -189,21 +201,25 @@ def _clear_if_viewing_flagged_run(subcommand: str, run_dir: Path) -> None:
 def show_handler(args: argparse.Namespace) -> int:
     """Top-level entry for ``gitbulk show``.
 
-    The shared global lock guards us against a concurrent mutating run
-    swapping the ``latest-<subcommand>`` symlink mid-read; without it
-    we could resolve a path that no longer exists by the time we open
-    it. Timeout per node ``tmlk5pq3`` (300s for read-only subcommands).
+    ``show <sub>`` holds ``run_state_lock(<sub>, shared)`` only around the
+    resolve+read, so a concurrent run of <sub> cannot swap its symlink or
+    gc-prune its run dir mid-read; a run of a DIFFERENT subcommand never
+    contends. Bare ``show`` reads the atomically-written dashboard.md with no
+    run-state lock. The sentinel clear runs under ``sentinel_lock`` (inside the
+    emit helpers). Timeouts per node ``tmlk5pq3`` (300s for read-only).
     """
+    sub = getattr(args, "show_subcommand", None)
     try:
-        with global_lock(
-            "shared",
-            timeout=_LOCK_TIMEOUT_SECONDS,
-            subcommand="show",
+        if not sub:
+            return _emit_dashboard()
+        artifact = _selected_artifact(args)
+        if sub not in NAMES:
+            # Unknown subcommand: no real run-state resource to lock — let the
+            # emit helper print the canonical error (avoids a stray lock file).
+            return _emit_for_subcommand(sub, artifact)
+        with run_state_lock(
+            sub, "shared", timeout=_LOCK_TIMEOUT_SECONDS, subcommand="show"
         ):
-            sub = getattr(args, "show_subcommand", None)
-            if not sub:
-                return _emit_dashboard()
-            artifact = _selected_artifact(args)
             return _emit_for_subcommand(sub, artifact)
     except LockTimeoutError as e:
         print(

@@ -45,7 +45,7 @@ from pathlib import Path
 from gitbulk import paths, sentinel
 from gitbulk.claude import ClaudeError, ProductionClaudeClient
 from gitbulk.config.policy import Policy, load_policy
-from gitbulk.locks import LockTimeoutError, global_lock
+from gitbulk.locks import LockTimeoutError, run_state_lock, sentinel_lock
 from gitbulk.runstate import RunState
 from gitbulk.util.style import error_line, summary_line
 
@@ -133,35 +133,47 @@ def _top_attention_items(claude_output: str) -> list[str]:
 
 
 def summarize_handler(args: argparse.Namespace) -> int:
-    """Top-level entry for ``gitbulk summarize``."""
+    """Top-level entry for ``gitbulk summarize``.
+
+    Resource-scoped locking (node ``rsclk7nq``): the report's ``state.yaml`` is
+    resolved + read into memory under ``run_state_lock("report", shared)`` so a
+    concurrent ``report`` run cannot swap its symlink or gc-prune it mid-read.
+    The (slow) Claude call then runs with NO lock held; summarize's own
+    ``complete()`` and ``set_attention`` take their resource locks afterwards.
+    """
     policy = load_policy()
 
-    latest_report = paths.latest_run_symlink("report")
-    if not latest_report.exists():
-        print(
-            error_line(
-                "gitbulk summarize: no `gitbulk report` run found. "
-                "Run `gitbulk report` first."
-            ),
-            file=sys.stderr,
-        )
-        return EXIT_STRUCTURAL_FAILURE
-
-    state_path = latest_report / "state.yaml"
-    if not state_path.exists():
-        print(
-            error_line("gitbulk summarize: latest report run has no state.yaml."),
-            file=sys.stderr,
-        )
-        return EXIT_STRUCTURAL_FAILURE
-
     try:
-        with global_lock(
-            "shared",
-            timeout=_LOCK_TIMEOUT_SECONDS,
-            subcommand="summarize",
+        with run_state_lock(
+            "report", "shared", timeout=_LOCK_TIMEOUT_SECONDS, subcommand="summarize"
         ):
-            return _run_under_lock(args, policy, state_path)
+            latest_report = paths.latest_run_symlink("report")
+            if not latest_report.exists():
+                print(
+                    error_line(
+                        "gitbulk summarize: no `gitbulk report` run found. "
+                        "Run `gitbulk report` first."
+                    ),
+                    file=sys.stderr,
+                )
+                return EXIT_STRUCTURAL_FAILURE
+
+            state_path = latest_report / "state.yaml"
+            if not state_path.exists():
+                print(
+                    error_line(
+                        "gitbulk summarize: latest report run has no state.yaml."
+                    ),
+                    file=sys.stderr,
+                )
+                return EXIT_STRUCTURAL_FAILURE
+
+            # Read into memory while the report lock is held; everything after
+            # this (Claude, our own run-state writes) needs neither this lock
+            # nor to keep `report` blocked for the Claude duration.
+            state_text = state_path.read_text()
+
+        return _run(args, policy, state_path, state_text)
     except LockTimeoutError as e:
         print(
             error_line(f"gitbulk summarize: timed out acquiring lock: {e}"),
@@ -170,14 +182,18 @@ def summarize_handler(args: argparse.Namespace) -> int:
         return EXIT_STRUCTURAL_FAILURE
 
 
-def _run_under_lock(
+def _run(
     args: argparse.Namespace,
     policy: Policy,
     state_path: Path,
+    state_text: str,
 ) -> int:
-    """Pipeline under the shared lock — split for the same reason as
-    report.py: lock-timeout vs in-run failures are structurally distinct
-    error branches."""
+    """The summarize pipeline after the report state has been read.
+
+    Split out so lock-timeout vs in-run failures stay structurally distinct
+    error branches (same rationale as report.py). ``state_text`` is the
+    already-read report ``state.yaml`` content; ``state_path`` is recorded in
+    the manifest snapshot for forensic reproducibility."""
     # Build a minimal config snapshot for manifest.yaml. Summarize is
     # parameterized only by the prompt path and model name (no repos,
     # no skip set); recording those lets a forensic reader reproduce
@@ -214,7 +230,7 @@ def _run_under_lock(
         )
 
     prompt_text = prompt_path.read_text()
-    state_text = state_path.read_text()
+    # state_text was read under run_state_lock("report") in the handler.
 
     claude = ProductionClaudeClient()
     try:
@@ -243,13 +259,18 @@ def _run_under_lock(
     if items:
         exit_code = EXIT_ATTENTION_NEEDED
         runid = _runid_from_run_dir(rs.run_dir)
-        sentinel.set_attention(
-            exit_code,
-            "summarize",
-            runid,
-            f"triage output flagged {len(items)} attention items",
-        )
-        rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
+        with sentinel_lock(timeout=_LOCK_TIMEOUT_SECONDS, subcommand="summarize"):
+            sentinel.set_attention(
+                exit_code,
+                "summarize",
+                runid,
+                f"triage output flagged {len(items)} attention items",
+            )
+        with run_state_lock(
+            "summarize", "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
+            subcommand="summarize",
+        ):
+            rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
         print(summary_line(
             f"gitbulk summarize: {len(items)} attention item(s). "
             f"View: gitbulk show summarize",
@@ -257,7 +278,11 @@ def _run_under_lock(
         ))
         return exit_code
 
-    rs.complete(EXIT_OK, retain_runs=policy.defaults.retain_runs)
+    with run_state_lock(
+        "summarize", "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
+        subcommand="summarize",
+    ):
+        rs.complete(EXIT_OK, retain_runs=policy.defaults.retain_runs)
     print(summary_line(
         "gitbulk summarize: nothing requires attention. View: gitbulk show summarize",
         EXIT_OK,
@@ -284,7 +309,11 @@ def _finish_failure(
     parseable run dir even on the unhappy paths.
     """
     rs.write_summary(f"# gitbulk summarize (FAILED)\n\n{summary}\n")
-    rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
+    with run_state_lock(
+        "summarize", "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
+        subcommand="summarize",
+    ):
+        rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
     return exit_code
 
 

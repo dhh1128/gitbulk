@@ -433,8 +433,9 @@ def test_summarize_lock_timeout_returns_structural_failure(
         def __exit__(self, *a):  # pragma: no cover — never reached
             return False
 
+    # summarize now reads the report state under run_state_lock("report").
     monkeypatch.setattr(
-        "gitbulk.commands.summarize.global_lock",
+        "gitbulk.commands.summarize.run_state_lock",
         lambda *a, **kw: _BoomLock(),
     )
     # Inject a fake to make sure no real claude runs even if the lock
