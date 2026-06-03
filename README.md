@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/dhh1128/gitbulk/actions/workflows/ci.yml/badge.svg)](https://github.com/dhh1128/gitbulk/actions/workflows/ci.yml)
 [![Docs](https://github.com/dhh1128/gitbulk/actions/workflows/deploy-docs.yml/badge.svg)](https://dhh1128.github.io/gitbulk/)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 
 Nightly fleet-maintenance tool for a developer who works across many GitHub
 repositories.
