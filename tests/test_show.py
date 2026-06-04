@@ -465,3 +465,38 @@ def test_show_serializes_on_same_subcommand_run_lock(
     err = capsys.readouterr().err
     assert rc == EXIT_STRUCTURAL_FAILURE
     assert "timed out" in err
+
+
+def test_show_nested_sentinel_clear_is_bounded_not_a_hang(
+    report_run, monkeypatch, capsys
+):
+    """The ONE nested acquisition in the whole system — `show <sub>` holds
+    run_state_lock(sub, SH) and then takes sentinel_lock(EX) to clear the
+    matching ATTENTION sentinel — is BOUNDED, not a hang.
+
+    Holding the sentinel lock from 'another process' forces show through that
+    nested path under contention. It must surface a clean LockTimeoutError
+    (exit 1), proving the inner lock can never deadlock: the worst case is a
+    bounded timeout, never a forever-wait (node rsclk7nq deadlock argument)."""
+    from gitbulk import sentinel
+    from gitbulk.commands.show import _runid_from_run_dir
+
+    runid = _runid_from_run_dir(report_run, "report")
+    sentinel.set_attention(2, "report", runid, "needs a human")
+    monkeypatch.setattr("gitbulk.commands.show._LOCK_TIMEOUT_SECONDS", 0.3)
+
+    # Another holder owns the sentinel lock; show holds run_state("report", SH)
+    # and then blocks trying to take sentinel_lock(EX) for the clear.
+    fd = os.open(
+        paths.named_lock_file("attention"), os.O_RDWR | os.O_CREAT, 0o644
+    )
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        rc = show_handler(_make_args(show_subcommand="report"))
+    finally:
+        os.close(fd)
+    err = capsys.readouterr().err
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    assert "timed out" in err
+    # The sentinel was NOT cleared (we held its lock), so it survives intact.
+    assert sentinel.has_attention()

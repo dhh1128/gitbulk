@@ -1516,6 +1516,27 @@ Gitbulk Triage Tool = goal:
           org -> default_branches -> repo(slug) -> run_state(sub)
               -> sentinel -> dashboard
 
+        AUDITED + ENFORCED (2026-06-04, after a "prove it's deadlock-free"
+        review): a source audit confirmed org/default_branches/watchdog locks
+        are taken early (before any repo/run_state/sentinel lock), _finish
+        takes sentinel and run_state sequentially (not nested), and the lone
+        simultaneous hold is show's run_state(SH)->sentinel(EX) in canonical
+        order with no reverse pair. Two regression guards keep it true:
+        test_all_production_lock_acquisitions_pass_a_timeout (token-scans
+        src/gitbulk; fails if any `with <lock>(...)` omits timeout=) and
+        test_show_nested_sentinel_clear_is_bounded_not_a_hang (drives the one
+        nested path under contention -> bounded LockTimeoutError, not a hang).
+
+        WAIT-FOREVER vs TIMEOUT: every production acquisition passes a bounded
+        timeout (tmlk5pq3: 300s read / 1800s mutate; 60s file-only cache
+        locks; 300s org refresh). On contention the poll loop raises
+        LockTimeoutError -> handler catches -> exit 1 + holder metadata on
+        stderr, no ATTENTION. The keyed constructors default to None
+        (block-forever) per hk5pq3nm.c, so safety lives at the call sites and
+        the token-scan guard makes a forgotten timeout= a test failure. Worst
+        observable case is therefore a bounded timeout + clean exit 1, never a
+        hang.
+
         kp7nw4mq.h UPDATE: that node said "subcommands acquire global_lock()
         in their CLI handler before RunState.begin()". Under rsclk7nq there
         is no single global_lock; RunState.begin() still takes no lock, but

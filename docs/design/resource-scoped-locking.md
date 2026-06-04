@@ -147,6 +147,37 @@ documented at the lock definitions:
 org → default_branches → repo(slug) → run_state(sub) → sentinel → dashboard
 ```
 
+### Audited (not just argued)
+
+A source audit confirms the above is the real shape, not an aspiration:
+`org_lock` / `default_branches_lock` / `watchdog_ack_lock` are all taken *early*
+in each pipeline (org refresh / prime / the merge-watchdog), strictly before any
+`repo_lock` / `run_state_lock` / `sentinel_lock`; the mutators' `_finish` takes
+`sentinel_lock` and `run_state_lock` as separate sequential blocks; `summarize`
+releases `run_state_lock("report")` before locking anything else. The **only**
+simultaneous hold is `show <sub>`'s `run_state(SH) → sentinel(EX)`, in canonical
+order, with no reverse pair anywhere — so no wait-cycle can form.
+
+Two regression tests keep this true:
+- `test_all_production_lock_acquisitions_pass_a_timeout` (token-scans
+  `src/gitbulk`, fails if any `with <lock>(…)` omits `timeout=`).
+- `test_show_nested_sentinel_clear_is_bounded_not_a_hang` (drives the one nested
+  path under contention; asserts it times out cleanly instead of hanging).
+
+### Do we wait forever, or time out?
+
+**Always time out — never forever.** Every acquisition in production passes an
+explicit bounded `timeout=` (read-only 300 s, mutating 1800 s per `tmlk5pq3`;
+file-only cache locks 60 s; org refresh 300 s). On contention the poll loop
+raises `LockTimeoutError`, which each handler catches and surfaces as exit 1 +
+a stderr line naming the holder (pid / since / subcommand / liveness) — no
+ATTENTION sentinel (a stuck lock is a structural issue for cron's mail channel,
+not the daily glyph). The keyed constructors *default* to block-forever
+(`timeout=None`, per `hk5pq3nm.c`), so the safety lives at the call sites — and
+the token-scan guard above makes a forgotten `timeout=` a test failure, not a
+production hang. Net: even if the deadlock argument were somehow wrong, the
+worst observable outcome is a bounded timeout and a clean exit 1, never a hang.
+
 ## 7. Prerequisite hardening (Phase 0)
 
 These remove the crash-races the global lock currently masks; fine-grained locks

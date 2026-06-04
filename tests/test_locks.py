@@ -554,3 +554,65 @@ def test_named_lock_file_rejects_unsafe_names(bad):
 
 def test_named_lock_file_valid_name(isolated_cache):
     assert paths.named_lock_file("runstate-merge") == paths.locks_dir() / "runstate-merge.lock"
+
+
+# ─── No-forever-wait invariant (node rsclk7nq) ──────────────────────────────
+
+
+def test_all_production_lock_acquisitions_pass_a_timeout():
+    """Every `with <lock>(...)` in src/gitbulk MUST pass an explicit timeout=.
+
+    This is the structural guarantee that gitbulk never waits forever on a
+    lock: a contended acquisition always fails fast with LockTimeoutError
+    (surfaced as exit 1) instead of hanging. The keyed constructors default
+    timeout to None (block-forever) per hk5pq3nm.c, so the safety lives at the
+    CALL SITES — this guard enforces it for all current and future code.
+    locks.py (the definitions themselves) is excluded.
+    """
+    import io
+    import tokenize
+    from pathlib import Path
+
+    lock_names = {
+        "run_state_lock", "repo_lock", "org_lock", "default_branches_lock",
+        "sentinel_lock", "dashboard_lock", "watchdog_ack_lock",
+    }
+    root = Path(__file__).resolve().parents[1] / "src" / "gitbulk"
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        if path.name == "locks.py":
+            continue
+        toks = list(tokenize.generate_tokens(io.StringIO(path.read_text()).readline))
+        for i, tok in enumerate(toks):
+            if not (tok.type == tokenize.NAME and tok.string == "with"):
+                continue
+            for j in range(i + 1, min(i + 6, len(toks))):
+                tj = toks[j]
+                if (
+                    tj.type == tokenize.NAME
+                    and tj.string in lock_names
+                    and j + 1 < len(toks)
+                    and toks[j + 1].string == "("
+                ):
+                    depth, k = 0, j + 1
+                    while k < len(toks):
+                        s = toks[k].string
+                        if s == "(":
+                            depth += 1
+                        elif s == ")":
+                            depth -= 1
+                            if depth == 0:
+                                break
+                        k += 1
+                    names = [
+                        toks[x].string
+                        for x in range(j + 1, k + 1)
+                        if toks[x].type == tokenize.NAME
+                    ]
+                    if "timeout" not in names:
+                        offenders.append(f"{path.name}:{tj.start[0]} with {tj.string}(...)")
+                    break
+    assert not offenders, (
+        "lock acquisition(s) missing an explicit timeout= (would block "
+        "forever on contention):\n" + "\n".join(offenders)
+    )
