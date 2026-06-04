@@ -2555,6 +2555,77 @@ Gitbulk Triage Tool = goal:
         drain); ``plan()`` only supplies the argv/env, it does not run.
       approved-by: daniel, 2026-06-04
 
+    Agent Profiles: Presets Plus Custom Template = decision:
+      id: agprof4k
+      why: >
+        How a backend (agbknd7q) is selected and configured. A new optional
+        ``agents:`` mapping plus ``default_agent:`` in gitbulk.yaml, and a
+        per-repo ``agent:`` override reusing the existing repos.<slug> override
+        machinery. Built-in PRESETS (claude, gemini, copilot, cursor) cover the
+        common case in one line (``default_agent: gemini``); a custom
+        ``command`` template covers anything else. A user ``agents.<name>``
+        block deep-merges over the preset of the same name.
+
+        Resolution order (resolve_agent_name): ``--agent`` → per-repo ``agent:``
+        → ``default_agent`` → the ``claude`` preset. The ``claude`` default is
+        served by the native ProductionClaudeClient (not the generic
+        CommandAgentBackend) so the no-config path is byte-identical to
+        pre-feature behavior — the whole feature is opt-in and backward
+        compatible (proven: 1556→1628 tests, the original 1556 unchanged).
+
+        Per-repo override in dispatch: the parallel kernel takes a single
+        ``claude`` backend plus an optional per-target ``backends`` map keyed by
+        ExecTarget.key. dispatch builds that map from per-repo overrides,
+        caching each distinct backend by resolved name (build-once). summarize
+        is single-backend (run-level). Chosen over threading a backend through
+        every ExecTarget: the map is a smaller, well-bounded kernel addition and
+        leaves ExecTarget unchanged.
+
+    Agent Command Templates Are Argv-Lists, Never Shell = constraint:
+      id: agtmpl9k
+      why: >
+        The security spine of the pluggable layer (threat-model T6 / §3.4-4
+        warned that letting config choose the binary is a red flag; we accept
+        that surface deliberately and these are the compensating controls):
+
+        (1) ``command`` / ``model_args`` are argv LISTS. A scalar YAML string is
+            a hard config error — a string would imply a shell, which gitbulk
+            never uses. So attacker-influenceable prompt/worktree text only ever
+            lands as a single argv element and cannot break out: there is no
+            shell to break out of.
+        (2) ``{prompt}`` / ``{model}`` substitute WITHIN one token (whole token
+            or substring), so the substitution can never split into extra args.
+            Validated: exactly one ``{prompt}`` token for prompt_via=arg, zero
+            for stdin.
+        (3) ``command[0]`` is pinned via shutil.which at construction (the
+            gh/claude F2 fix, generalized), so a later PATH prepend cannot
+            substitute the binary. Absolute path trusted as-is; a relative
+            path that does not resolve is a config error; a bare name that
+            which() cannot find falls back to itself (a missing binary then
+            surfaces as a per-target launch failure, not a whole-run abort, and
+            an absent binary cannot be PATH-hijacked).
+
+        These are enforced by the test_agent_security.py adversarial suite
+        (agatk5n): shell-metachar prompts stay one token, scalar command/env
+        refused, which-pinning, relative-path rejection.
+
+    Agent Environment Is An Allowlist = decision:
+      id: agenv6q
+      why: >
+        A subprocess inherits the WHOLE environment, so a backend would
+        otherwise get GH_TOKEN, the SSH agent socket, AWS/cloud creds, and every
+        API token (threat-model T1). Each profile gets an optional ``env``
+        allowlist: only the named vars plus a minimal safe base (PATH, HOME,
+        locale, TERM, TMPDIR — deliberately NO credential-bearing vars) reach
+        the child. ``env: null`` (the default) inherits the full environment for
+        backward compatibility; presets/custom profiles opt into a scoped set.
+        The launch plan (agbknd7q) carries the exact ``env`` dict; the kernel
+        passes it to Popen only when scoped (so the inherit path and the
+        existing test popen-factories are unaffected). With the least-privilege
+        push rework (agpriv8n) the resolve-conflicts agent needs no credentials
+        at all, so its env can be scrubbed to the bare toolchain.
+      approved-by: daniel, 2026-06-04
+
     Repo-Level Dispatch Opens A PR = decision:
       id: dsprp7kq
       why: >

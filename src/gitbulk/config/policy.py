@@ -11,13 +11,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
 from gitbulk import paths
 from gitbulk.config.repos import ConfigError
 from gitbulk.filters import FilterSpec
+
+if TYPE_CHECKING:
+    from gitbulk.agent import AgentProfile
 
 _VALID_MERGE_POLICIES = {"strict", "ci-only", "never"}
 _VALID_UNRESOLVED_BURDENS = {"me", "other", "either"}
@@ -31,6 +34,8 @@ _TOP_LEVEL_KEYS = {
     "repos",
     "filters",
     "worktree_root",
+    "agents",  # pluggable coding-agent profiles (this.i agprof4k)
+    "default_agent",  # run-level default agent name
     "notifications",  # forward-compat placeholder; contents ignored
 }
 
@@ -56,7 +61,8 @@ _DEFAULTS_KEYS = {
 
 _HUMANS_KEYS = {"org", "cache_ttl_hours", "exceptions", "always_human"}
 
-_REPO_OVERRIDE_KEYS = _DEFAULTS_KEYS  # per-repo can override any defaults key
+# per-repo can override any defaults key, plus pick a per-repo agent
+_REPO_OVERRIDE_KEYS = _DEFAULTS_KEYS | {"agent"}
 
 
 @dataclass(frozen=True)
@@ -113,6 +119,9 @@ class RepoOverride:
     prune_min_age_days: int | None = None
     skip_checks: tuple[str, ...] = ()  # appended to defaults
     extra_checks: tuple[str, ...] = ()  # appended to defaults
+    #: Per-repo coding-agent selection (this.i agprof4k); names a profile
+    #: under ``agents:`` or a built-in preset. ``None`` ⇒ use ``default_agent``.
+    agent: str | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +134,11 @@ class Policy:
     #: Maps name → FilterSpec (see gitbulk.filters / node flt7arg2).
     filters: dict[str, "FilterSpec"] = field(default_factory=dict)
     worktree_root: Path = field(default_factory=lambda: paths.default_worktree_root())
+    #: Pluggable coding-agent profiles, name → AgentProfile (this.i agprof4k).
+    #: Empty ⇒ only the built-in presets are available.
+    agents: dict[str, "AgentProfile"] = field(default_factory=dict)
+    #: Run-level default agent name; ``None`` ⇒ the ``claude`` preset.
+    default_agent: str | None = None
 
 
 # ─── Validation helpers ────────────────────────────────────────────────────
@@ -314,6 +328,8 @@ def _parse_repo_override(raw: dict[str, Any], where: str) -> RepoOverride:
         kwargs["extra_checks"] = _ensure_str_list(
             raw["extra_checks"], f"{where}.extra_checks"
         )
+    if "agent" in raw:
+        kwargs["agent"] = _ensure_str(raw["agent"], f"{where}.agent")
     return RepoOverride(**kwargs)
 
 
@@ -381,6 +397,16 @@ def load_policy(path: Path | None = None) -> Policy:
                 f"{path}.worktree_root: expected str, got {type(wt).__name__}"
             )
         kwargs["worktree_root"] = Path(wt).expanduser()
+    if raw.get("agents") is not None:
+        # Imported here (not at module top) to keep config.policy importable
+        # without pulling in the agent/subprocess machinery on every load.
+        from gitbulk.agent import parse_agents_config
+
+        kwargs["agents"] = parse_agents_config(raw["agents"], f"{path}.agents")
+    if raw.get("default_agent") is not None:
+        kwargs["default_agent"] = _ensure_str(
+            raw["default_agent"], f"{path}.default_agent"
+        )
     # "notifications" key, if present, is intentionally ignored
     return Policy(**kwargs)
 

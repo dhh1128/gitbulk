@@ -70,7 +70,7 @@ from pathlib import Path
 from typing import Iterable
 
 from gitbulk import paths, sentinel
-from gitbulk.claude import ProductionClaudeClient
+from gitbulk.agent import backend_for, resolve_agent_name
 from gitbulk.config.policy import Policy, load_policy
 from gitbulk.config.repos import RepoEntry, load_repos
 from gitbulk.default_branch_cache import prime_default_branches
@@ -719,7 +719,25 @@ def _run_under_lock(
 
     # 10. Run the bounded pool.
     log_dir = rs.run_dir / "dispatch-logs"
-    claude = ProductionClaudeClient()
+    # Resolve the agent backend(s): --agent → per-repo agent: → default_agent
+    # → claude (this.i agprof4k). The run default is the fallback; a per-repo
+    # override yields a per-target backend (cached by resolved name so we build
+    # each distinct backend once). The no-config path returns a
+    # ProductionClaudeClient, so existing behavior is unchanged.
+    requested_agent = getattr(args, "agent", None)
+    default_backend = backend_for(policy, requested_agent)
+    default_name = resolve_agent_name(policy, requested_agent)
+    backend_by_name: dict = {default_name: default_backend}
+    backends: dict = {}
+    for key, (slug, _pr, _wt) in target_meta.items():
+        name = resolve_agent_name(policy, requested_agent, slug=slug)
+        if name == default_name:
+            continue
+        if name not in backend_by_name:
+            backend_by_name[name] = backend_for(
+                policy, requested_agent, slug=slug
+            )
+        backends[key] = backend_by_name[name]
     concurrency = int(getattr(args, "concurrency", _DEFAULT_CONCURRENCY))
     timeout_per_target = float(
         getattr(args, "timeout", _DEFAULT_PER_TARGET_TIMEOUT)
@@ -727,10 +745,12 @@ def _run_under_lock(
 
     results = execute_targets(
         targets,
-        claude=claude,
+        claude=default_backend,
         log_dir=log_dir,
         concurrency=concurrency,
         timeout_per_target=timeout_per_target,
+        model=getattr(args, "model", None),
+        backends=backends or None,
     )
 
     # 11. Worktree cleanup vs preservation per node vp7n2krq.

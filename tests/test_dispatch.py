@@ -135,12 +135,14 @@ def fake_clones(code_root):
 
 @pytest.fixture
 def write_config(isolated_xdg, code_root):
-    def _write(*, repos_slugs, with_org="provenant-dev"):
+    def _write(*, repos_slugs, with_org="provenant-dev", extra=None):
         cfg_dir = paths.config_dir()
         cfg_dir.mkdir(parents=True, exist_ok=True)
         policy_yaml = {"defaults": {"retain_runs": 5}}
         if with_org:
             policy_yaml["humans"] = {"org": with_org, "cache_ttl_hours": 24}
+        if extra:
+            policy_yaml.update(extra)
         (cfg_dir / "gitbulk.yaml").write_text(yaml.safe_dump(policy_yaml))
         repos_txt = "\n".join(repos_slugs) + ("\n" if repos_slugs else "")
         (cfg_dir / "repos.txt").write_text(repos_txt)
@@ -493,7 +495,16 @@ def _stub_is_conflict(monkeypatch, *, conflicts_for_paths):
 def _stub_execute_targets(monkeypatch, *, results_by_key):
     """Patch execute_targets to return canned ExecResult per key."""
 
-    def _impl(targets, *, claude, log_dir, concurrency, timeout_per_target):
+    def _impl(
+        targets,
+        *,
+        claude,
+        log_dir,
+        concurrency,
+        timeout_per_target,
+        model=None,
+        backends=None,
+    ):
         log_dir.mkdir(parents=True, exist_ok=True)
         out: list[ExecResult] = []
         now = datetime.now(timezone.utc)
@@ -556,8 +567,8 @@ def test_dispatch_apply_happy_path_two_prs(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient",
-        lambda: object(),  # never called because execute_targets is stubbed
+        "gitbulk.commands.dispatch.backend_for",
+        lambda *a, **k: object(),  # never used because execute_targets is stubbed
     )
 
     paths_seen: list[Path] = []
@@ -592,6 +603,99 @@ def test_dispatch_apply_happy_path_two_prs(
         assert prs[0]["worktree_preserved"] is False
 
 
+def test_dispatch_apply_per_repo_agent_builds_per_target_backend(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """A per-repo ``agent:`` override yields a per-target backend in the map
+    passed to execute_targets; repos on the run default are absent from it
+    (this.i agprof4k; dispatch per-repo backend loop)."""
+    # Both repos override to the SAME non-default agent, so the second one
+    # exercises the backend-cache-hit branch (build once, reuse).
+    write_config(
+        repos_slugs=["dhh1128/alpha", "dhh1128/beta"],
+        extra={
+            "repos": {
+                "dhh1128/alpha": {"agent": "gemini"},
+                "dhh1128/beta": {"agent": "gemini"},
+            }
+        },
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake_clones("dhh1128/alpha")
+    fake_clones("dhh1128/beta")
+    pr1 = _make_pr(slug="dhh1128/alpha", number=1)
+    pr2 = _make_pr(slug="dhh1128/beta", number=2)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main", "dhh1128/beta": "main"},
+        my_open_prs={"dhh1128/alpha": [pr1], "dhh1128/beta": [pr2]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
+    )
+    # Distinguish backends by the resolved name so we can assert the map.
+    build_calls: list = []
+
+    def _fake_backend_for(policy, requested, slug=None):
+        build_calls.append(slug)
+        name = "gemini" if slug in ("dhh1128/alpha", "dhh1128/beta") else "claude"
+        return f"backend:{name}"
+
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.backend_for", _fake_backend_for
+    )
+
+    captured: dict = {}
+
+    def _capture_exec(targets, *, claude, log_dir, concurrency,
+                      timeout_per_target, model=None, backends=None):
+        captured["backends"] = backends
+        captured["default"] = claude
+        log_dir.mkdir(parents=True, exist_ok=True)
+        out = []
+        now = datetime.now(timezone.utc)
+        for t in targets:
+            (log_dir / f"{t.key}.stdout.log").write_text("")
+            (log_dir / f"{t.key}.stderr.log").write_text("")
+            out.append(
+                ExecResult(
+                    key=t.key, status="completed", exit_code=0,
+                    stdout_path=log_dir / f"{t.key}.stdout.log",
+                    stderr_path=log_dir / f"{t.key}.stderr.log",
+                    started_at=now, finished_at=now, duration_seconds=0.0,
+                )
+            )
+        return out
+
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.execute_targets", _capture_exec
+    )
+    _stub_worktree_create(monkeypatch, paths_seen=[])
+    _stub_worktree_remove(monkeypatch, removed=[])
+    _stub_is_conflict(monkeypatch, conflicts_for_paths=[])
+
+    rc = dispatch_handler(
+        _make_args(
+            prompt=prompt_file, apply=True, code_root=code_root,
+            skip_check=_LOCAL_SKIPS,
+        )
+    )
+    assert rc == EXIT_OVERRIDES_APPLIED
+    alpha_key = _key_for_pr("dhh1128/alpha", 1)
+    beta_key = _key_for_pr("dhh1128/beta", 2)
+    # Both targets get the gemini backend...
+    assert captured["backends"] == {
+        alpha_key: "backend:gemini",
+        beta_key: "backend:gemini",
+    }
+    assert captured["default"] == "backend:claude"
+    # ...but the gemini backend was built only ONCE (cache hit on the second),
+    # plus the one build for the run default. slug=None is the default build.
+    assert build_calls == [None, "dhh1128/alpha"]
+
+
 # ─── --apply: 1 PR claude-fails → exit 2 ───────────────────────────────────
 
 
@@ -613,7 +717,7 @@ def test_dispatch_apply_one_failure_attention(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
 
     paths_seen: list[Path] = []
@@ -669,7 +773,7 @@ def test_dispatch_apply_timeout_no_conflict_tears_down(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
 
     paths_seen: list[Path] = []
@@ -720,7 +824,7 @@ def test_dispatch_apply_conflict_preserved_with_marker(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
 
     paths_seen: list[Path] = []
@@ -799,7 +903,7 @@ def test_dispatch_apply_teardown_error_preserves(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
 
     paths_seen: list[Path] = []
@@ -875,7 +979,7 @@ def test_dispatch_apply_worktree_create_error_skips_pr(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
 
     paths_seen: list[Path] = []
@@ -1271,7 +1375,7 @@ def _one_pr_apply_run(monkeypatch, code_root, write_config, fresh_org_cache,
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
     paths_seen: list = []
     removed: list = []
@@ -1445,7 +1549,7 @@ def test_dispatch_apply_attention_beats_skip(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
 
     paths_seen: list[Path] = []
@@ -1523,7 +1627,7 @@ def test_dispatch_apply_no_skip_check_clean_exit_ok(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
 
     paths_seen: list[Path] = []
@@ -1563,7 +1667,7 @@ def test_dispatch_apply_with_skipped_repo_no_failures_exit_3(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
 
     paths_seen: list[Path] = []
@@ -1659,7 +1763,7 @@ def test_dispatch_apply_no_eligible_and_skip_check_exit_4(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
     _stub_worktree_create(monkeypatch, paths_seen=[])
     _stub_worktree_remove(monkeypatch, removed=[])

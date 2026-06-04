@@ -24,6 +24,29 @@ def _write_policy(tmp_path: Path, content: str) -> Path:
     return p
 
 
+# ─── Pluggable agent config (this.i agprof4k) ──────────────────────────────
+
+
+def test_per_repo_agent_override_parsed(tmp_path):
+    p = _write_policy(
+        tmp_path,
+        "repos:\n  owner/repo:\n    agent: gemini\n",
+    )
+    policy = load_policy(p)
+    assert policy.repos["owner/repo"].agent == "gemini"
+
+
+def test_default_agent_parsed(tmp_path):
+    p = _write_policy(tmp_path, "default_agent: copilot\n")
+    assert load_policy(p).default_agent == "copilot"
+
+
+def test_agent_field_defaults_none():
+    assert RepoOverride().agent is None
+    assert Policy().default_agent is None
+    assert Policy().agents == {}
+
+
 # ─── Defaults: missing/empty file ──────────────────────────────────────────
 
 

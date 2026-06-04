@@ -92,14 +92,14 @@ def _make_args(*, prompt: str | None = None, model: str | None = None):
 
 
 def _inject_fake_claude(monkeypatch, fake: FakeClaudeClient) -> None:
-    """Replace ProductionClaudeClient in the handler with a fake.
+    """Replace the resolved agent backend in the handler with a fake.
 
-    Same pattern as test_report.py's ProductionGHClient injection: the
-    handler imports the class by name, so the monkeypatch target is the
-    name as it appears at the call site.
+    summarize now resolves its backend via ``agent.backend_for(policy, ...)``
+    (this.i agprof4k); patch that factory to return the fake regardless of
+    args, so the handler never builds a real client.
     """
     monkeypatch.setattr(
-        "gitbulk.commands.summarize.ProductionClaudeClient", lambda: fake
+        "gitbulk.commands.summarize.backend_for", lambda *a, **k: fake
     )
 
 

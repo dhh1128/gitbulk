@@ -46,16 +46,22 @@ class AgentInvocation:
             (absolute when resolvable). NEVER passed to a shell — list-form
             only, so attacker-influenceable prompt/worktree text in later
             elements cannot break out (threat-model §5).
-        use_stdin: when True the prompt (or ``input_text``) is delivered on
-            stdin rather than as an argv element.
+        use_stdin: when True, ``stdin_data`` must be written to the child's
+            stdin (the prompt and/or ``input_text`` is delivered there rather
+            than as an argv element).
+        stdin_data: the exact text to feed on stdin, or ``None`` for no stdin.
+            Computed by :meth:`plan` so callers (both ``run_prompt`` and the
+            parallel kernel) feed one canonical value regardless of whether
+            the backend takes its prompt via argv or stdin.
         env: the exact environment for the child, or ``None`` to inherit the
-            parent environment (today's behavior). Per-profile scoping lands
-            in a later phase (this.i ``agenv6q``).
+            parent environment (today's behavior). Per-profile scoping is the
+            ``env`` allowlist on a profile (this.i ``agenv6q``).
         timeout: effective per-call timeout in seconds.
     """
 
     argv: list[str]
     use_stdin: bool = False
+    stdin_data: str | None = None
     env: dict[str, str] | None = None
     timeout: float | None = None
 
@@ -244,6 +250,7 @@ class FakeClaudeClient:
                 "--dangerously-skip-permissions",
             ],
             use_stdin=input_text is not None,
+            stdin_data=input_text,
             env=None,
             timeout=timeout,
         )
@@ -345,6 +352,7 @@ class ProductionClaudeClient:
                 "--dangerously-skip-permissions",
             ],
             use_stdin=input_text is not None,
+            stdin_data=input_text,
             env=None,
             timeout=effective_timeout,
         )
@@ -371,7 +379,7 @@ class ProductionClaudeClient:
         try:
             completed = subprocess.run(
                 list(command),
-                input=input_text,
+                input=inv.stdin_data,
                 capture_output=True,
                 text=True,
                 timeout=effective_timeout,

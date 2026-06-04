@@ -363,6 +363,17 @@ def _add_summarize_args(sp: argparse.ArgumentParser) -> None:
             "'opus' or a full model name."
         ),
     )
+    sp.add_argument(
+        "--agent",
+        metavar="NAME",
+        default=None,
+        help=(
+            "Coding agent to drive (a built-in preset like 'claude', "
+            "'gemini', 'copilot', 'cursor', or a profile defined under "
+            "'agents:' in gitbulk.yaml). Overrides 'default_agent'. "
+            "Default: claude."
+        ),
+    )
 
 
 def _add_show_args(sp: argparse.ArgumentParser) -> None:
@@ -489,6 +500,26 @@ def _add_dispatch_args(sp: argparse.ArgumentParser) -> None:
             "even when the cache is still within its TTL. dispatch "
             "auto-refreshes a missing or stale cache on its own; this "
             "flag forces a refetch regardless."
+        ),
+    )
+    sp.add_argument(
+        "--model",
+        metavar="NAME",
+        default=None,
+        help=(
+            "Override the agent's default model for this run (e.g. 'opus'). "
+            "Applies to whichever agent is selected."
+        ),
+    )
+    sp.add_argument(
+        "--agent",
+        metavar="NAME",
+        default=None,
+        help=(
+            "Coding agent to drive inside each worktree (a built-in preset "
+            "like 'claude', 'gemini', 'copilot', 'cursor', or a profile "
+            "defined under 'agents:' in gitbulk.yaml). Overrides "
+            "'default_agent' and any per-repo 'agent:'. Default: claude."
         ),
     )
 
