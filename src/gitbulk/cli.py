@@ -522,6 +522,17 @@ def _add_dispatch_args(sp: argparse.ArgumentParser) -> None:
             "'default_agent' and any per-repo 'agent:'. Default: claude."
         ),
     )
+    sp.add_argument(
+        "--allow-foreign-authors",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow dispatching the agent against PRs NOT authored by you. By "
+            "default such PRs are skipped, because the agent reads/operates on "
+            "attacker-controllable PR content (SEC-F3). This flag is REFUSED in "
+            "unattended/cron mode (no TTY) — it is interactive-only."
+        ),
+    )
 
 
 def _add_close_stale_args(sp: argparse.ArgumentParser) -> None:

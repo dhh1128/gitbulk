@@ -2723,6 +2723,55 @@ Gitbulk Triage Tool = goal:
         — the seam exists so it can be added without reworking the backend.
       approved-by: daniel, 2026-06-04
 
+    Security Review Remediation 2026-06-04 = decision:
+      id: agsecr5n
+      why: >
+        An adversarial security-hawk review (review-panel, security persona,
+        reviewedSha c8508a0) of the pluggable-agents work confirmed 5 findings,
+        all dispositioned recommend-fix. Their resolutions:
+
+        SEC-F1 (HIGH) — the bwrap sandbox was NON-FUNCTIONAL for dispatch: a
+        linked worktree's .git points into the operator clone's
+        .git/worktrees/<name> (commondir → objects/refs/config/hooks), which
+        wrap_argv never bound and --tmpfs $HOME shadowed; a live bwrap probe
+        showed git failing 'not a git repository'. It was tested only by
+        argv-shape assertions, never e2e. Fix: sandboxed agents now run in a
+        SELF-CONTAINED ``git clone --no-hardlinks`` (own .git, no shared
+        objects/hooks/config with the operator clone), origin reset to the real
+        remote; gitbulk fetches base + checks out head OUTSIDE the sandbox, the
+        agent rebases offline, gitbulk verifies + pushes. core.hooksPath is
+        neutralized. Validated by a REAL bwrap e2e test (auto-skips when
+        bwrap/userns absent) — the test that would have caught the original
+        defect. See agsbx3k (updated) and agecln4k (the isolated-clone model).
+
+        SEC-F2 (HIGH) — least privilege was opt-in: presets defaulted env=None
+        (full inherit) + sandbox=none, so default_agent:gemini ran --yolo with
+        GH_TOKEN/SSH/AWS. Fix: non-claude presets ship a scoped ``env``
+        allowlist by default (agenv6q updated). Env scoping stops env-borne
+        leakage only; filesystem isolation needs the sandbox (F1).
+
+        SEC-F3 (HIGH) — no foreign-author gate: the auto-approve agent ran on
+        attacker-controllable PR content at head_sha. Fix: dispatch skips PRs
+        not authored by the operator unless --allow-foreign-authors, which is
+        REFUSED in unattended/cron (no TTY). Closes the open part of
+        threat-model T1 / §3.3-fix item 1. (Author-based gate; PRInfo carries
+        no fork/head-repo field, and author!=me already covers foreign PRs.)
+
+        SEC-F4 (MED) — sandbox_fallback:warn-run silently downgraded under cron
+        with only a logging.warning. Fix: a downgrade now records a durable
+        WARNING into run state AND raises ATTENTION (exit 2); the backend
+        exposes ``sandbox_downgraded`` for dispatch to surface.
+
+        SEC-F5 (LOW) — the threat model claimed the effective agent argv was
+        logged; it wasn't. Fix: exec persists agent_argv (prompt elided) +
+        agent_env_keys (NAMES only) per target in <key>.meta.yaml.
+
+        Lesson recorded: argv-shape unit tests gave false confidence in a
+        control (the sandbox) that did not actually work; security-relevant
+        OS-confinement code needs an e2e test exercising the real binary
+        (agtste9k).
+      approved-by: daniel, 2026-06-04
+
     Repo-Level Dispatch Opens A PR = decision:
       id: dsprp7kq
       why: >

@@ -30,9 +30,11 @@ from gitbulk.commands.dispatch import (
     EXIT_OK,
     EXIT_OVERRIDES_APPLIED,
     EXIT_STRUCTURAL_FAILURE,
+    _apply_foreign_author_gate,
     _build_summary_md,
     _key_for_pr,
     _parse_agent_outcome,
+    _stdout_isatty,
     _runid_from_run_dir,
     _salvage_escalation,
     _validate_prompt,
@@ -239,6 +241,7 @@ def _make_args(
     timeout=1800.0,
     filter=None,
     refresh_org_members=False,
+    allow_foreign_authors=False,
 ):
     return argparse.Namespace(
         subcommand="dispatch",
@@ -250,6 +253,7 @@ def _make_args(
         timeout=timeout,
         filter=filter,
         refresh_org_members=refresh_org_members,
+        allow_foreign_authors=allow_foreign_authors,
     )
 
 
@@ -1818,6 +1822,137 @@ def test_dispatch_prefetch_failure_skips_pr(
         if line.strip()
     ]
     assert any("prefetch failed" in e["message"] for e in errors)
+
+
+# ─── SEC-F3: foreign-author / fork gate ────────────────────────────────────
+
+
+def _foreign_pr_setup(monkeypatch, write_config, fresh_org_cache, fake_clones):
+    """One eligible PR authored by someone OTHER than the operator (dhh1128)."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128", "stranger"])
+    fake_clones("dhh1128/alpha")
+    pr = _make_pr(slug="dhh1128/alpha", number=1, author="stranger")
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128", "stranger"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
+    )
+    return fake
+
+
+def _read_errors(latest):
+    return [
+        json.loads(line)
+        for line in (latest / "errors.log").read_text().splitlines()
+        if line.strip()
+    ]
+
+
+def test_dispatch_skips_foreign_authored_pr_by_default(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    _foreign_pr_setup(monkeypatch, write_config, fresh_org_cache, fake_clones)
+    # Dry-run is enough to exercise the gate (it runs before the apply path).
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, code_root=code_root, skip_check=_LOCAL_SKIPS)
+    )
+    latest = paths.latest_run_symlink("dispatch").resolve()
+    summary = (latest / "summary.md").read_text()
+    assert "no eligible PRs" in summary  # the stranger's PR was withheld
+    assert any(
+        "skipping foreign-authored PR dhh1128/alpha#1" in e["message"]
+        for e in _read_errors(latest)
+    )
+
+
+def test_dispatch_allow_foreign_refused_unattended(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    _foreign_pr_setup(monkeypatch, write_config, fresh_org_cache, fake_clones)
+    # pytest captures stdout → not a TTY → unattended. The flag must be refused.
+    monkeypatch.setattr("gitbulk.commands.dispatch._stdout_isatty", lambda: False)
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, code_root=code_root,
+                   skip_check=_LOCAL_SKIPS, allow_foreign_authors=True)
+    )
+    assert rc == EXIT_STRUCTURAL_FAILURE
+
+
+def test_dispatch_allow_foreign_interactive_keeps_pr(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    _foreign_pr_setup(monkeypatch, write_config, fresh_org_cache, fake_clones)
+    monkeypatch.setattr("gitbulk.commands.dispatch._stdout_isatty", lambda: True)
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, code_root=code_root,
+                   skip_check=_LOCAL_SKIPS, allow_foreign_authors=True)
+    )
+    latest = paths.latest_run_symlink("dispatch").resolve()
+    summary = (latest / "summary.md").read_text()
+    # The stranger's PR is now listed as a would-dispatch target...
+    assert "dhh1128/alpha` #1" in summary
+    # ...with an audit WARNING that it is foreign.
+    assert any(
+        "FOREIGN-authored PR dhh1128/alpha#1" in e["message"]
+        for e in _read_errors(latest)
+    )
+
+
+def test_stdout_isatty_returns_bool():
+    # Executes the real helper body (deterministic regardless of capture).
+    assert isinstance(_stdout_isatty(), bool)
+
+
+def test_foreign_gate_fails_closed_on_auth_error():
+    """Direct unit test of the gate: if the operator login can't be fetched,
+    it returns an error (fail closed), independent of the preflight."""
+    from gitbulk.gh import GHError
+
+    class _Gh:
+        def authenticated_user(self, **k):
+            raise GHError("auth probe failed")
+
+    kept, err = _apply_foreign_author_gate(
+        [("o/r", _make_pr(slug="o/r", number=1, author="stranger"))],
+        _Gh(),
+        rs=None,  # not reached on the error path
+        allow_foreign=False,
+    )
+    assert kept == []
+    assert err is not None and "authenticated user" in err
+
+
+def test_dispatch_operator_authored_pr_not_gated(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """Sanity: a PR authored by the operator is never gated."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake_clones("dhh1128/alpha")
+    pr = _make_pr(slug="dhh1128/alpha", number=1, author="dhh1128")
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
+    )
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, code_root=code_root, skip_check=_LOCAL_SKIPS)
+    )
+    latest = paths.latest_run_symlink("dispatch").resolve()
+    assert "dhh1128/alpha` #1" in (latest / "summary.md").read_text()
 
 
 def test_key_for_pr_shape():

@@ -69,7 +69,13 @@ agents:
 - If a requested sandbox isn't available, `sandbox_fallback` decides: the
   default `refuse` makes gitbulk **skip/abort rather than run unconfined** —
   which in cron means a failed run you'll see, not a silent unsandboxed one. Set
-  `warn-run` only if you accept running unsandboxed when bwrap is missing.
+  `warn-run` only if you accept running unsandboxed when bwrap is missing (it
+  still records a WARNING and raises `ATTENTION`, so you're told).
+- **Foreign-author safety:** by default `dispatch` only runs the agent on PRs
+  **you authored** — a stranger's PR content is attacker-controllable. The
+  opt-in `--allow-foreign-authors` is **refused in cron** (no TTY); it is
+  interactive-only by design, so a schedule can never run agents on someone
+  else's code.
 
 ## Exit codes
 

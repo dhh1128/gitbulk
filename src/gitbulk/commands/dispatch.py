@@ -243,6 +243,66 @@ def _validate_prompt(args: argparse.Namespace) -> tuple[Path | None, str | None]
     return prompt_path, None
 
 
+def _stdout_isatty() -> bool:
+    """True if stdout is an interactive terminal. Cron / pipes are not TTYs,
+    which is how we detect unattended mode (SEC-F3). Wrapped for monkeypatching
+    and to swallow odd stream objects."""
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def _apply_foreign_author_gate(
+    eligible_prs: list[tuple[str, "PRInfo"]],
+    gh,
+    rs: RunState,
+    *,
+    allow_foreign: bool,
+) -> tuple[list[tuple[str, "PRInfo"]], str | None]:
+    """Drop PRs not authored by the operator unless explicitly allowed (SEC-F3).
+
+    Returns ``(filtered_prs, error)``. ``error`` is non-None (and the run
+    should abort structurally) when ``--allow-foreign-authors`` is passed in
+    unattended/cron mode — the flag is interactive-only. When allowed and
+    interactive, foreign PRs are kept (a WARNING is still recorded for the
+    audit trail).
+    """
+    if allow_foreign and not _stdout_isatty():
+        return (
+            [],
+            "--allow-foreign-authors is refused in unattended/cron mode "
+            "(no TTY); run it interactively to dispatch agents on PRs you "
+            "did not author.",
+        )
+    try:
+        operator_login = (gh.authenticated_user() or {}).get("login")
+    except GHError as e:
+        return ([], f"could not determine the authenticated user: {e}")
+
+    kept: list[tuple[str, PRInfo]] = []
+    for slug, pr in eligible_prs:
+        is_foreign = operator_login is None or pr.author != operator_login
+        if is_foreign and not allow_foreign:
+            rs.record_error(
+                f"skipping foreign-authored PR {slug}#{pr.number}: author "
+                f"{pr.author!r} != operator {operator_login!r}. Pass "
+                f"--allow-foreign-authors (interactively) to dispatch on it.",
+                level="WARNING",
+                context={"slug": slug, "pr": pr.number, "author": pr.author},
+            )
+            continue
+        if is_foreign:
+            rs.record_error(
+                f"dispatching on FOREIGN-authored PR {slug}#{pr.number} "
+                f"(author {pr.author!r}) under --allow-foreign-authors",
+                level="WARNING",
+                context={"slug": slug, "pr": pr.number, "author": pr.author},
+            )
+        kept.append((slug, pr))
+    return (kept, None)
+
+
 def _key_for_pr(slug: str, pr_number: int) -> str:
     """Build a filesystem-safe key for an ExecTarget.
 
@@ -626,6 +686,30 @@ def _run_under_lock(
             ]
             if pr_result.passed and not intrinsic_pr_skips:
                 eligible_prs.append((repo.slug, pr))
+
+    # 7b. FOREIGN-AUTHOR GATE (SEC-F3). The dispatched agent reads and operates
+    # on the PR's content at its head SHA — which is attacker-controllable for a
+    # PR you did not author. By default, skip PRs not authored by you. The
+    # opt-in flag is interactive-only: refuse it under cron/no-TTY so a
+    # misconfigured schedule can't quietly run agents on strangers' code.
+    eligible_prs, foreign_gate_error = _apply_foreign_author_gate(
+        eligible_prs, gh, rs, allow_foreign=bool(getattr(args, "allow_foreign_authors", False))
+    )
+    if foreign_gate_error is not None:
+        return _finish(
+            rs,
+            EXIT_STRUCTURAL_FAILURE,
+            summary=foreign_gate_error,
+            policy=policy,
+            attention=False,
+            all_repos=repos,
+            passing_repos=passing_repos,
+            skipped_repos=skipped_repos,
+            eligible_prs=[],
+            results=None,
+            apply=bool(args.apply),
+            prompt_path=prompt_path,
+        )
 
     # 8. DRY-RUN GATE.
     if not args.apply:

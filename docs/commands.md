@@ -86,6 +86,10 @@ and performs the `force-push-with-lease` itself after verifying the agent's
 result, so the agent never pushes — which also lets it run sandboxed with no
 network or credentials.
 
+By default `dispatch` only acts on PRs **you authored** (a stranger's PR is
+attacker-controllable input to an auto-approve agent); `--allow-foreign-authors`
+opts in and is refused in unattended/cron mode.
+
 ### `merge`
 
 Auto-merges PRs that satisfy the [per-repo merge policy](configuration.md#defaults-merge-and-stale-policy)
