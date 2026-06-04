@@ -2626,6 +2626,52 @@ Gitbulk Triage Tool = goal:
         at all, so its env can be scrubbed to the bare toolchain.
       approved-by: daniel, 2026-06-04
 
+    Least Privilege: gitbulk Owns Every Networked Git Op = decision:
+      id: agpriv8n
+      why: >
+        The pivotal security change of the pluggable-agent work and the
+        substantive fix for threat-model T1 (P0): the dispatched agent must
+        never perform a networked, credentialed, or irreversible git operation.
+        Before this, prompts/resolve-conflicts.md had the AGENT run
+        ``git fetch`` and ``git push --force-with-lease`` — so a prompt-injected
+        or buggy/less-trusted backend could push arbitrary refs to any of the
+        ~150 fleet repos.
+
+        New division of labor for PR-centric dispatch (execk7nm):
+          1. gitbulk creates the worktree (unchanged) and then PRE-FETCHES the
+             PR's base into it (rebase.fetch_base) — the networked step, run
+             with gitbulk's own creds, BEFORE the agent launches. A fetch
+             failure removes the worktree and skips the PR (the agent could not
+             rebase offline anyway).
+          2. the AGENT rebases onto the already-fetched ``origin/<base>``,
+             resolves conflicts, runs ``git rebase --continue`` — purely LOCAL,
+             needing no network and no credentials (which is exactly what makes
+             the fs+no-net sandbox viable, agsbx3k). It NEVER fetches or pushes;
+             the rewritten prompt says so explicitly.
+          3. gitbulk INDEPENDENTLY VERIFIES the worktree
+             (rebase.verify_resolved_for_push): no conflict markers, no rebase
+             in progress, HEAD advanced past the SHA gitbulk first observed.
+             Only on READY + a RESOLVED verdict does gitbulk itself call
+             force_push_with_lease (lease against the observed SHA). The
+             verdict is ADVISORY — a spoofed ``RESOLVED`` that left markers or a
+             half-finished rebase yields BLOCKED → gitbulk pushes NOTHING and
+             the PR is surfaced for attention (exit 2). NO_CHANGE (HEAD
+             unmoved) is benign.
+
+        This establishes the cross-backend invariant: **the agent never touches
+        a remote; gitbulk performs every networked mutation.** codeowners.md /
+        migrate-*.md already followed "commit locally, gitbulk pushes"; this
+        makes it uniform. Blast radius of a hostile/confused agent collapses to
+        "garbage in a throwaway worktree," caught by verification before any
+        push. Reuses the existing, tested rebase.py machinery
+        (force_push_with_lease, the ``_git`` seam) rather than inventing new
+        push code. Enforced by tests/test_rebase.py (fetch/verify gate) and
+        tests/test_dispatch.py (READY→push, BLOCKED→no-push+attention,
+        push-failed→attention, NO_CHANGE→benign, ESCALATED→never verified,
+        prefetch-failure→skip). Builds toward agsbx3k (sandbox) and agtok2n
+        (scoped tokens).
+      approved-by: daniel, 2026-06-04
+
     Repo-Level Dispatch Opens A PR = decision:
       id: dsprp7kq
       why: >

@@ -95,6 +95,14 @@ from gitbulk.locks import (
     sentinel_lock,
 )
 from gitbulk.pr_info import PRInfo
+from gitbulk.rebase import (
+    PushReadiness,
+    RebaseError,
+    RebaseStatus,
+    fetch_base,
+    force_push_with_lease,
+    verify_resolved_for_push,
+)
 from gitbulk.runstate import RunState
 from gitbulk.util.progress import Progress
 from gitbulk.util.style import error_line
@@ -691,8 +699,18 @@ def _run_under_lock(
                     worktree_root=policy.worktree_root,
                     runid=runid,
                 )
+                # Least privilege (this.i agpriv8n): gitbulk performs the
+                # networked fetch itself, BEFORE the agent runs, so the agent
+                # can rebase against origin/<base> with no network and no
+                # credentials of its own. On fetch failure the worktree is
+                # removed and the PR skipped (the agent could not rebase
+                # offline anyway). Still under repo_lock — the fetch updates
+                # the clone's shared refs/remotes/*.
+                fetched = fetch_base(worktree_path, pr.base_ref)
+                if fetched.status is not RebaseStatus.CLEAN:
+                    remove_worktree(repo.local_path, worktree_path)
         except WorktreeError as e:
-            # Worktree creation failed; record and skip this PR.
+            # Worktree creation/teardown failed; record and skip this PR.
             # We DO NOT abort the whole run — the user's other 149
             # repos still deserve a shot.
             rs.record_error(
@@ -703,6 +721,14 @@ def _run_under_lock(
                     "pr": pr.number,
                     "stderr": e.stderr or "",
                 },
+            )
+            continue
+
+        if fetched.status is not RebaseStatus.CLEAN:
+            rs.record_error(
+                f"base prefetch failed for {slug}#{pr.number}: {fetched.detail}",
+                level="ERROR",
+                context={"slug": slug, "pr": pr.number},
             )
             continue
 
@@ -757,6 +783,9 @@ def _run_under_lock(
     per_pr_states: dict[str, list[dict]] = {}
     # key -> normalized "VERDICT: detail" line, for the summary (Gap 1).
     outcomes: dict[str, str] = {}
+    # Keys whose RESOLVED verdict could not be safely pushed (blocked /
+    # push-failed) → these warrant ATTENTION just like a failed process.
+    push_problem_keys: list[str] = []
     escalations_dir = rs.run_dir / "escalations"
     for r in results:
         slug, pr, worktree_path = target_meta[r.key]
@@ -766,6 +795,47 @@ def _run_under_lock(
         verdict, outcome_line = _parse_agent_outcome(r.stdout_path)
         if outcome_line is not None:
             outcomes[r.key] = outcome_line
+
+        # Least privilege (this.i agpriv8n): gitbulk — never the agent —
+        # performs the push, and only on a RESOLVED verdict AND only after
+        # independently re-checking the worktree is genuinely safe (the verdict
+        # is advisory; a spoofed RESOLVED that left conflict markers or a
+        # half-finished rebase is caught here and pushed NOTHING — threat-model
+        # §5). The lease is against the head SHA gitbulk first observed, so a
+        # concurrent push aborts rather than clobbers.
+        push_status: str | None = None
+        push_detail: str | None = None
+        if verdict == "RESOLVED":
+            readiness, detail = verify_resolved_for_push(
+                worktree_path, pr.head_sha
+            )
+            if readiness is PushReadiness.READY:
+                try:
+                    force_push_with_lease(
+                        worktree_path, pr.head_ref, pr.head_sha
+                    )
+                    push_status, push_detail = "pushed", detail
+                except RebaseError as e:
+                    push_status = "push-failed"
+                    push_detail = e.stderr or str(e)
+                    push_problem_keys.append(r.key)
+                    rs.record_error(
+                        f"push failed for {slug}#{pr.number}: {push_detail}",
+                        level="ERROR",
+                        context={"slug": slug, "pr": pr.number},
+                    )
+            elif readiness is PushReadiness.NO_CHANGE:
+                push_status, push_detail = "no-change", detail
+            else:  # BLOCKED — RESOLVED claimed but worktree says otherwise
+                push_status, push_detail = "blocked", detail
+                push_problem_keys.append(r.key)
+                rs.record_error(
+                    f"agent reported RESOLVED but worktree is not pushable "
+                    f"for {slug}#{pr.number}: {detail}",
+                    level="WARNING",
+                    context={"slug": slug, "pr": pr.number},
+                )
+
         # Gap 2: salvage any ESCALATION.md into the run dir BEFORE teardown
         # (a clean escalation aborts the rebase, so the worktree is not
         # in-conflict and would otherwise be removed with the note inside).
@@ -807,6 +877,8 @@ def _run_under_lock(
                 "exit_code": r.exit_code,
                 "outcome": verdict,
                 "outcome_detail": outcome_line,
+                "push_status": push_status,
+                "push_detail": push_detail,
                 "escalation_file": escalation_file,
                 "duration_seconds": r.duration_seconds,
                 "worktree_path": str(worktree_path),
@@ -820,9 +892,12 @@ def _run_under_lock(
     for slug, states in per_pr_states.items():
         rs.record_repo_state(slug, {"pr_count": len(states), "prs": states})
 
-    # 12. Compute exit code.
+    # 12. Compute exit code. A RESOLVED verdict that could not be safely
+    # pushed (blocked / push-failed) is an attention condition too — gitbulk
+    # owns the push, so a push it refused or that failed is something the
+    # operator must see (this.i agpriv8n).
     attention_results = _attention_results(results)
-    if attention_results:
+    if attention_results or push_problem_keys:
         exit_code = EXIT_ATTENTION_NEEDED
     elif skipped_repos:
         exit_code = EXIT_INVARIANT_SKIPPED
@@ -846,10 +921,17 @@ def _run_under_lock(
 
     n_resolved = sum(1 for v in outcomes.values() if v.startswith("RESOLVED"))
     n_escalated = sum(1 for v in outcomes.values() if v.startswith("ESCALATED"))
+    n_pushed = sum(
+        1
+        for states in per_pr_states.values()
+        for s in states
+        if s.get("push_status") == "pushed"
+    )
     summary_text = (
         f"dispatched {len(results)} PRs; "
         f"{n_resolved} resolved, {n_escalated} escalated; "
-        f"{len(attention_results)} need attention; "
+        f"{n_pushed} pushed; "
+        f"{len(attention_results) + len(push_problem_keys)} need attention; "
         f"{len(skipped_repos)} repos skipped"
     )
     return _finish(

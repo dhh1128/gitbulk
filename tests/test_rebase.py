@@ -13,10 +13,13 @@ from unittest.mock import patch
 import pytest
 
 from gitbulk.rebase import (
+    PushReadiness,
     RebaseError,
     RebaseStatus,
+    fetch_base,
     force_push_with_lease,
     rebase_onto_base,
+    verify_resolved_for_push,
 )
 
 
@@ -150,3 +153,79 @@ def test_force_push_lease_violation_raises():
         with pytest.raises(RebaseError) as exc:
             force_push_with_lease(WT, "feat/x", "a" * 40)
     assert "remote ref moved" in (exc.value.stderr or "")
+
+
+# ─── fetch_base (this.i agpriv8n) ──────────────────────────────────────────
+
+
+def test_fetch_base_clean():
+    side = _seq(_Completed(0))
+    with patch("gitbulk.rebase.subprocess.run", side_effect=side) as run:
+        result = fetch_base(WT, "main")
+    assert result.status is RebaseStatus.CLEAN
+    assert run.call_args_list[0][0][0] == [
+        "git", "-C", str(WT), "fetch", "origin", "main",
+    ]
+
+
+def test_fetch_base_failure_is_error():
+    side = _seq(_Completed(1, stderr="no route to host"))
+    with patch("gitbulk.rebase.subprocess.run", side_effect=side):
+        result = fetch_base(WT, "main")
+    assert result.status is RebaseStatus.ERROR
+    assert "no route to host" in result.detail
+
+
+# ─── verify_resolved_for_push (this.i agpriv8n; threat-model §5) ────────────
+
+
+def test_verify_blocked_on_conflict_markers():
+    with patch("gitbulk.rebase.is_worktree_in_conflict", return_value=True):
+        readiness, detail = verify_resolved_for_push(WT, "a" * 40)
+    assert readiness is PushReadiness.BLOCKED
+    assert "conflict" in detail
+
+
+def test_verify_blocked_on_in_progress_op():
+    with patch("gitbulk.rebase.is_worktree_in_conflict", return_value=False), patch(
+        "gitbulk.rebase.worktree_in_progress_op", return_value="rebase"
+    ):
+        readiness, detail = verify_resolved_for_push(WT, "a" * 40)
+    assert readiness is PushReadiness.BLOCKED
+    assert "rebase" in detail
+
+
+def test_verify_blocked_when_head_unreadable():
+    with patch("gitbulk.rebase.is_worktree_in_conflict", return_value=False), patch(
+        "gitbulk.rebase.worktree_in_progress_op", return_value=None
+    ), patch(
+        "gitbulk.rebase.subprocess.run",
+        side_effect=_seq(_Completed(128, stderr="not a git repo")),
+    ):
+        readiness, detail = verify_resolved_for_push(WT, "a" * 40)
+    assert readiness is PushReadiness.BLOCKED
+    assert "HEAD" in detail
+
+
+def test_verify_no_change_when_head_unmoved():
+    sha = "a" * 40
+    with patch("gitbulk.rebase.is_worktree_in_conflict", return_value=False), patch(
+        "gitbulk.rebase.worktree_in_progress_op", return_value=None
+    ), patch(
+        "gitbulk.rebase.subprocess.run",
+        side_effect=_seq(_Completed(0, stdout=sha + "\n")),
+    ):
+        readiness, _ = verify_resolved_for_push(WT, sha)
+    assert readiness is PushReadiness.NO_CHANGE
+
+
+def test_verify_ready_when_head_advanced():
+    with patch("gitbulk.rebase.is_worktree_in_conflict", return_value=False), patch(
+        "gitbulk.rebase.worktree_in_progress_op", return_value=None
+    ), patch(
+        "gitbulk.rebase.subprocess.run",
+        side_effect=_seq(_Completed(0, stdout="b" * 40 + "\n")),
+    ):
+        readiness, detail = verify_resolved_for_push(WT, "a" * 40)
+    assert readiness is PushReadiness.READY
+    assert "bbbbbbb" in detail

@@ -173,6 +173,32 @@ def prompt_file(tmp_path):
     return p
 
 
+@pytest.fixture(autouse=True)
+def _neutralize_prefetch_and_push(monkeypatch):
+    """Keep existing dispatch tests hermetic after Phase 3 (this.i agpriv8n).
+
+    gitbulk now performs a networked base-fetch before the agent and a
+    force-push after a verified RESOLVED. Default these to no-ops so tests
+    that stub worktrees/execute_targets don't hit real git: fetch succeeds,
+    the worktree verifies as NO_CHANGE (so nothing is pushed), and push is a
+    no-op. The dedicated Phase-3 push tests below override these.
+    """
+    from gitbulk.rebase import PushReadiness, RebaseResult, RebaseStatus
+
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.fetch_base",
+        lambda *a, **k: RebaseResult(RebaseStatus.CLEAN, "fetched"),
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.verify_resolved_for_push",
+        lambda *a, **k: (PushReadiness.NO_CHANGE, "stub: no change"),
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.force_push_with_lease",
+        lambda *a, **k: None,
+    )
+
+
 def _make_pr(
     *,
     slug: str,
@@ -1453,6 +1479,183 @@ def test_dispatch_apply_surfaces_resolved_no_escalation_file(
     assert pr_state["outcome"] == "RESOLVED"
     assert pr_state["escalation_file"] is None
     assert not (latest / "escalations").exists()
+
+
+# ─── Phase 3: gitbulk owns the push (this.i agpriv8n; threat-model T1/§5) ───
+
+
+def _resolved_cfg():
+    return {
+        "status": "completed",
+        "exit_code": 0,
+        "stdout": "rebased clean\nRESOLVED: union-merged lockfiles\n",
+    }
+
+
+def test_dispatch_resolved_ready_gitbulk_pushes(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """RESOLVED + verification READY → gitbulk force-pushes itself, with the
+    lease against the head SHA it first observed."""
+    from gitbulk.rebase import PushReadiness
+
+    pushes: list = []
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.verify_resolved_for_push",
+        lambda wt, sha: (PushReadiness.READY, "advanced"),
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.force_push_with_lease",
+        lambda wt, head_ref, expected_sha: pushes.append(
+            (head_ref, expected_sha)
+        ),
+    )
+    rc, latest, _removed = _one_pr_apply_run(
+        monkeypatch, code_root, write_config, fresh_org_cache, prompt_file,
+        fake_clones, cfg=_resolved_cfg(), conflict=False,
+    )
+    assert rc == EXIT_OVERRIDES_APPLIED  # skip-check applied; no problems
+    assert pushes == [("feature/7", "a" * 40)]
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    pr_state = state["repos"]["dhh1128/alpha"]["prs"][0]
+    assert pr_state["push_status"] == "pushed"
+
+
+def test_dispatch_resolved_blocked_pushes_nothing_and_flags_attention(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """A spoofed/garbled RESOLVED whose worktree fails verification → gitbulk
+    pushes NOTHING and the PR is surfaced for attention (verdict is advisory)."""
+    from gitbulk.rebase import PushReadiness
+
+    pushes: list = []
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.verify_resolved_for_push",
+        lambda wt, sha: (PushReadiness.BLOCKED, "unresolved conflict markers"),
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.force_push_with_lease",
+        lambda *a, **k: pushes.append(a),
+    )
+    rc, latest, _removed = _one_pr_apply_run(
+        monkeypatch, code_root, write_config, fresh_org_cache, prompt_file,
+        fake_clones, cfg=_resolved_cfg(), conflict=False,
+    )
+    assert pushes == []  # nothing pushed
+    assert rc == EXIT_ATTENTION_NEEDED  # push problem beats skip-check
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    pr_state = state["repos"]["dhh1128/alpha"]["prs"][0]
+    assert pr_state["push_status"] == "blocked"
+
+
+def test_dispatch_resolved_push_failure_flags_attention(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """READY but the force-push itself fails (e.g. lease violation) → attention."""
+    from gitbulk.rebase import PushReadiness, RebaseError
+
+    def _boom(*a, **k):
+        raise RebaseError("push rejected", stderr="stale info: ref moved")
+
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.verify_resolved_for_push",
+        lambda wt, sha: (PushReadiness.READY, "advanced"),
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.force_push_with_lease", _boom
+    )
+    rc, latest, _removed = _one_pr_apply_run(
+        monkeypatch, code_root, write_config, fresh_org_cache, prompt_file,
+        fake_clones, cfg=_resolved_cfg(), conflict=False,
+    )
+    assert rc == EXIT_ATTENTION_NEEDED
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    pr_state = state["repos"]["dhh1128/alpha"]["prs"][0]
+    assert pr_state["push_status"] == "push-failed"
+
+
+def test_dispatch_resolved_no_change_pushes_nothing(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """RESOLVED but HEAD never advanced → nothing to push, not an attention
+    condition."""
+    from gitbulk.rebase import PushReadiness
+
+    pushes: list = []
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.verify_resolved_for_push",
+        lambda wt, sha: (PushReadiness.NO_CHANGE, "unchanged"),
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.force_push_with_lease",
+        lambda *a, **k: pushes.append(a),
+    )
+    rc, latest, _removed = _one_pr_apply_run(
+        monkeypatch, code_root, write_config, fresh_org_cache, prompt_file,
+        fake_clones, cfg=_resolved_cfg(), conflict=False,
+    )
+    assert pushes == []
+    assert rc == EXIT_OVERRIDES_APPLIED  # benign; no attention
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    assert state["repos"]["dhh1128/alpha"]["prs"][0]["push_status"] == "no-change"
+
+
+def test_dispatch_escalated_is_never_pushed(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """An ESCALATED verdict is never verified or pushed (the agent declined)."""
+    pushes: list = []
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.force_push_with_lease",
+        lambda *a, **k: pushes.append(a),
+    )
+    called = []
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.verify_resolved_for_push",
+        lambda *a, **k: called.append(a) or (None, "x"),
+    )
+    cfg = {"status": "completed", "exit_code": 0,
+           "stdout": "ESCALATED: not mechanical\n"}
+    rc, _latest, _removed = _one_pr_apply_run(
+        monkeypatch, code_root, write_config, fresh_org_cache, prompt_file,
+        fake_clones, cfg=cfg, conflict=False,
+    )
+    assert pushes == []
+    assert called == []  # verification not even attempted for ESCALATED
+    assert rc == EXIT_OVERRIDES_APPLIED
+
+
+def test_dispatch_prefetch_failure_skips_pr(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """If gitbulk cannot fetch the base, the PR is skipped (the agent could
+    not rebase offline anyway) and the worktree is removed."""
+    from gitbulk.rebase import RebaseResult, RebaseStatus
+
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.fetch_base",
+        lambda wt, base: RebaseResult(RebaseStatus.ERROR, "no route to host"),
+    )
+    rc, latest, removed = _one_pr_apply_run(
+        monkeypatch, code_root, write_config, fresh_org_cache, prompt_file,
+        fake_clones, cfg=_resolved_cfg(), conflict=False,
+    )
+    # PR skipped: no repo state recorded, worktree removed, error logged.
+    assert len(removed) == 1
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    assert state["repos"] == {} or "dhh1128/alpha" not in state.get("repos", {})
+    errors = [
+        json.loads(line)
+        for line in (latest / "errors.log").read_text().splitlines()
+        if line.strip()
+    ]
+    assert any("prefetch failed" in e["message"] for e in errors)
 
 
 def test_key_for_pr_shape():
