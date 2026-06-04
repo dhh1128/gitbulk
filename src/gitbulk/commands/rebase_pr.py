@@ -58,7 +58,12 @@ from gitbulk.org_members_cache import (
 )
 from gitbulk.invariants import InvariantContext, get, run_chain
 from gitbulk.invariants.base import Invariant, InvariantKind
-from gitbulk.locks import LockTimeoutError, global_lock
+from gitbulk.locks import (
+    LockTimeoutError,
+    repo_lock,
+    run_state_lock,
+    sentinel_lock,
+)
 from gitbulk.pr_info import PRInfo
 from gitbulk.rebase import (
     RebaseError,
@@ -206,22 +211,114 @@ def rebase_pr_handler(args: argparse.Namespace) -> int:
         )
     repos, repos_excluded = select_repos(repos, spec)
 
+    # Resource-scoped locking (node rsclk7nq): no global lock. Caches self-lock
+    # in their helpers; each PR's rebase (worktree create/remove + force-push)
+    # runs under repo_lock(slug) in _rebase_one_pr; the terminal writes take
+    # sentinel_lock + run_state_lock("rebase-pr").
     try:
-        with global_lock(
-            "exclusive",
-            timeout=_LOCK_TIMEOUT_SECONDS,
-            subcommand="rebase-pr",
-        ):
-            return _run_under_lock(
-                args, policy, repos, repos_text, skipped_entries,
-                spec, repos_excluded,
-            )
+        return _run_under_lock(
+            args, policy, repos, repos_text, skipped_entries,
+            spec, repos_excluded,
+        )
     except LockTimeoutError as e:
         print(
             error_line(f"gitbulk rebase-pr: timed out acquiring lock: {e}"),
             file=sys.stderr,
         )
         return EXIT_STRUCTURAL_FAILURE
+
+
+def _rebase_one_pr(rs, policy, repo, pr, runid) -> dict:
+    """Rebase one PR in a disposable worktree; force-push on a clean rebase.
+
+    All git work on the clone (worktree create/remove) and the force-push run
+    under repo_lock(slug, EX) so a concurrent gitbulk run never touches the
+    SAME repo mid-rebase (node rsclk7nq #6/#7); different repos run in
+    parallel. Returns the result record; ``outcome`` is one of
+    ``rebased`` | ``conflict`` | ``error``. A LockTimeoutError propagates to
+    the handler (surfaced as exit 1).
+    """
+    slug = repo.slug
+    base_ref = pr.base_ref
+    record = {
+        "slug": slug,
+        "number": pr.number,
+        "title": pr.title,
+        "url": pr.url,
+    }
+    with repo_lock(
+        slug, "exclusive", timeout=_LOCK_TIMEOUT_SECONDS, subcommand="rebase-pr"
+    ):
+        # Create the worktree.
+        try:
+            worktree_path = create_worktree(
+                repo.local_path,
+                slug,
+                pr.number,
+                pr.head_ref,
+                pr.head_sha,
+                worktree_root=policy.worktree_root,
+                runid=runid,
+            )
+        except WorktreeError as e:
+            rs.record_error(
+                f"worktree creation failed for {slug}#{pr.number}: {e}",
+                level="ERROR",
+                context={"slug": slug, "pr": pr.number, "stderr": e.stderr or ""},
+            )
+            record.update(outcome="error", detail=f"worktree: {e}")
+            return record
+
+        rebase_result = rebase_onto_base(worktree_path, base_ref)
+
+        if rebase_result.status is RebaseStatus.CLEAN:
+            try:
+                force_push_with_lease(worktree_path, pr.head_ref, pr.head_sha)
+            except RebaseError as e:
+                rs.record_error(
+                    f"force-push failed for {slug}#{pr.number}: {e}",
+                    level="ERROR",
+                    context={"slug": slug, "pr": pr.number, "stderr": e.stderr or ""},
+                )
+                record.update(outcome="error", detail=f"push: {e.stderr or e}")
+                _safe_remove_worktree(repo.local_path, worktree_path, rs, slug, pr)
+                return record
+            record.update(outcome="rebased", detail=rebase_result.detail)
+            _safe_remove_worktree(repo.local_path, worktree_path, rs, slug, pr)
+            return record
+
+        elif rebase_result.status is RebaseStatus.CONFLICT:
+            # Preserve the worktree mid-rebase for manual resolution.
+            _write_conflict_marker(
+                worktree_path, slug, pr, base_ref, rebase_result.detail
+            )
+            rs.record_error(
+                f"rebase conflict for {slug}#{pr.number}; worktree preserved at "
+                f"{worktree_path}",
+                level="WARNING",
+                context={
+                    "slug": slug,
+                    "pr": pr.number,
+                    "worktree": str(worktree_path),
+                    "conflicted": rebase_result.detail,
+                },
+            )
+            record.update(
+                outcome="conflict",
+                detail=rebase_result.detail,
+                worktree=str(worktree_path),
+            )
+            return record
+
+        else:  # ERROR — rebase already aborted inside rebase_onto_base
+            rs.record_error(
+                f"rebase failed for {slug}#{pr.number}: {rebase_result.detail}",
+                level="ERROR",
+                context={"slug": slug, "pr": pr.number},
+            )
+            record.update(outcome="error", detail=rebase_result.detail)
+            _safe_remove_worktree(repo.local_path, worktree_path, rs, slug, pr)
+            return record
 
 
 def _run_under_lock(
@@ -444,91 +541,14 @@ def _run_under_lock(
     apply_prog = Progress(len(eligible_prs), prefix="rebasing: ")
     for i, (slug, pr) in enumerate(eligible_prs, start=1):
         apply_prog.update(i, f"{slug}#{pr.number}")
-        repo = repo_by_slug[slug]
-        base_ref = pr.base_ref
-        record = {
-            "slug": slug,
-            "number": pr.number,
-            "title": pr.title,
-            "url": pr.url,
-        }
-        # Create the worktree.
-        try:
-            worktree_path = create_worktree(
-                repo.local_path,
-                slug,
-                pr.number,
-                pr.head_ref,
-                pr.head_sha,
-                worktree_root=policy.worktree_root,
-                runid=runid,
-            )
-        except WorktreeError as e:
-            failure_count += 1
-            rs.record_error(
-                f"worktree creation failed for {slug}#{pr.number}: {e}",
-                level="ERROR",
-                context={"slug": slug, "pr": pr.number, "stderr": e.stderr or ""},
-            )
-            record.update(outcome="error", detail=f"worktree: {e}")
-            results.append(record)
-            continue
-
-        rebase_result = rebase_onto_base(worktree_path, base_ref)
-
-        if rebase_result.status is RebaseStatus.CLEAN:
-            try:
-                force_push_with_lease(worktree_path, pr.head_ref, pr.head_sha)
-            except RebaseError as e:
-                failure_count += 1
-                rs.record_error(
-                    f"force-push failed for {slug}#{pr.number}: {e}",
-                    level="ERROR",
-                    context={"slug": slug, "pr": pr.number, "stderr": e.stderr or ""},
-                )
-                record.update(outcome="error", detail=f"push: {e.stderr or e}")
-                _safe_remove_worktree(repo.local_path, worktree_path, rs, slug, pr)
-                results.append(record)
-                continue
+        record = _rebase_one_pr(rs, policy, repo_by_slug[slug], pr, runid)
+        results.append(record)
+        if record["outcome"] == "rebased":
             rebased_count += 1
-            record.update(outcome="rebased", detail=rebase_result.detail)
-            _safe_remove_worktree(repo.local_path, worktree_path, rs, slug, pr)
-            results.append(record)
-
-        elif rebase_result.status is RebaseStatus.CONFLICT:
-            # Preserve the worktree mid-rebase for manual resolution.
+        elif record["outcome"] == "conflict":
             conflict_count += 1
-            _write_conflict_marker(
-                worktree_path, slug, pr, base_ref, rebase_result.detail
-            )
-            rs.record_error(
-                f"rebase conflict for {slug}#{pr.number}; worktree preserved at "
-                f"{worktree_path}",
-                level="WARNING",
-                context={
-                    "slug": slug,
-                    "pr": pr.number,
-                    "worktree": str(worktree_path),
-                    "conflicted": rebase_result.detail,
-                },
-            )
-            record.update(
-                outcome="conflict",
-                detail=rebase_result.detail,
-                worktree=str(worktree_path),
-            )
-            results.append(record)
-
-        else:  # ERROR — rebase already aborted inside rebase_onto_base
+        else:
             failure_count += 1
-            rs.record_error(
-                f"rebase failed for {slug}#{pr.number}: {rebase_result.detail}",
-                level="ERROR",
-                context={"slug": slug, "pr": pr.number},
-            )
-            record.update(outcome="error", detail=rebase_result.detail)
-            _safe_remove_worktree(repo.local_path, worktree_path, rs, slug, pr)
-            results.append(record)
     apply_prog.done()
 
     for repo in passing_repos:
@@ -707,9 +727,14 @@ def _finish(
 
     if attention:
         runid = _runid_from_run_dir(rs.run_dir)
-        sentinel.set_attention(exit_code, "rebase-pr", runid, summary)
+        with sentinel_lock(timeout=_LOCK_TIMEOUT_SECONDS, subcommand="rebase-pr"):
+            sentinel.set_attention(exit_code, "rebase-pr", runid, summary)
 
-    rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
+    with run_state_lock(
+        "rebase-pr", "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
+        subcommand="rebase-pr",
+    ):
+        rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
     print(summary_line(f"gitbulk rebase-pr: {summary}. View: gitbulk show rebase-pr", exit_code))
     return exit_code
 

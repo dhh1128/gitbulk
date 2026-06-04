@@ -448,7 +448,17 @@ def test_lock_timeout_returns_structural_failure(
         from gitbulk.locks import LockTimeoutError
         raise LockTimeoutError(Path("/tmp/x.lock"), None)
 
-    monkeypatch.setattr("gitbulk.commands.rebase_pr.global_lock", _raise)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"}, default_branches={"dhh1128/alpha": "main"}
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.rebase_pr.ProductionGHClient", lambda: fake
+    )
+    # default_branches_lock (resource #3) times out — reached in prime, before
+    # the clone is touched (node rsclk7nq); surfaced as exit 1.
+    monkeypatch.setattr(
+        "gitbulk.default_branch_cache.default_branches_lock", _raise
+    )
     rc = rebase_pr_handler(_args(code_root=code_root))
     assert rc == EXIT_STRUCTURAL_FAILURE
 

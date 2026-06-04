@@ -77,8 +77,8 @@ exactly that resource, never wider (this.i node `rsclk7nq`,
 keyed `fcntl.flock`: per-subcommand run-state (`run_state_lock`), per-repo
 clone+remote mutation (`repo_lock`), the org-members and default-branch
 caches, the ATTENTION sentinel, the dashboard, and the watchdog-ack cache.
-The single global `run.lock` of the original two-lock model (`lj5pqn4kr`) is
-being retired in favour of these. A mutating run on repo A and any operation
+The single global `run.lock` of the original two-lock model (`lj5pqn4kr`) has
+been retired in favour of these. A mutating run on repo A and any operation
 on repo B never contend; `show <sub>` never contends with a run of a
 *different* subcommand. New subcommands MUST declare which resource locks
 they take (and in which mode) explicitly, and acquire them in the documented

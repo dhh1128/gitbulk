@@ -11,8 +11,9 @@ only around the section that touches it. Context managers:
   - ``sentinel_lock()``              — ATTENTION sentinel (resource #4)
   - ``dashboard_lock()``             — dashboard.md (resource #5)
   - ``watchdog_ack_lock()``          — watchdog-ack cache (resource #9)
-  - ``global_lock(mode)``            — the legacy global run.lock, being
-                                       retired as callers migrate to the above.
+
+The legacy single ``global_lock`` of the two-lock model (``lj5pqn4kr``) has been
+retired — every subcommand now takes only the resource locks it needs.
 
 To avoid deadlock, never hold two at once (the design is flat/non-nested); if
 nesting is ever unavoidable, acquire in this order: org -> default_branches ->
@@ -164,20 +165,6 @@ def _file_lock(
     finally:
         os.close(fd)
         _log.debug("released lock at %s", path)
-
-
-@contextmanager
-def global_lock(
-    mode: Literal["shared", "exclusive"],
-    *,
-    timeout: float | None = None,
-    subcommand: str | None = None,
-) -> Iterator[None]:
-    """Hold the global run.lock for the duration of the ``with`` block."""
-    with _file_lock(
-        paths.global_lock_file(), mode, timeout=timeout, subcommand=subcommand
-    ):
-        yield
 
 
 @contextmanager

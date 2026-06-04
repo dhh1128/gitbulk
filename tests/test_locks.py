@@ -35,7 +35,7 @@ def test_global_lock_shared_calls_flock_with_LOCK_SH(isolated_cache, monkeypatch
         captured.append(op)
 
     monkeypatch.setattr(fcntl, "flock", fake_flock)
-    with locks.global_lock("shared"):
+    with locks.run_state_lock("audit", "shared"):
         pass
     assert captured == [fcntl.LOCK_SH]
 
@@ -47,14 +47,14 @@ def test_global_lock_exclusive_calls_flock_with_LOCK_EX(isolated_cache, monkeypa
         captured.append(op)
 
     monkeypatch.setattr(fcntl, "flock", fake_flock)
-    with locks.global_lock("exclusive"):
+    with locks.run_state_lock("audit", "exclusive"):
         pass
     assert captured == [fcntl.LOCK_EX]
 
 
 def test_invalid_mode_raises_value_error(isolated_cache):
     with pytest.raises(ValueError, match="invalid mode"):
-        with locks.global_lock("write-only"):  # type: ignore[arg-type]
+        with locks.run_state_lock("audit", "write-only"):  # type: ignore[arg-type]
             pass
 
 
@@ -80,9 +80,9 @@ def test_repo_lock_malformed_slug_raises(isolated_cache):
 
 
 def test_global_lock_writes_to_global_lock_file(isolated_cache):
-    with locks.global_lock("exclusive", subcommand="report"):
-        assert paths.global_lock_file().exists()
-        metadata = json.loads(paths.global_lock_file().read_text())
+    with locks.run_state_lock("audit", "exclusive", subcommand="report"):
+        assert paths.named_lock_file("runstate-audit").exists()
+        metadata = json.loads(paths.named_lock_file("runstate-audit").read_text())
         assert metadata["pid"] == os.getpid()
         assert metadata["subcommand"] == "report"
 
@@ -99,16 +99,16 @@ def test_repo_lock_writes_to_repo_lock_file(isolated_cache):
 
 
 def test_metadata_includes_pid_and_started_at_utc(isolated_cache):
-    with locks.global_lock("exclusive", subcommand="dispatch"):
-        metadata = json.loads(paths.global_lock_file().read_text())
+    with locks.run_state_lock("audit", "exclusive", subcommand="dispatch"):
+        metadata = json.loads(paths.named_lock_file("runstate-audit").read_text())
         assert metadata["pid"] == os.getpid()
         assert metadata["started_at"].endswith("+00:00") or metadata["started_at"].endswith("Z")
         assert metadata["subcommand"] == "dispatch"
 
 
 def test_metadata_subcommand_null_when_omitted(isolated_cache):
-    with locks.global_lock("shared"):
-        metadata = json.loads(paths.global_lock_file().read_text())
+    with locks.run_state_lock("audit", "shared"):
+        metadata = json.loads(paths.named_lock_file("runstate-audit").read_text())
         assert metadata["subcommand"] is None
 
 
@@ -116,10 +116,10 @@ def test_metadata_subcommand_null_when_omitted(isolated_cache):
 
 
 def test_lock_file_persists_after_release(isolated_cache):
-    with locks.global_lock("shared"):
+    with locks.run_state_lock("audit", "shared"):
         pass
     # The file is unlocked (we exited the context) but the file remains on disk
-    assert paths.global_lock_file().exists()
+    assert paths.named_lock_file("runstate-audit").exists()
 
 
 # ─── Timeout / blocking behavior ───────────────────────────────────────────
@@ -133,7 +133,7 @@ def test_no_timeout_omits_LOCK_NB(isolated_cache, monkeypatch):
         captured.append(op)
 
     monkeypatch.setattr(fcntl, "flock", fake_flock)
-    with locks.global_lock("shared"):
+    with locks.run_state_lock("audit", "shared"):
         pass
     assert captured == [fcntl.LOCK_SH]  # no LOCK_NB bit set
     assert not (captured[0] & fcntl.LOCK_NB)
@@ -146,7 +146,7 @@ def test_timeout_uses_LOCK_NB(isolated_cache, monkeypatch):
         captured.append(op)
 
     monkeypatch.setattr(fcntl, "flock", fake_flock)
-    with locks.global_lock("shared", timeout=1.0):
+    with locks.run_state_lock("audit", "shared", timeout=1.0):
         pass
     assert len(captured) == 1
     assert captured[0] & fcntl.LOCK_NB
@@ -156,14 +156,14 @@ def test_timeout_succeeds_after_retry(isolated_cache, monkeypatch):
     """First flock call raises BlockingIOError; second succeeds. Exercises the retry loop."""
     mock_flock = MagicMock(side_effect=[BlockingIOError("contention"), None])
     monkeypatch.setattr(fcntl, "flock", mock_flock)
-    with locks.global_lock("shared", timeout=2.0):
+    with locks.run_state_lock("audit", "shared", timeout=2.0):
         pass
     assert mock_flock.call_count == 2
 
 
 def test_timeout_expires_raises_LockTimeoutError(isolated_cache):
     """Hold the lock from a second FD in this process and try to re-acquire with timeout."""
-    fd_holder = os.open(paths.global_lock_file(), os.O_RDWR | os.O_CREAT, 0o644)
+    fd_holder = os.open(paths.named_lock_file("runstate-audit"), os.O_RDWR | os.O_CREAT, 0o644)
     fcntl.flock(fd_holder, fcntl.LOCK_EX)
     try:
         # Pre-write some metadata so the error path has a holder dict to find
@@ -180,7 +180,7 @@ def test_timeout_expires_raises_LockTimeoutError(isolated_cache):
             ).encode(),
         )
         with pytest.raises(LockTimeoutError) as exc_info:
-            with locks.global_lock("exclusive", timeout=0.2):
+            with locks.run_state_lock("audit", "exclusive", timeout=0.2):
                 pass
         err = exc_info.value
         assert err.holder is not None
@@ -188,19 +188,19 @@ def test_timeout_expires_raises_LockTimeoutError(isolated_cache):
         assert err.holder["subcommand"] == "report"
         assert "99999" in str(err)
         assert "report" in str(err)
-        assert err.lock_path == paths.global_lock_file()
+        assert err.lock_path == paths.named_lock_file("runstate-audit")
     finally:
         os.close(fd_holder)
 
 
 def test_timeout_error_message_when_no_holder_metadata(isolated_cache):
     """Lock file exists but is empty (no JSON to read)."""
-    paths.global_lock_file().write_text("")
-    fd_holder = os.open(paths.global_lock_file(), os.O_RDWR)
+    paths.named_lock_file("runstate-audit").write_text("")
+    fd_holder = os.open(paths.named_lock_file("runstate-audit"), os.O_RDWR)
     fcntl.flock(fd_holder, fcntl.LOCK_EX)
     try:
         with pytest.raises(LockTimeoutError) as exc_info:
-            with locks.global_lock("exclusive", timeout=0.2):
+            with locks.run_state_lock("audit", "exclusive", timeout=0.2):
                 pass
         assert exc_info.value.holder is None
         assert "no holder metadata" in str(exc_info.value)
@@ -325,7 +325,7 @@ def test_is_pid_alive_generic_oserror_treated_as_dead(monkeypatch):
 
 def test_locktimeout_message_shows_alive_when_holder_present(isolated_cache):
     # Use this process's own pid so the holder shows as alive.
-    fd_holder = os.open(paths.global_lock_file(), os.O_RDWR | os.O_CREAT, 0o644)
+    fd_holder = os.open(paths.named_lock_file("runstate-audit"), os.O_RDWR | os.O_CREAT, 0o644)
     fcntl.flock(fd_holder, fcntl.LOCK_EX)
     try:
         # Pre-write metadata referencing our own pid.
@@ -342,7 +342,7 @@ def test_locktimeout_message_shows_alive_when_holder_present(isolated_cache):
             ).encode(),
         )
         with pytest.raises(LockTimeoutError) as exc_info:
-            with locks.global_lock("exclusive", timeout=0.2):
+            with locks.run_state_lock("audit", "exclusive", timeout=0.2):
                 pass
         err = exc_info.value
         assert err.holder is not None
@@ -373,7 +373,7 @@ def test_locktimeout_message_no_alive_field(tmp_path):
 def test_locktimeout_message_shows_stale_when_holder_dead(isolated_cache):
     """When the recorded pid is gone, the message must say so clearly so the
     operator does not waste time chasing a nonexistent process."""
-    fd_holder = os.open(paths.global_lock_file(), os.O_RDWR | os.O_CREAT, 0o644)
+    fd_holder = os.open(paths.named_lock_file("runstate-audit"), os.O_RDWR | os.O_CREAT, 0o644)
     fcntl.flock(fd_holder, fcntl.LOCK_EX)
     try:
         # Pre-write metadata referencing a definitely-dead pid.
@@ -390,7 +390,7 @@ def test_locktimeout_message_shows_stale_when_holder_dead(isolated_cache):
             ).encode(),
         )
         with pytest.raises(LockTimeoutError) as exc_info:
-            with locks.global_lock("exclusive", timeout=0.2):
+            with locks.run_state_lock("audit", "exclusive", timeout=0.2):
                 pass
         err = exc_info.value
         assert err.holder is not None
@@ -406,11 +406,11 @@ def test_locktimeout_message_shows_stale_when_holder_dead(isolated_cache):
 
 def test_exclusive_blocks_concurrent_exclusive_attempt(isolated_cache):
     """Real fcntl behavior: when one FD holds EX, another EX with LOCK_NB fails."""
-    fd_holder = os.open(paths.global_lock_file(), os.O_RDWR | os.O_CREAT, 0o644)
+    fd_holder = os.open(paths.named_lock_file("runstate-audit"), os.O_RDWR | os.O_CREAT, 0o644)
     fcntl.flock(fd_holder, fcntl.LOCK_EX)
     try:
         with pytest.raises(LockTimeoutError):
-            with locks.global_lock("exclusive", timeout=0.15):
+            with locks.run_state_lock("audit", "exclusive", timeout=0.15):
                 pass
     finally:
         os.close(fd_holder)
@@ -418,11 +418,11 @@ def test_exclusive_blocks_concurrent_exclusive_attempt(isolated_cache):
 
 def test_shared_coexists_with_shared(isolated_cache):
     """Real fcntl behavior: two shared locks on the same file coexist."""
-    fd_holder = os.open(paths.global_lock_file(), os.O_RDWR | os.O_CREAT, 0o644)
+    fd_holder = os.open(paths.named_lock_file("runstate-audit"), os.O_RDWR | os.O_CREAT, 0o644)
     fcntl.flock(fd_holder, fcntl.LOCK_SH)
     try:
         # This must NOT block; timeout=0.5 is generous in case scheduling is slow
-        with locks.global_lock("shared", timeout=0.5):
+        with locks.run_state_lock("audit", "shared", timeout=0.5):
             pass
     finally:
         os.close(fd_holder)
@@ -444,7 +444,7 @@ def test_repo_locks_for_different_slugs_dont_contend(isolated_cache):
 
 def test_acquire_succeeds_when_holder_releases_mid_wait(isolated_cache):
     """A separate thread releases the lock partway through our wait."""
-    fd_holder = os.open(paths.global_lock_file(), os.O_RDWR | os.O_CREAT, 0o644)
+    fd_holder = os.open(paths.named_lock_file("runstate-audit"), os.O_RDWR | os.O_CREAT, 0o644)
     fcntl.flock(fd_holder, fcntl.LOCK_EX)
     released = threading.Event()
 
@@ -456,7 +456,7 @@ def test_acquire_succeeds_when_holder_releases_mid_wait(isolated_cache):
     t = threading.Thread(target=release_after_delay)
     t.start()
     try:
-        with locks.global_lock("exclusive", timeout=2.0):
+        with locks.run_state_lock("audit", "exclusive", timeout=2.0):
             assert released.wait(timeout=1.0)
     finally:
         t.join(timeout=2.0)

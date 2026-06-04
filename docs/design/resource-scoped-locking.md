@@ -75,7 +75,9 @@ metadata, pid-liveness — unchanged). Lock files live under `locks_dir()`.
 gitbulk remote mutation to repo `<slug>` holds `repo_lock(slug)` EXCLUSIVE. The
 clone and the GitHub repo are treated as one resource keyed by slug.
 
-`global_lock` is retired once every command is migrated.
+`global_lock` has been retired — every command now takes only the resource
+locks it needs (the `global_lock_file()` path helper remains only as a holder
+placeholder in a few tests).
 
 ## 4. The refactor pattern
 

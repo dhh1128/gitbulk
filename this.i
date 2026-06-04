@@ -1548,10 +1548,12 @@ Gitbulk Triage Tool = goal:
         dropped. tmlk5pq3's bounded-timeout policy and LockTimeoutError
         handling carry over unchanged to every keyed lock.
 
-        ROLLOUT: Phase 0 (hardening) -> Phase 1 (show/summarize off
-        global_lock onto run_state_lock — fixes the reported symptom) ->
-        Phase 2 (activate repo_lock + cache/org/sentinel locks in the six
-        mutators; retire global_lock last).
+        ROLLOUT (all landed): Phase 0 (hardening) -> Phase 1 (show/summarize
+        off global_lock onto run_state_lock — fixed the reported symptom) ->
+        Phase 2 (repo_lock + cache/org/sentinel locks across report + the six
+        mutators; global_lock function REMOVED from locks.py). The
+        global_lock_file() path helper is kept only as a holder placeholder in
+        a few tests.
       approved-by: daniel, 2026-06-03
       supersedes: lj5pqn4kr
       extends: hk5pq3nm
