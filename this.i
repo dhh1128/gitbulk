@@ -3381,14 +3381,21 @@ Gitbulk Triage Tool = goal:
           id: reldst7q
           why: >
             scripts/release.py (clean-tree + in-sync-with-origin/main +
-            tests-pass gates -> bump pyproject -> commit -> tag -> push tag)
-            triggers .github/workflows/release.yml on the tag, which
+            tests-pass gates -> bump pyproject -> uv lock -> commit
+            (pyproject + uv.lock) -> tag -> push tag) triggers
+            .github/workflows/release.yml on the tag, which
             pip-installs, builds the bundle, generates update.json
             (latest_version / script_url / sha256), and publishes both as
             release assets. Chosen as a direct port of agentprep's proven
             release path so the author maintains one mental model across
             both tools. release.py is human-run (AGENTS.md reserves pushes
-            to main and tags for humans; AI never runs it). Workflow actions
+            to main and tags for humans; AI never runs it). The `uv lock`
+            step (added 2026-06-04) keeps uv.lock's recorded editable-root
+            version tracking pyproject (vsrc4pn3's single source of truth)
+            rather than lagging a release behind — `uv lock --check` does NOT
+            detect that drift, and plain `uv lock` does not upgrade pinned
+            deps, so it only refreshes the project's own version snapshot.
+            Workflow actions
             are pinned to node24-runtime versions per the standing
             GitHub-Actions deprecation rule. Cost: couples releasing to
             GitHub Actions availability; acceptable, CI already lives there.

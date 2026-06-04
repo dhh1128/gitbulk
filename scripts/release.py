@@ -220,7 +220,16 @@ def main():
     print(f"{verb} {old} -> {new}")
     set_version(new)
 
-    run(["git", "add", str(PYPROJECT.relative_to(REPO_ROOT))])
+    # Regenerate the lockfile so uv.lock's recorded project version tracks
+    # pyproject (the single source of truth, node vsrc4pn3) instead of lagging
+    # a release behind. uv re-reads the editable root's version from pyproject;
+    # `uv lock --check` does NOT catch this drift, so we refresh it explicitly.
+    # Plain `uv lock` does not upgrade already-locked dependencies — only the
+    # project's own version snapshot changes.
+    print("Refreshing uv.lock...")
+    run(["uv", "lock"])
+
+    run(["git", "add", str(PYPROJECT.relative_to(REPO_ROOT)), "uv.lock"])
     # DCO sign-off (the user works in DCO-enforced repos and signs every commit).
     run(["git", "commit", "-s", "-m", f"Release {tag}: {message}"])
     run(["git", "push", "origin", "main"])
