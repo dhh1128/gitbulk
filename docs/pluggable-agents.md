@@ -1,9 +1,10 @@
 # Pluggable coding agents
 
-Status: **design approved 2026-06-04** (forks chosen by the user); implementation
-in progress on `feat/pluggable-agents`. This document is the implementation
-contract; the locked decisions also live as `this.i` nodes (see the IDs in each
-section).
+Status: **implemented 2026-06-04** on `feat/pluggable-agents` (Phases 1–5, full
+suite green at 100% branch coverage). This document is the design contract; the
+locked decisions also live as `this.i` nodes `agbknd7q`, `agprof4k`, `agtmpl9k`,
+`agpriv8n`, `agdang5k`, `agenv6q`, `agsbx3k`, `agtok2n`, `agatk5n`. The
+threat-model reconciliation is in `docs/threat-model.md` §3.5.
 
 ---
 

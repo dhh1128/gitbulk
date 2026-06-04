@@ -100,6 +100,36 @@ Every mutating subcommand (`merge`, `close-stale`, `rebase-onto-default`,
 `dispatch`) defaults to `--dry-run` and requires `--apply` to actually act.
 A misconfigured cron entry must not silently merge things.
 
+### The dispatched agent never touches a remote (cross-backend invariant)
+
+gitbulk can drive coding agents other than Claude (`agents:` / `--agent`; see
+[`docs/pluggable-agents.md`](docs/pluggable-agents.md), this.i `agbknd7q`…).
+Regardless of which backend runs, **the agent must never perform a networked,
+credentialed, or irreversible git operation** — no `git fetch`, no `git push`,
+no `gh pr merge`/close/delete. gitbulk pre-fetches the base before launching the
+agent and performs the `force-push-with-lease` itself, only after independently
+verifying the worktree (`rebase.verify_resolved_for_push`); the agent's
+`RESOLVED:`/`ESCALATED:` verdict is **advisory and never trusted as proof of
+work** (this.i `agpriv8n`). Any change that re-introduces a push/fetch into a
+dispatch prompt, or makes gitbulk push on the verdict alone without
+verification, is a defect.
+
+Related hard rules for the agent layer:
+
+- **Command templates are argv lists, never shell strings**; a scalar
+  `command`/`model_args` is a config error. `{prompt}`/`{model}` substitute
+  within a single token. No `shell=True`, anywhere (this.i `agtmpl9k`).
+- **The agent binary is pinned via `shutil.which`** at load — never let config
+  or CLI choose an arbitrary executable path that isn't pinned.
+- **Env reaching the agent is an allowlist** (`agenv6q`); don't widen the safe
+  base to include credential-bearing vars.
+- **A requested sandbox that's unavailable refuses by default** (`agsbx3k`);
+  don't change `sandbox_fallback` to silently downgrade.
+
+These are guarded by `tests/test_agent_security.py` — treat any change that
+weakens those tests as security-sensitive (mirrors the threat-model §3.4-6
+warning about eroding the `Fake*`/test safety net).
+
 ### Invariants are first-class
 
 New operations that touch repos or PRs must be expressed as a chain of

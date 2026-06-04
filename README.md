@@ -9,9 +9,11 @@ Nightly fleet-maintenance tool for a developer who works across many GitHub
 repositories.
 
 Given a list of repos you contribute to, `gitbulk` reports the state of your
-open pull requests, flags ones that need your attention, can launch Claude Code
-agents to fix common problems, can rebase PRs onto their default branches, can
-auto-merge PRs that meet a configurable policy, and can close stale PRs. It
+open pull requests, flags ones that need your attention, can launch headless
+coding agents (Claude Code by default, or Gemini / Copilot / Cursor / a custom
+CLI — see [pluggable agents](docs/pluggable-agents.md)) to fix common problems,
+can rebase PRs onto their default branches, can auto-merge PRs that meet a
+configurable policy, and can close stale PRs. It
 also treats local clones themselves as first-class — discovering and cleaning
 up post-merge cruft (orphaned worktrees, undeleted branches) and surfacing
 repos that need work no PR yet exists for.

@@ -51,6 +51,26 @@ MAILTO=you@example.com
 0 5 * * 6 /home/you/code/gitbulk/bin/gitbulk-cron dispatch --apply --prompt ~/.config/gitbulk/prompts/dispatch.md
 ```
 
+## Sandboxing dispatched agents
+
+`dispatch` runs a coding agent with auto-approval inside a worktree. By default
+that is Claude Code; you can point it at another agent (Gemini, Copilot, Cursor,
+or a custom CLI) via [`agents:` / `default_agent`](configuration.md#agents--default_agent--which-coding-agent-to-drive).
+For unattended runs against untrusted PR content, prefer to confine non-Claude
+agents:
+
+- Set the profile's `sandbox: fs+no-net` (and an `env:` allowlist). gitbulk
+  fetches the base and pushes the result itself, so the agent needs no network
+  or credentials for conflict resolution and can run fully offline + isolated.
+- The sandbox uses [bubblewrap](https://github.com/containers/bubblewrap): the
+  host needs `bwrap` installed **and** unprivileged user namespaces enabled
+  (true on most Linux incl. WSL2; some hardened distros disable them). gitbulk
+  capability-probes at runtime.
+- If a requested sandbox isn't available, `sandbox_fallback` decides: the
+  default `refuse` makes gitbulk **skip/abort rather than run unconfined** —
+  which in cron means a failed run you'll see, not a silent unsandboxed one. Set
+  `warn-run` only if you accept running unsandboxed when bwrap is missing.
+
 ## Exit codes
 
 The exit code drives both your inbox and the `ATTENTION` sentinel:

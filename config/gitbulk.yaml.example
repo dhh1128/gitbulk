@@ -50,6 +50,51 @@ repos: {}
 # location — e.g., a tmpfs mount.
 # worktree_root: ~/.cache/gitbulk/worktrees
 
+# ── Pluggable coding agents (dispatch / summarize) ──────────────────────────
+# Which CLI coding agent gitbulk shells out to. Omit everything below to use
+# the built-in `claude` default (byte-identical to pre-1.0 behavior). See
+# docs/pluggable-agents.md for the full design and the security model.
+#
+# Built-in presets: claude, gemini, copilot, cursor. Pick one run-wide:
+# default_agent: gemini
+#
+# Per-repo override (under `repos:` above), e.g.:
+#   repos:
+#     someorg/some-repo:
+#       agent: copilot
+#
+# `--agent NAME` on the command line overrides both.
+#
+# Override a preset's fields, or define a fully custom agent. SECURITY: every
+# `command`/`model_args` is an argv LIST (never a shell string — a string is a
+# hard error); `{prompt}` and `{model}` substitute within a single token; the
+# binary is pinned via `which` at load. The auto-approve flag in each command
+# (--yolo / --allow-all-tools / --dangerously-skip-permissions) is what makes
+# unattended runs possible AND removes the in-agent safety net — the sandbox is
+# the real boundary.
+# agents:
+#   gemini:
+#     model: gemini-2.5-pro          # override just the model of a preset
+#   myagent:                         # a fully custom backend
+#     command: [mytool, run, "{prompt}"]   # argv list; exactly one {prompt}
+#     model_args: [--model, "{model}"]     # appended only when a model is set
+#     model: my-default
+#     prompt_via: arg                # arg | stdin  (stdin → no {prompt} token)
+#     timeout: 1800
+#     env: [MYTOOL_API_KEY]          # allowlist: ONLY these (+ a safe base:
+#                                    # PATH/HOME/locale) reach the agent; it
+#                                    # does NOT inherit GH_TOKEN/SSH/cloud creds.
+#                                    # Omit `env` to inherit everything (the
+#                                    # backward-compatible default).
+#     sandbox: fs+no-net             # none | fs-only | fs+no-net  (bubblewrap;
+#                                    # fs+no-net = no network + creds/other repos
+#                                    # hidden. Needs bwrap + unprivileged userns.)
+
+# What to do when a profile requests a sandbox this host can't provide:
+#   refuse   (default) — refuse to run rather than silently run unconfined
+#   warn-run           — run UNSANDBOXED with a logged warning
+# sandbox_fallback: refuse
+
 notifications:
   # Layers 1-4 (file-based) are always-on and require no config here.
   # External adapters (ntfy, slack, etc.) are out of scope for v1.
