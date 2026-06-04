@@ -32,7 +32,15 @@ import yaml
 
 from gitbulk import paths
 from gitbulk.gh import GHClient, GHError
+from gitbulk.locks import org_lock
 from gitbulk.util import atomicio
+
+#: Lock budget for the org-members cache (resource #2, node rsclk7nq). Honors
+#: security-hawk F4 (shawk7nq): the refresh (a network fetch + cache write)
+#: runs under org_lock so concurrent runs can't both refetch or race on the
+#: file. The fetch is inside the lock, so this ceiling accommodates a slow
+#: GitHub round-trip.
+_ORG_LOCK_TIMEOUT_SECONDS = 300.0
 
 if TYPE_CHECKING:
     from gitbulk.config.policy import Policy
@@ -235,15 +243,20 @@ def ensure_org_members_fresh(
     org = policy.humans.org
     if org is None:
         return None
+    ttl = policy.humans.cache_ttl_hours
     cached = load_cache(org)
-    if (
-        not force
-        and cached is not None
-        and is_fresh(cached, policy.humans.cache_ttl_hours)
-    ):
-        return None
+    if not force and cached is not None and is_fresh(cached, ttl):
+        return None  # warm fast path — no lock acquired
     how = "--refresh-org-members" if force else "org-members auto-refresh"
-    try:
-        return refresh_cache(gh, org)
-    except GHError as e:
-        raise OrgMembersRefreshError(f"{how} failed: {e}") from e
+    # Stale / missing / forced: refresh under org_lock (resource #2, node
+    # rsclk7nq) so concurrent runs don't both refetch and can't race on the
+    # cache file (security-hawk F4, shawk7nq). Double-checked — re-test
+    # freshness under the lock in case another run just refreshed it.
+    with org_lock(org, timeout=_ORG_LOCK_TIMEOUT_SECONDS):
+        cached = load_cache(org)
+        if not force and cached is not None and is_fresh(cached, ttl):
+            return None
+        try:
+            return refresh_cache(gh, org)
+        except GHError as e:
+            raise OrgMembersRefreshError(f"{how} failed: {e}") from e

@@ -1462,10 +1462,14 @@ Gitbulk Triage Tool = goal:
             a deleted branch or lose a fetch (a real lost update, not benign).
 
           org_lock(org)              org-<org>.lock        EX
-            Around ensure_org_members_fresh's refresh->save. OPTIMIZATION,
-            not correctness: the lost update is benign (both writers store
-            authoritative membership); the lock only dedups redundant GitHub
-            fetches.
+            Around ensure_org_members_fresh's refresh->save. Wired (not
+            skipped) to honor security-hawk F4 (shawk7nq): the refresh must
+            not race on the cache file. Implemented with DOUBLE-CHECKED
+            locking inside the helper — the warm fast path returns BEFORE
+            taking the lock, so steady-state runs never contend; only an
+            actual refresh locks (and re-checks freshness in case a peer just
+            refreshed). The lost update was already benign post-Phase-0
+            (atomic write); the lock additionally dedups redundant fetches.
 
           sentinel_lock()            attention.lock        EX
             Around set/clear of the ATTENTION sentinel (check-then-act).
@@ -1487,6 +1491,17 @@ Gitbulk Triage Tool = goal:
         each acquired and released before the next. The multi-minute
         gh-fetch / preflight phases run under NO lock. This both removes the
         coarse blocking and shrinks every hold to milliseconds.
+
+        WHERE THE LOCKS LIVE: org_lock, default_branches_lock, and
+        watchdog_ack_lock are acquired INSIDE their shared helpers
+        (ensure_org_members_fresh, prime_default_branches, record_ack) rather
+        than at each call site — DRY and unforgettable for new subcommands.
+        default_branches_lock wraps only the file read-modify-write (it
+        RE-READS under the lock so a concurrent prime is merged, not lost);
+        the GraphQL prefetch runs OUTSIDE it so commands never serialize on
+        each other's network fetch. repo_lock, run_state_lock, and
+        sentinel_lock are acquired at the handler/_finish call sites (they
+        need the per-command timeout/label and the per-repo slug).
 
         DEADLOCK SAFETY: the structure is PREDOMINANTLY FLAT — at most one
         lock is held at a time in almost all paths (org/default_branches are

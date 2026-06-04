@@ -42,7 +42,13 @@ import yaml
 
 from gitbulk import paths
 from gitbulk.gh import GHClient
+from gitbulk.locks import default_branches_lock
 from gitbulk.util import atomicio
+
+#: Lock budget for the default-branches cache (resource #3, node rsclk7nq).
+#: The critical section is file-only (load->merge->save, no network), so this
+#: is a generous ceiling on a pathological stuck holder, not a real wait.
+_LOCK_TIMEOUT_SECONDS = 60.0
 
 SCHEMA_VERSION = 1
 
@@ -212,28 +218,32 @@ def prime_default_branches(
     if missing:
         gh.prefetch_default_branches(missing, on_progress=on_progress)
 
-    # Persist. Start from the existing file so slugs not in this run's
-    # ``slugs`` list survive (a different cron entry may use a different
-    # repos.txt subset).
-    merged: dict[str, CachedBranch] = dict(file_cache)
-    # Fresh entries: keep as-is (already in merged from file_cache).
-    # Freshly-fetched entries: read back from gh's in-process cache and
-    # stamp with `now`. A slug in `missing` that gh couldn't resolve
-    # (deleted repo) won't be in the in-process cache — drop any stale
-    # file entry for it so we don't keep serving a dead branch forever.
+    # Persist under default_branches_lock (resource #3, node rsclk7nq). The
+    # network prefetch above ran UNLOCKED so commands never serialize on each
+    # other's GraphQL fetch; the lock wraps only the file read-modify-write.
+    # Crucially we RE-READ the file inside the lock so a concurrent prime (e.g.
+    # another cron entry with a different repos.txt subset) is merged in rather
+    # than lost — the earlier `file_cache` read was just for the freshness/
+    # missing decision and may now be stale.
     resolved = gh.cached_default_branches()
     resolved_archived = gh.cached_archived()
-    for slug in missing:
-        branch = resolved.get(slug)
-        if branch is not None:
-            merged[slug] = CachedBranch(
-                branch=branch,
-                fetched_at=now,
-                archived=bool(resolved_archived.get(slug, False)),
-            )
-        else:
-            merged.pop(slug, None)
-    save_cache(merged)
+    with default_branches_lock(timeout=_LOCK_TIMEOUT_SECONDS):
+        merged: dict[str, CachedBranch] = dict(load_cache())
+        # Freshly-fetched entries: read back from gh's in-process cache and
+        # stamp with `now`. A slug in `missing` that gh couldn't resolve
+        # (deleted repo) won't be in the in-process cache — drop any stale
+        # file entry for it so we don't keep serving a dead branch forever.
+        for slug in missing:
+            branch = resolved.get(slug)
+            if branch is not None:
+                merged[slug] = CachedBranch(
+                    branch=branch,
+                    fetched_at=now,
+                    archived=bool(resolved_archived.get(slug, False)),
+                )
+            else:
+                merged.pop(slug, None)
+        save_cache(merged)
 
 
 __all__ = [
