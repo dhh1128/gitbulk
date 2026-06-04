@@ -252,6 +252,13 @@ def _log_paths(log_dir: Path, key: str) -> tuple[Path, Path, Path]:
     )
 
 
+def _redact_argv(argv: list[str], prompt: str) -> list[str]:
+    """Return ``argv`` with any element equal to the (possibly large/sensitive)
+    prompt replaced by a length placeholder, for the audit record (SEC-F5)."""
+    placeholder = f"<prompt:{len(prompt)} chars>"
+    return [placeholder if a == prompt else a for a in argv]
+
+
 def _write_meta(
     meta_path: Path,
     *,
@@ -262,6 +269,8 @@ def _write_meta(
     finished_at: datetime,
     duration_seconds: float,
     timed_out: bool,
+    agent_argv: list[str] | None = None,
+    agent_env_keys: list[str] | None = None,
 ) -> None:
     payload = {
         "key": key,
@@ -271,6 +280,13 @@ def _write_meta(
         "finished_at": finished_at.isoformat(),
         "duration_seconds": round(duration_seconds, 6),
         "timed_out": timed_out,
+        # SEC-F5: persist the EFFECTIVE agent invocation (prompt elided) so the
+        # granted authority — which binary, sandbox wrapper, and which env vars
+        # — is auditable after the fact. ``agent_env_keys`` is the sorted list
+        # of env-var NAMES (never values); ``null`` means the full parent
+        # environment was inherited.
+        "agent_argv": agent_argv,
+        "agent_env_keys": agent_env_keys,
     }
     meta_path.write_text(yaml.safe_dump(payload, sort_keys=False))
 
@@ -357,6 +373,10 @@ def _run_one(
         stdin_payload = target.input_text
         use_stdin = target.input_text is not None
         env = None
+    # SEC-F5 audit record: the effective argv (prompt elided) + env-var names.
+    audit_argv = _redact_argv(argv, target.prompt)
+    audit_env_keys = sorted(env.keys()) if env is not None else None
+
     # Children write directly to the log files; we never buffer
     # gigabytes of triage output in memory.
     stdout_fh = stdout_path.open("w")
@@ -396,6 +416,8 @@ def _run_one(
             finished_at=finished_at,
             duration_seconds=duration,
             timed_out=False,
+            agent_argv=audit_argv,
+            agent_env_keys=audit_env_keys,
         )
         if on_progress is not None:
             on_progress(target.key, "failed")
@@ -479,6 +501,8 @@ def _run_one(
         finished_at=finished_at,
         duration_seconds=duration,
         timed_out=timed_out,
+        agent_argv=audit_argv,
+        agent_env_keys=audit_env_keys,
     )
     if on_progress is not None:
         on_progress(target.key, status)

@@ -791,6 +791,22 @@ def _run_under_lock(
         if name != default_name:
             backends[key] = backend_by_name[name]
 
+    # SEC-F4: a profile that requested a sandbox but ran UNSANDBOXED under
+    # `sandbox_fallback: warn-run` must leave a durable signal, not just a
+    # logging.warning that cron swallows. Record a WARNING per downgraded agent
+    # and force ATTENTION so the operator actually sees it.
+    sandbox_downgraded = False
+    for agent_name, backend in backend_by_name.items():
+        if getattr(backend, "sandbox_downgraded", False):
+            sandbox_downgraded = True
+            rs.record_error(
+                f"agent {agent_name!r} ran UNSANDBOXED: requested sandbox "
+                f"{getattr(backend, 'requested_sandbox', '?')!r} but bubblewrap "
+                f"is unavailable (sandbox_fallback=warn-run)",
+                level="WARNING",
+                context={"agent": agent_name},
+            )
+
     # 10. Run the bounded pool.
     log_dir = rs.run_dir / "dispatch-logs"
     concurrency = int(getattr(args, "concurrency", _DEFAULT_CONCURRENCY))
@@ -926,7 +942,7 @@ def _run_under_lock(
     # owns the push, so a push it refused or that failed is something the
     # operator must see (this.i agpriv8n).
     attention_results = _attention_results(results)
-    if attention_results or push_problem_keys:
+    if attention_results or push_problem_keys or sandbox_downgraded:
         exit_code = EXIT_ATTENTION_NEEDED
     elif skipped_repos:
         exit_code = EXIT_INVARIANT_SKIPPED

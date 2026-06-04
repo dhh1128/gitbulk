@@ -501,6 +501,41 @@ def test_sandbox_unavailable_warn_run_downgrades(monkeypatch, caplog):
         inv = b.plan("p", working_directory=Path("/wt"))
     assert inv.argv[0] == "/canonical/tool"  # unsandboxed
     assert any("UNSANDBOXED" in r.message for r in caplog.records)
+    # SEC-F4: the downgrade is exposed so the caller can surface it durably.
+    assert b.sandbox_downgraded is True
+    assert b.requested_sandbox == "fs-only"
+
+
+def test_no_downgrade_flag_when_sandbox_available(monkeypatch):
+    monkeypatch.setattr("gitbulk.agent.bwrap_available", lambda: True)
+    monkeypatch.setattr("gitbulk.agent.wrap_argv", lambda argv, **k: argv)
+    b = CommandAgentBackend(_profile(sandbox="fs-only"))
+    assert b.sandbox_downgraded is False
+
+
+# ─── SEC-F2: presets are secure-by-default (scoped env) ────────────────────
+
+
+def test_non_claude_presets_ship_env_allowlist():
+    # Each non-claude preset scopes env so it does NOT inherit GH_TOKEN/SSH/etc.
+    assert PRESETS["gemini"].env and "GEMINI_API_KEY" in PRESETS["gemini"].env
+    assert PRESETS["cursor"].env == ("CURSOR_API_KEY",)
+    # copilot legitimately needs the GitHub token (documented tension).
+    assert "GH_TOKEN" in PRESETS["copilot"].env
+    # None of them silently inherit the full environment.
+    for name in ("gemini", "copilot", "cursor"):
+        assert PRESETS[name].env is not None
+
+
+def test_gemini_preset_backend_scopes_env(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "secret")
+    monkeypatch.setenv("GEMINI_API_KEY", "key")
+    monkeypatch.setenv("PATH", "/bin")
+    b = backend_for(Policy(default_agent="gemini"), None)
+    env = b.plan("p").env
+    assert env is not None
+    assert env.get("GEMINI_API_KEY") == "key"
+    assert "GH_TOKEN" not in env
 
 
 def test_sandbox_none_never_probes(monkeypatch):

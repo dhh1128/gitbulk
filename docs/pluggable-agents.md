@@ -200,9 +200,10 @@ pushes.
 `--dangerously-skip-permissions` / `--yolo` / `--allow-all-tools` / `--force`
 are what make unattended runs possible *and* what remove every in-agent safety
 net. They live explicitly in each profile so the user consciously opts each
-agent into full autonomy. gitbulk **logs the exact argv it will run** (prompt
-elided) at dispatch start, so cron logs show precisely what authority was
-granted to which binary.
+agent into full autonomy. gitbulk **persists the exact effective argv** (prompt
+elided) plus the sandbox wrapper and the env-var *names* per target in that
+run's `dispatch-logs/<key>.meta.yaml` (`agent_argv` / `agent_env_keys`), so the
+authority granted to which binary is auditable after the fact (SEC-F5).
 
 The verdict stays advisory: gitbulk never trusts `RESOLVED:` as proof that work
 happened — §4's independent verification gates every irreversible op.
@@ -215,9 +216,14 @@ A subprocess inherits the *entire* environment — every agent would otherwise g
 your `GH_TOKEN`, SSH agent socket, and all API keys. Each profile gets an
 optional `env` **allowlist**: only the named variables (plus a minimal safe base:
 `PATH`, `HOME`, `LANG`, `TERM`, …) are passed through, and per-agent extras
-(e.g. `GEMINI_API_KEY`) can be injected. Default — for backward compatibility —
-is today's full passthrough, but the docs flag it as a foot-gun and presets opt
-into a scoped set.
+(e.g. `GEMINI_API_KEY`) can be injected. **The built-in non-Claude presets are
+secure by default (SEC-F2): each ships an `env` allowlist** (gemini → its API
+key; cursor → `CURSOR_API_KEY`; copilot → `GH_TOKEN`/`GITHUB_TOKEN`, since it
+authenticates via GitHub — prefer a scoped token there), so `default_agent:
+gemini` does **not** hand the agent your `GH_TOKEN`/SSH/AWS. Omitting `env` on a
+custom profile still inherits the full environment (the backward-compatible
+escape hatch), but that is a foot-gun. Note env scoping stops *environment*-borne
+leakage only; filesystem isolation (`~/.ssh` etc.) needs the §7 sandbox.
 
 With §4 in force, the `resolve-conflicts` agent needs *no* credentials at all, so
 its env can be scrubbed down to the bare toolchain minimum.

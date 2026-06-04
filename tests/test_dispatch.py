@@ -763,6 +763,74 @@ def test_dispatch_default_agent_sandbox_unavailable_refuses(
     assert created == []  # aborted before any worktree
 
 
+def test_dispatch_sandbox_warn_run_runs_but_flags_attention(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """SEC-F4: with sandbox_fallback=warn-run and bwrap unavailable, the run
+    proceeds UNSANDBOXED but records a durable WARNING and raises ATTENTION —
+    not just a logging.warning cron would swallow."""
+    monkeypatch.setattr("gitbulk.agent.bwrap_available", lambda: False)
+    write_config(
+        repos_slugs=["dhh1128/alpha"],
+        extra={
+            "default_agent": "gemini",
+            "agents": {"gemini": {"sandbox": "fs-only"}},
+            "sandbox_fallback": "warn-run",
+        },
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake_clones("dhh1128/alpha")
+    pr = _make_pr(slug="dhh1128/alpha", number=1)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
+    )
+    _stub_worktree_create(monkeypatch, paths_seen=[])
+    _stub_worktree_remove(monkeypatch, removed=[])
+    _stub_is_conflict(monkeypatch, conflicts_for_paths=[])
+    ran = {"called": False}
+
+    def _exec_wrapper(targets, *, claude, log_dir, concurrency,
+                      timeout_per_target, model=None, backends=None):
+        ran["called"] = True
+        log_dir.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        out = []
+        for t in targets:
+            (log_dir / f"{t.key}.stdout.log").write_text("")
+            (log_dir / f"{t.key}.stderr.log").write_text("")
+            out.append(ExecResult(
+                key=t.key, status="completed", exit_code=0,
+                stdout_path=log_dir / f"{t.key}.stdout.log",
+                stderr_path=log_dir / f"{t.key}.stderr.log",
+                started_at=now, finished_at=now, duration_seconds=0.0,
+            ))
+        return out
+
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.execute_targets", _exec_wrapper
+    )
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, apply=True, code_root=code_root,
+                   skip_check=_LOCAL_SKIPS)
+    )
+    assert ran["called"] is True  # it ran (did not refuse)
+    assert rc == EXIT_ATTENTION_NEEDED  # but flagged for attention
+    latest = paths.latest_run_symlink("dispatch").resolve()
+    errors = [
+        json.loads(line)
+        for line in (latest / "errors.log").read_text().splitlines()
+        if line.strip()
+    ]
+    assert any("ran UNSANDBOXED" in e["message"] for e in errors)
+
+
 def test_dispatch_per_repo_sandbox_refusal_skips_only_that_pr(
     monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
     prompt_file, fake_clones,

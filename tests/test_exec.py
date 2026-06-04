@@ -300,6 +300,58 @@ def test_happy_path_three_targets_all_complete(claude_fake, tmp_log_dir, tmp_wd)
         assert meta["timed_out"] is False
 
 
+def test_meta_records_redacted_agent_argv_env_none(claude_fake, tmp_log_dir, tmp_wd):
+    """SEC-F5: meta.yaml records the effective argv with the prompt elided and
+    env-keys null when the full environment is inherited."""
+    script = _FakeRunnerScript()
+    script.default = {"exit_code": 0, "stdout_text": "ok\n"}
+    execute_targets(
+        [ExecTarget(key="t", working_directory=tmp_wd, prompt="SECRET PROMPT")],
+        claude=claude_fake,
+        log_dir=tmp_log_dir,
+        _popen_factory=script,
+    )
+    meta = yaml.safe_load((tmp_log_dir / "t.meta.yaml").read_text())
+    assert "SECRET PROMPT" not in meta["agent_argv"]
+    assert "<prompt:13 chars>" in meta["agent_argv"]
+    assert meta["agent_argv"][0] == "claude"
+    assert meta["agent_env_keys"] is None  # FakeClaudeClient.plan inherits
+
+
+def test_meta_records_scoped_env_keys(tmp_log_dir, tmp_wd):
+    """SEC-F5: when a backend scopes the env, meta records the var NAMES only."""
+
+    class _ScopedBackend:
+        def plan(self, prompt, **kwargs):
+            from gitbulk.claude import AgentInvocation
+
+            return AgentInvocation(
+                argv=["/canonical/agent", "-p", prompt],
+                use_stdin=False,
+                stdin_data=None,
+                env={"AGENT_KEY": "v", "PATH": "/bin"},
+                timeout=10.0,
+            )
+
+    captured_env = {}
+
+    def factory(argv, *, cwd, stdin, stdout, stderr, text, env=None):
+        captured_env["env"] = env
+        return _FakePopen(argv, cwd=None, stdout=stdout, stderr=stderr)
+
+    execute_targets(
+        [ExecTarget(key="t", working_directory=tmp_wd, prompt="p")],
+        claude=_ScopedBackend(),
+        log_dir=tmp_log_dir,
+        _popen_factory=factory,
+    )
+    # The scoped env reached the child...
+    assert captured_env["env"] == {"AGENT_KEY": "v", "PATH": "/bin"}
+    # ...and only the NAMES (sorted) are persisted — never the values.
+    meta = yaml.safe_load((tmp_log_dir / "t.meta.yaml").read_text())
+    assert meta["agent_env_keys"] == ["AGENT_KEY", "PATH"]
+
+
 def test_one_target_fails_others_continue(claude_fake, tmp_log_dir, tmp_wd):
     script = _FakeRunnerScript()
     script.by_prompt["bad"] = {"exit_code": 1, "stderr_text": "boom\n"}

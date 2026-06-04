@@ -144,23 +144,36 @@ PRESETS: dict[str, AgentProfile] = {
         model_args=("--model", MODEL_PLACEHOLDER),
         model="claude-sonnet-4-6",
     ),
+    # Non-claude presets are SECURE BY DEFAULT (SEC-F2): each ships an ``env``
+    # allowlist so the agent gets only its own API credential plus the minimal
+    # safe base — NOT the operator's GH_TOKEN / SSH agent / AWS / npm tokens.
+    # (The exact var names, like the flags, must be verified against each CLI;
+    # extend the allowlist in config if a tool needs more.) Note: env scoping
+    # stops *environment*-borne secret leakage only — filesystem isolation
+    # (reading ~/.ssh etc.) needs the ``sandbox`` (this.i agsbx3k). copilot is
+    # the awkward case: it authenticates via the GitHub token, so its allowlist
+    # necessarily includes GH_TOKEN/GITHUB_TOKEN — prefer a scoped token
+    # (agtok2n) there.
     "gemini": AgentProfile(
         name="gemini",
         command=("gemini", "-p", PROMPT_PLACEHOLDER, "--yolo"),
         model_args=("-m", MODEL_PLACEHOLDER),
         model="gemini-2.5-pro",
+        env=("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_GENAI_USE_VERTEXAI"),
     ),
     "copilot": AgentProfile(
         name="copilot",
         command=("copilot", "-p", PROMPT_PLACEHOLDER, "--allow-all-tools"),
         model_args=("--model", MODEL_PLACEHOLDER),
         model=None,
+        env=("GH_TOKEN", "GITHUB_TOKEN"),
     ),
     "cursor": AgentProfile(
         name="cursor",
         command=("cursor-agent", "-p", PROMPT_PLACEHOLDER, "--force"),
         model_args=("--model", MODEL_PLACEHOLDER),
         model=None,
+        env=("CURSOR_API_KEY",),
     ),
 }
 
@@ -251,7 +264,11 @@ class CommandAgentBackend:
         # Resolve the effective sandbox now (this.i agsbx3k). If the profile
         # asks for a sandbox the host can't provide, REFUSE by default rather
         # than silently downgrade (a silent downgrade defeats the purpose);
-        # ``warn-run`` opts into running unsandboxed with a loud warning.
+        # ``warn-run`` opts into running unsandboxed — but records a DURABLE
+        # signal the caller surfaces (SEC-F4), not just a logging.warning that
+        # is lost under cron.
+        self.requested_sandbox = profile.sandbox
+        self.sandbox_downgraded = False
         sb = profile.sandbox
         if sb != SANDBOX_NONE and not bwrap_available():
             if sandbox_fallback == SANDBOX_FALLBACK_WARN_RUN:
@@ -262,6 +279,7 @@ class CommandAgentBackend:
                     profile.name,
                     sb,
                 )
+                self.sandbox_downgraded = True
                 sb = SANDBOX_NONE
             else:
                 raise AgentConfigError(
