@@ -770,6 +770,23 @@ def _stream_isatty(stream) -> bool:
         return False
 
 
+def _configure_lock_status() -> None:
+    """Install the interactive lock-status reporter when appropriate.
+
+    Auto-on only when stderr is a TTY (so cron / pipes stay silent); the live
+    "waiting on <lock> — Ns left" notice would be garbled or noisy otherwise.
+    ``GITBULK_LOCK_STATUS=off`` disables it. Node rsclk7nq UX.
+    """
+    if os.environ.get("GITBULK_LOCK_STATUS", "").strip().lower() == "off":
+        return
+    if not _stream_isatty(sys.stderr):
+        return
+    from gitbulk.locks import set_status_reporter
+    from gitbulk.util.lockstatus import TtyLockStatusReporter
+
+    set_status_reporter(TtyLockStatusReporter())
+
+
 def maybe_print_update_notice(
     subcommand: str,
     *,
@@ -990,6 +1007,7 @@ def _set_private_umask() -> None:
 def main(argv: list[str] | None = None) -> int:
     _check_python_version()
     _configure_logging()
+    _configure_lock_status()
     _set_private_umask()
     parser = build_parser()
     args = parser.parse_args(argv)

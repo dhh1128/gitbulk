@@ -1,9 +1,24 @@
 """POSIX advisory locks for gitbulk's concurrency model.
 
-Two context managers: ``global_lock`` (shared or exclusive at
-``cache_dir()/run.lock``) and ``repo_lock`` (always exclusive at
-``locks_dir()/<slug>.lock``). See this.i nodes ``lj5pqn4kr`` (why
-two locks) and ``hk5pq3nm`` (the API contract).
+Resource-scoped locking (node ``rsclk7nq``, superseding the two-lock model of
+``lj5pqn4kr``): one keyed ``fcntl.flock`` per shared resource, each acquired
+only around the section that touches it. Context managers:
+
+  - ``run_state_lock(target, mode)`` — per-subcommand run-state (resource #1)
+  - ``repo_lock(slug, mode)``        — per-repo clone + remote (resources #6-8)
+  - ``org_lock(org)``                — org-members cache (resource #2)
+  - ``default_branches_lock()``      — default-branches cache (resource #3)
+  - ``sentinel_lock()``              — ATTENTION sentinel (resource #4)
+  - ``dashboard_lock()``             — dashboard.md (resource #5)
+  - ``watchdog_ack_lock()``          — watchdog-ack cache (resource #9)
+
+The legacy single ``global_lock`` of the two-lock model (``lj5pqn4kr``) has been
+retired — every subcommand now takes only the resource locks it needs.
+
+To avoid deadlock, never hold two at once (the design is flat/non-nested); if
+nesting is ever unavoidable, acquire in this order: org -> default_branches ->
+repo(slug) -> run_state(sub) -> sentinel -> dashboard. See ``hk5pq3nm`` for the
+underlying ``_file_lock`` contract (timeout, holder metadata, pid-liveness).
 """
 
 from __future__ import annotations
@@ -28,6 +43,46 @@ _MODE_TO_OP = {
 }
 
 _POLL_INTERVAL = 0.1  # seconds; how often we retry while waiting under a timeout
+
+#: Optional lock-status reporter (node rsclk7nq UX). Default None = silent, so
+#: the library, tests, and embeds emit nothing; the CLI installs a TTY reporter
+#: so an interactive user can see when one gitbulk run is waiting on another.
+_status_reporter = None
+
+
+def set_status_reporter(reporter) -> None:
+    """Install (or clear, with ``None``) the lock-status reporter.
+
+    A reporter is duck-typed with ``waiting(label, holder, remaining,
+    elapsed)``, ``acquired(label, waited)``, and ``gave_up(label)``; it is
+    consulted only while an acquisition is actually BLOCKED (uncontended
+    acquires stay silent). It engages only when a bounded ``timeout`` is set —
+    which every CLI acquisition passes — so an indefinite ``timeout=None`` wait
+    (tests/embeds) keeps the original blocking behavior with no status.
+    """
+    global _status_reporter
+    _status_reporter = reporter
+
+
+def _label_for(path: Path) -> str:
+    """Friendly name for a lock file, for the status line."""
+    name = path.stem  # strip the .lock suffix
+    fixed = {
+        "default-branches": "default-branches",
+        "attention": "ATTENTION sentinel",
+        "dashboard": "dashboard",
+        "watchdog-acked": "watchdog-ack",
+        "run": "global",
+    }
+    if name in fixed:
+        return fixed[name]
+    if name.startswith("runstate-"):
+        return f"run-state ({name[len('runstate-'):]})"
+    if name.startswith("org-"):
+        return f"org-members ({name[len('org-'):]})"
+    if "__" in name:  # normalized owner__repo slug
+        return f"repo ({name.replace('__', '/')})"
+    return name
 
 
 class LockTimeoutError(TimeoutError):
@@ -100,18 +155,41 @@ def _read_holder_metadata(path: Path) -> dict | None:
 
 def _acquire(fd: int, lock_op: int, lock_path: Path, timeout: float | None) -> None:
     if timeout is None:
+        # Indefinite wait: a single blocking flock, no status (the pre-feature
+        # behavior; only tests/embeds use timeout=None — the CLI always bounds).
         fcntl.flock(fd, lock_op)
         return
-    deadline = time.monotonic() + timeout
+    reporter = _status_reporter
+    label = _label_for(lock_path) if reporter is not None else ""
+    start = time.monotonic()
+    deadline = start + timeout
+    holder: dict | None = None
+    waited = False
     while True:
         try:
             fcntl.flock(fd, lock_op | fcntl.LOCK_NB)
-            return
+            break
         except BlockingIOError:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if reporter is not None:
+                    reporter.gave_up(label=label)
                 raise LockTimeoutError(lock_path, _read_holder_metadata(lock_path))
+            waited = True
+            if reporter is not None:
+                if holder is None:  # read the holder once, not every tick
+                    holder = _read_holder_metadata(lock_path)
+                reporter.waiting(
+                    label=label,
+                    holder=holder,
+                    remaining=remaining,
+                    elapsed=time.monotonic() - start,
+                )
             time.sleep(min(_POLL_INTERVAL, remaining))
+    if reporter is not None:
+        reporter.acquired(
+            label=label, waited=(time.monotonic() - start) if waited else 0.0
+        )
 
 
 def _write_metadata(fd: int, subcommand: str | None) -> None:
@@ -153,29 +231,132 @@ def _file_lock(
 
 
 @contextmanager
-def global_lock(
-    mode: Literal["shared", "exclusive"],
+def repo_lock(
+    slug: str,
+    mode: Literal["shared", "exclusive"] = "exclusive",
     *,
     timeout: float | None = None,
     subcommand: str | None = None,
 ) -> Iterator[None]:
-    """Hold the global run.lock for the duration of the ``with`` block."""
+    """Hold a per-repo lock (clone + remote) for the ``with`` block.
+
+    Resource #6/#7/#8 of node ``rsclk7nq``: serializes all gitbulk work on one
+    repository. ``mode`` defaults to ``"exclusive"`` (mutating git or any
+    remote mutation); pass ``"shared"`` for read-only git (clone preflights).
+    The previously always-exclusive contract of ``hk5pq3nm.b`` is relaxed here.
+    """
     with _file_lock(
-        paths.global_lock_file(), mode, timeout=timeout, subcommand=subcommand
+        paths.repo_lock_file(slug),
+        mode,
+        timeout=timeout,
+        subcommand=subcommand,
     ):
         yield
 
 
 @contextmanager
-def repo_lock(
-    slug: str,
+def run_state_lock(
+    target: str,
+    mode: Literal["shared", "exclusive"],
     *,
     timeout: float | None = None,
     subcommand: str | None = None,
 ) -> Iterator[None]:
-    """Hold a per-repo exclusive lock for the duration of the ``with`` block."""
+    """Hold the run-state lock for subcommand ``target`` (resource #1).
+
+    Guards the ``latest-<target>`` symlink swap and ``gc.prune_runs(target)``
+    against readers. Writers (a run of ``target`` finishing) take exclusive;
+    ``show``/dashboard reads take shared. Keyed by ``target`` (the run-state
+    subcommand), which is independent of ``subcommand`` (the command actually
+    running — e.g. ``show`` reads run-state ``prune-worktrees``).
+    """
     with _file_lock(
-        paths.repo_lock_file(slug),
+        paths.named_lock_file(f"runstate-{target}"),
+        mode,
+        timeout=timeout,
+        subcommand=subcommand,
+    ):
+        yield
+
+
+@contextmanager
+def org_lock(
+    org: str,
+    *,
+    timeout: float | None = None,
+    subcommand: str | None = None,
+) -> Iterator[None]:
+    """Hold the org-members-cache lock for ``org`` (resource #2, exclusive)."""
+    with _file_lock(
+        paths.named_lock_file(f"org-{org}"),
+        "exclusive",
+        timeout=timeout,
+        subcommand=subcommand,
+    ):
+        yield
+
+
+@contextmanager
+def default_branches_lock(
+    *,
+    timeout: float | None = None,
+    subcommand: str | None = None,
+) -> Iterator[None]:
+    """Hold the default-branches-cache lock (resource #3, exclusive)."""
+    with _file_lock(
+        paths.named_lock_file("default-branches"),
+        "exclusive",
+        timeout=timeout,
+        subcommand=subcommand,
+    ):
+        yield
+
+
+@contextmanager
+def sentinel_lock(
+    *,
+    timeout: float | None = None,
+    subcommand: str | None = None,
+) -> Iterator[None]:
+    """Hold the ATTENTION-sentinel lock (resource #4, exclusive)."""
+    with _file_lock(
+        paths.named_lock_file("attention"),
+        "exclusive",
+        timeout=timeout,
+        subcommand=subcommand,
+    ):
+        yield
+
+
+@contextmanager
+def dashboard_lock(
+    *,
+    timeout: float | None = None,
+    subcommand: str | None = None,
+) -> Iterator[None]:
+    """Hold the dashboard.md lock (resource #5, exclusive)."""
+    with _file_lock(
+        paths.named_lock_file("dashboard"),
+        "exclusive",
+        timeout=timeout,
+        subcommand=subcommand,
+    ):
+        yield
+
+
+@contextmanager
+def watchdog_ack_lock(
+    *,
+    timeout: float | None = None,
+    subcommand: str | None = None,
+) -> Iterator[None]:
+    """Hold the watchdog-ack-cache lock (resource #9, exclusive).
+
+    Guards the load->modify->save in ``watchdog_ack.record_ack`` against the
+    cross-process lost-update window (the write itself is already atomic).
+    """
+    with _file_lock(
+        paths.named_lock_file("watchdog-acked"),
         "exclusive",
         timeout=timeout,
         subcommand=subcommand,

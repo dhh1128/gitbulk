@@ -333,11 +333,12 @@ def test_report_lock_timeout_exits_1(
     write_config(repos_slugs=["dhh1128/alpha"])
     fresh_org_cache("provenant-dev", ["dhh1128"])
 
-    # Inject a global_lock that raises LockTimeoutError on entry.
+    # Inject a default-branches cache lock that times out on entry (the first
+    # resource lock report hits — org cache is fresh, so prime runs early).
     class _BoomLock:
         def __enter__(self):
             raise LockTimeoutError(
-                paths.global_lock_file(),
+                paths.named_lock_file("default-branches"),
                 {"pid": 999, "started_at": "1970-01-01T00:00:00+00:00",
                  "subcommand": "merge", "alive": False},
             )
@@ -345,11 +346,9 @@ def test_report_lock_timeout_exits_1(
         def __exit__(self, *a):  # pragma: no cover — never reached
             return False
 
-    def _fake_global_lock(*a, **kw):
-        return _BoomLock()
-
     monkeypatch.setattr(
-        "gitbulk.commands.report.global_lock", _fake_global_lock
+        "gitbulk.default_branch_cache.default_branches_lock",
+        lambda *a, **kw: _BoomLock(),
     )
     fake = FakeGHClient(user={"login": "dhh1128"})
     monkeypatch.setattr(

@@ -109,6 +109,20 @@ def global_lock_file() -> Path:
     return cache_dir() / "run.lock"
 
 
+def named_lock_file(name: str) -> Path:
+    """Lock file for a keyed/singleton shared resource: ``locks/<name>.lock``.
+
+    Used by the resource-scoped locks (node ``rsclk7nq``) — e.g. names like
+    ``runstate-merge``, ``org-provenant-dev``, ``default-branches``,
+    ``attention``. Path separators and the ``.``/``..`` segments are rejected
+    so a crafted key (an attacker-controlled org/subcommand) cannot escape
+    ``locks_dir()`` — defense-in-depth mirroring the slug guard above.
+    """
+    if not name or "/" in name or "\\" in name or name in _FORBIDDEN_SEGMENTS:
+        raise ValueError(f"invalid lock name: {name!r}")
+    return locks_dir() / f"{name}.lock"
+
+
 def default_worktree_root() -> Path:
     return cache_dir() / "worktrees"
 

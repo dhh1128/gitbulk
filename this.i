@@ -1079,6 +1079,10 @@ Gitbulk Triage Tool = goal:
         process at a time (guaranteed by the global lock acquired
         upstream). read_attention silently returns None if the file
         is missing — `has_attention` is the explicit existence test.
+        UPDATE (rsclk7nq, 2026-06-03): the global lock is retired, so this
+        "exactly one writer" guarantee no longer holds for free. set/clear
+        now run under sentinel_lock() and set_attention is made atomic
+        (tmp+os.replace) so external readers never see a torn line.
 
     Implicit ATTENTION clearing = decision:
       id: aklr5pq3
@@ -1133,6 +1137,9 @@ Gitbulk Triage Tool = goal:
         `show` already holds the shared global lock, which is what guards
         the read+clear against a concurrent exclusive run swapping the
         symlink.
+        UPDATE (rsclk7nq, 2026-06-03): with global_lock retired, `show`
+        guards the symlink read via run_state_lock(sub, SH) and the
+        sentinel read+clear via sentinel_lock().
       approved-by: daniel, 2026-06-03
       supersedes-aspect-of: clip7nm4
 
@@ -1323,6 +1330,10 @@ Gitbulk Triage Tool = goal:
         Subcommands acquire global_lock() in their CLI handler
         before calling RunState.begin(). runstate.py and locks.py
         have no circular dep; locks.py is the lower layer.
+        UPDATE (rsclk7nq, 2026-06-03): global_lock is retired. RunState
+        still takes no lock and runstate.py still does not import locks.py;
+        but handlers now acquire resource-scoped locks around specific
+        sections — RunState.complete() runs under run_state_lock(sub, EX).
       approved-by: daniel, 2026-05-27
 
     Locks Module API And Semantics = decision:
@@ -1407,6 +1418,178 @@ Gitbulk Triage Tool = goal:
         contention, since fcntl.flock is per-process and threads in
         the same process all see the lock as held.
       approved-by: daniel, 2026-05-27
+
+    Resource Scoped Locking = decision:
+      id: rsclk7nq
+      why: >
+        Supersedes the two-lock model of lj5pqn4kr and extends the locks
+        API of hk5pq3nm. Resolves tension rlkrcn3p. Full spec and
+        per-command critical-section map: docs/design/resource-scoped-
+        locking.md.
+
+        PRINCIPLE: lock the RESOURCE, not the operation. A lock protects a
+        specific piece of shared state; its scope is exactly that state, no
+        wider. Contention follows data, not command identity. The old
+        single global_lock (held for an entire run) conflated three jobs —
+        serializing mutators, guarding per-subcommand run-state for readers,
+        and masking writer-vs-writer cache/sentinel races — which is why a
+        read-only `show prune-worktrees` blocked on a `prune-branches` run
+        that touched disjoint state (rlkrcn3p resolution).
+
+        SHARED RESOURCES AND THEIR LOCKS (all built on hk5pq3nm's
+        _file_lock; lock files under locks_dir()):
+
+          run_state_lock(sub, mode)  runstate-<sub>.lock   EX writers / SH show
+            Guards `latest-<sub>` symlink swap + gc.prune_runs(<sub>) vs
+            readers (show <sub>, dashboard). Keyed by SUBCOMMAND, so
+            show of subcommand X never contends with a run of subcommand Y.
+
+          repo_lock(slug, mode)      <slug>.lock           EX mutate / SH read
+            The previously-dead repo_lock, now ACTIVATED. Unifies resources
+            #6/#7/#8: the local clone (refs, .git/worktrees, index) AND
+            remote repo mutations (merge/close/branch-delete/head-push) for
+            one repo. Governing rule: any git invocation against clone
+            <slug> holds it (SH for read-only git, EX for mutating git);
+            any remote mutation to <slug> holds it EX. NOTE: hk5pq3nm.b
+            said repo_lock "takes no mode — always exclusive"; that is now
+            relaxed to shared|exclusive so clone-preflight READS
+            (local.exists/remote_matches in rebase-pr/dispatch/prune-
+            worktrees) can take it shared.
+
+          default_branches_lock()    default-branches.lock EX
+            Around prime_default_branches' load->merge->save. Mandatory:
+            the merge drops/keeps entries, so a concurrent run can resurrect
+            a deleted branch or lose a fetch (a real lost update, not benign).
+
+          org_lock(org)              org-<org>.lock        EX
+            Around ensure_org_members_fresh's refresh->save. Wired (not
+            skipped) to honor security-hawk F4 (shawk7nq): the refresh must
+            not race on the cache file. Implemented with DOUBLE-CHECKED
+            locking inside the helper — the warm fast path returns BEFORE
+            taking the lock, so steady-state runs never contend; only an
+            actual refresh locks (and re-checks freshness in case a peer just
+            refreshed). The lost update was already benign post-Phase-0
+            (atomic write); the lock additionally dedups redundant fetches.
+
+          sentinel_lock()            attention.lock        EX
+            Around set/clear of the ATTENTION sentinel (check-then-act).
+            Replaces the "no locking, guaranteed by the global lock" claim
+            in the sentinel node and in aklr5pq3.
+
+          dashboard_lock()           dashboard.lock        EX
+            Around dashboard.md render. Low stakes.
+
+          watchdog_ack_lock()        watchdog-acked.lock   EX
+            Resource #9: cache_dir()/watchdog-acked.yaml, written by
+            watchdog_ack.record_ack (load->modify->save) and read by
+            report's recent-merges watchdog. Phase 2 lock guards the
+            load-modify-save lost-update window; Phase 0 already made the
+            write itself atomic.
+
+        REFACTOR SHAPE: delete the outer `with global_lock(...)` in every
+        handler; wrap the short critical sections INSIDE _run_under_lock,
+        each acquired and released before the next. The multi-minute
+        gh-fetch / preflight phases run under NO lock. This both removes the
+        coarse blocking and shrinks every hold to milliseconds.
+
+        WHERE THE LOCKS LIVE: org_lock, default_branches_lock, and
+        watchdog_ack_lock are acquired INSIDE their shared helpers
+        (ensure_org_members_fresh, prime_default_branches, record_ack) rather
+        than at each call site — DRY and unforgettable for new subcommands.
+        default_branches_lock wraps only the file read-modify-write (it
+        RE-READS under the lock so a concurrent prime is merged, not lost);
+        the GraphQL prefetch runs OUTSIDE it so commands never serialize on
+        each other's network fetch. repo_lock, run_state_lock, and
+        sentinel_lock are acquired at the handler/_finish call sites (they
+        need the per-command timeout/label and the per-repo slug).
+
+        DEADLOCK SAFETY: the structure is PREDOMINANTLY FLAT — at most one
+        lock is held at a time in almost all paths (org/default_branches are
+        primed before the per-repo loop; repo_lock is the only in-loop lock
+        and is released each iteration). The ONE sanctioned nesting is
+        `show <sub>`'s sentinel clear, which holds sentinel_lock while still
+        holding run_state_lock(sub, SH) — i.e. run_state -> sentinel, the
+        canonical order below; nothing acquires those two in reverse (the
+        mutators take run_state at complete() and sentinel at set_attention
+        SEPARATELY, never nested), so no cycle can form. Acquisition order
+        for any nesting, documented at the lock definitions:
+          org -> default_branches -> repo(slug) -> run_state(sub)
+              -> sentinel -> dashboard
+
+        AUDITED + ENFORCED (2026-06-04, after a "prove it's deadlock-free"
+        review): a source audit confirmed org/default_branches/watchdog locks
+        are taken early (before any repo/run_state/sentinel lock), _finish
+        takes sentinel and run_state sequentially (not nested), and the lone
+        simultaneous hold is show's run_state(SH)->sentinel(EX) in canonical
+        order with no reverse pair. Two regression guards keep it true:
+        test_all_production_lock_acquisitions_pass_a_timeout (token-scans
+        src/gitbulk; fails if any `with <lock>(...)` omits timeout=) and
+        test_show_nested_sentinel_clear_is_bounded_not_a_hang (drives the one
+        nested path under contention -> bounded LockTimeoutError, not a hang).
+
+        WAIT-FOREVER vs TIMEOUT: every production acquisition passes a bounded
+        timeout (tmlk5pq3: 300s read / 1800s mutate; 60s file-only cache
+        locks; 300s org refresh). On contention the poll loop raises
+        LockTimeoutError -> handler catches -> exit 1 + holder metadata on
+        stderr, no ATTENTION. The keyed constructors default to None
+        (block-forever) per hk5pq3nm.c, so safety lives at the call sites and
+        the token-scan guard makes a forgotten timeout= a test failure. Worst
+        observable case is therefore a bounded timeout + clean exit 1, never a
+        hang.
+
+        kp7nw4mq.h UPDATE: that node said "subcommands acquire global_lock()
+        in their CLI handler before RunState.begin()". Under rsclk7nq there
+        is no single global_lock; RunState.begin() still takes no lock, but
+        the handler now acquires the SPECIFIC resource locks around the
+        specific sections (RunState.complete() under run_state_lock(sub,EX)).
+        runstate.py still does not import locks.py (no cycle).
+
+        PHASE 0 HARDENING (independent of the lock model; ships first
+        because finer locks expose more concurrency that these races would
+        otherwise corrupt — see docs design doc §7):
+          (1) Unique tmp names in every atomic writer (tempfile.mkstemp in
+              the target dir, as update.py already does) — the fixed
+              "<name>.tmp" suffix means two concurrent writers of the same
+              file collide and one os.replace hits ENOENT. This refines
+              kp7nw4mq.c/.d/.e (which specified the tmp+rename pattern but
+              with a fixed, collision-prone tmp name).
+          (2) Atomic set_attention AND watchdog_ack.record_ack (tmp+
+              os.replace) — both did a bare write_text, so an external
+              reader (tmux status, report's watchdog) could see a torn file.
+          (3) runid uniquifier — RunState.begin does mkdir(exist_ok=False)
+              on a second-resolution runid (3pw7qkn2), so two same-sub runs
+              in the same second crash. A lock cannot fix this (both compute
+              the same runid); add a pid/counter suffix or retry on
+              FileExistsError.
+
+        DELIBERATE CONSEQUENCE (user-approved 2026-06-03): two `merge
+        --apply` runs may overlap on DIFFERENT repos. repo_lock(slug)
+        guarantees they never touch the SAME repo concurrently; the old
+        "one mutating gitbulk at a time" global guarantee is intentionally
+        dropped. tmlk5pq3's bounded-timeout policy and LockTimeoutError
+        handling carry over unchanged to every keyed lock.
+
+        LOCK-STATUS UX (2026-06-04): locks._acquire calls a pluggable,
+        default-silent reporter (set_status_reporter) while BLOCKED, so an
+        interactive user running two commands sees one waiting on the other.
+        cli installs util/lockstatus.TtyLockStatusReporter; library/tests stay
+        silent (no behavior change). Wait-only (uncontended acquires render
+        nothing); live stderr line with a COUNTDOWN to timeout; folds into an
+        active Progress bar (progress.active_progress + set_wait_suffix) so a
+        repo_lock wait mid-apply shares the bar's line. Auto-on when stderr is
+        a TTY; GITBULK_LOCK_STATUS=off disables; only engages when a bounded
+        timeout is set (timeout=None keeps the original blocking flock, no
+        status). Full design: docs/design/resource-scoped-locking.md §11.
+
+        ROLLOUT (all landed): Phase 0 (hardening) -> Phase 1 (show/summarize
+        off global_lock onto run_state_lock — fixed the reported symptom) ->
+        Phase 2 (repo_lock + cache/org/sentinel locks across report + the six
+        mutators; global_lock function REMOVED from locks.py). The
+        global_lock_file() path helper is kept only as a holder placeholder in
+        a few tests.
+      approved-by: daniel, 2026-06-03
+      supersedes: lj5pqn4kr
+      extends: hk5pq3nm
 
     Business Day Arithmetic API = decision:
       id: gmw3npk7
@@ -1516,6 +1699,7 @@ Gitbulk Triage Tool = goal:
         (would serialize everything, including independent reads), and
         no locking (concurrent mutating ops could produce inconsistent
         run state and racing worktree creation).
+      superseded-by: rsclk7nq    # 2026-06-03 resource-scoped model; global_lock retired, repo_lock activated
 
     Four Layer File Based Notification = decision:
       id: tp4kq2nr
@@ -2980,6 +3164,24 @@ Gitbulk Triage Tool = goal:
         call — do not silently pick one. Whichever wins, the dead
         repo_lock() code and the locks.py comment must be reconciled with
         the chosen node. See reviews/review-panel-2026-05-29.md (MNT-F1).
+      resolution: >
+        RESOLVED 2026-06-03, neither A nor B as framed — the user chose a
+        THIRD, richer exit prompted by a concrete symptom: `gitbulk show
+        prune-worktrees` blocking for the entire multi-minute run of
+        `gitbulk prune-branches`, two commands that touch disjoint state.
+        That symptom proved the global lock's coarseness was a real cost,
+        not a speculative one, so option A (ratify global-exclusive) was
+        rejected. Instead: lock the RESOURCE, not the operation. The single
+        global lock is decomposed into resource-scoped locks (per-subcommand
+        run-state, per-org cache, default-branches, sentinel, dashboard) AND
+        repo_lock() is activated per-slug for both clone and remote
+        mutations — which honors lj5pqn4kr's intent (per-repo concurrency)
+        while going further. global_lock is retired entirely. The deliberate
+        consequence the user accepted: two `merge --apply` runs may now
+        overlap on DIFFERENT repos (repo_lock serializes same-repo work).
+        Full model in decision rsclk7nq and docs/design/resource-scoped-
+        locking.md.
+      resolved-by: daniel, 2026-06-03
 
     Fork-Origin PR Handling For Mutating Pushes = tension:
       id: frkpr5kq

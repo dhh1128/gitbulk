@@ -481,3 +481,40 @@ def test_not_implemented_handler_returns_99():
     assert rc == EXIT_NOT_IMPLEMENTED
     assert "future-cmd" in err.getvalue()
     assert "not yet implemented" in err.getvalue()
+
+
+# ─── lock-status reporter install (node rsclk7nq UX) ────────────────────────
+
+
+def test_configure_lock_status_installs_on_tty(monkeypatch):
+    import gitbulk.locks as L
+    from gitbulk.cli import _configure_lock_status
+    from gitbulk.util.lockstatus import TtyLockStatusReporter
+
+    monkeypatch.setattr(L, "_status_reporter", None)
+    monkeypatch.delenv("GITBULK_LOCK_STATUS", raising=False)
+    monkeypatch.setattr("gitbulk.cli._stream_isatty", lambda s: True)
+    _configure_lock_status()
+    assert isinstance(L._status_reporter, TtyLockStatusReporter)
+
+
+def test_configure_lock_status_disabled_by_env(monkeypatch):
+    import gitbulk.locks as L
+    from gitbulk.cli import _configure_lock_status
+
+    monkeypatch.setattr(L, "_status_reporter", None)
+    monkeypatch.setenv("GITBULK_LOCK_STATUS", "off")
+    monkeypatch.setattr("gitbulk.cli._stream_isatty", lambda s: True)
+    _configure_lock_status()
+    assert L._status_reporter is None
+
+
+def test_configure_lock_status_silent_on_non_tty(monkeypatch):
+    import gitbulk.locks as L
+    from gitbulk.cli import _configure_lock_status
+
+    monkeypatch.setattr(L, "_status_reporter", None)
+    monkeypatch.delenv("GITBULK_LOCK_STATUS", raising=False)
+    monkeypatch.setattr("gitbulk.cli._stream_isatty", lambda s: False)
+    _configure_lock_status()
+    assert L._status_reporter is None

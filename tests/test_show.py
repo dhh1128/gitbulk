@@ -10,6 +10,7 @@ independent of the report/summarize/dispatch handlers.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import os
 import sys
 from contextlib import redirect_stderr, redirect_stdout
@@ -258,12 +259,11 @@ def test_show_lock_timeout_exits_1(monkeypatch, isolated_xdg, capsys):
         def __exit__(self, *a):  # pragma: no cover — never reached
             return False
 
-    def _fake_global_lock(*a, **kw):
+    def _fake_lock(*a, **kw):
         return _BoomLock()
 
-    monkeypatch.setattr(
-        "gitbulk.commands.show.global_lock", _fake_global_lock
-    )
+    # show <sub> now acquires run_state_lock (resource-scoped, node rsclk7nq).
+    monkeypatch.setattr("gitbulk.commands.show.run_state_lock", _fake_lock)
     rc = show_handler(_make_args(show_subcommand="report"))
     assert rc == EXIT_STRUCTURAL_FAILURE
     err = capsys.readouterr().err
@@ -417,4 +417,86 @@ def test_clear_if_viewing_flagged_run_noop_on_unrecoverable_runid(isolated_xdg):
     weird_dir = paths.runs_dir() / "no-suffix-here"
     weird_dir.mkdir(parents=True, exist_ok=True)
     _clear_if_viewing_flagged_run("report", weird_dir)
+    assert sentinel.has_attention()
+
+
+# ─── Resource-scoped locking regression (node rsclk7nq) ─────────────────────
+
+
+def _hold_run_state_lock(subcommand: str) -> int:
+    """EX-flock the run-state lock file for ``subcommand`` (simulate another
+    holder, e.g. a concurrent run finishing). Caller must os.close the fd."""
+    fd = os.open(
+        paths.named_lock_file(f"runstate-{subcommand}"), os.O_RDWR | os.O_CREAT, 0o644
+    )
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def test_show_not_blocked_by_other_subcommand_run_lock(
+    isolated_xdg, monkeypatch, capsys
+):
+    """The reported bug: `show prune-worktrees` must NOT block while a
+    `prune-branches` run holds ITS run-state lock (a disjoint resource)."""
+    monkeypatch.setattr("gitbulk.commands.show._LOCK_TIMEOUT_SECONDS", 0.3)
+    fd = _hold_run_state_lock("prune-branches")
+    try:
+        rc = show_handler(_make_args(show_subcommand="prune-worktrees"))
+    finally:
+        os.close(fd)
+    err = capsys.readouterr().err
+    # Returns promptly (no prune-worktrees runs yet) — crucially NOT a timeout.
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    assert "timed out" not in err
+    assert "no prune-worktrees runs yet" in err
+
+
+def test_show_serializes_on_same_subcommand_run_lock(
+    isolated_xdg, monkeypatch, capsys
+):
+    """Control: `show prune-worktrees` DOES wait on prune-worktrees' own
+    run-state lock — proving the lock is real and correctly keyed."""
+    monkeypatch.setattr("gitbulk.commands.show._LOCK_TIMEOUT_SECONDS", 0.3)
+    fd = _hold_run_state_lock("prune-worktrees")
+    try:
+        rc = show_handler(_make_args(show_subcommand="prune-worktrees"))
+    finally:
+        os.close(fd)
+    err = capsys.readouterr().err
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    assert "timed out" in err
+
+
+def test_show_nested_sentinel_clear_is_bounded_not_a_hang(
+    report_run, monkeypatch, capsys
+):
+    """The ONE nested acquisition in the whole system — `show <sub>` holds
+    run_state_lock(sub, SH) and then takes sentinel_lock(EX) to clear the
+    matching ATTENTION sentinel — is BOUNDED, not a hang.
+
+    Holding the sentinel lock from 'another process' forces show through that
+    nested path under contention. It must surface a clean LockTimeoutError
+    (exit 1), proving the inner lock can never deadlock: the worst case is a
+    bounded timeout, never a forever-wait (node rsclk7nq deadlock argument)."""
+    from gitbulk import sentinel
+    from gitbulk.commands.show import _runid_from_run_dir
+
+    runid = _runid_from_run_dir(report_run, "report")
+    sentinel.set_attention(2, "report", runid, "needs a human")
+    monkeypatch.setattr("gitbulk.commands.show._LOCK_TIMEOUT_SECONDS", 0.3)
+
+    # Another holder owns the sentinel lock; show holds run_state("report", SH)
+    # and then blocks trying to take sentinel_lock(EX) for the clear.
+    fd = os.open(
+        paths.named_lock_file("attention"), os.O_RDWR | os.O_CREAT, 0o644
+    )
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        rc = show_handler(_make_args(show_subcommand="report"))
+    finally:
+        os.close(fd)
+    err = capsys.readouterr().err
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    assert "timed out" in err
+    # The sentinel was NOT cleared (we held its lock), so it survives intact.
     assert sentinel.has_attention()

@@ -59,7 +59,7 @@ from gitbulk.invariants import (
     run_chain,
 )
 from gitbulk.invariants.base import Invariant, InvariantKind
-from gitbulk.locks import LockTimeoutError, global_lock
+from gitbulk.locks import LockTimeoutError, run_state_lock, sentinel_lock
 from gitbulk.org_members_cache import (
     OrgMembersRefreshError,
     ensure_org_members_fresh,
@@ -520,25 +520,17 @@ def report_handler(args: argparse.Namespace) -> int:
     spec = resolve_filter_spec(args, policy)
     repos, repos_excluded = select_repos(repos, spec)
 
-    # 2. Acquire global lock (shared, 300s timeout per tmlk5pq3). The
-    # contextmanager raises LockTimeoutError on __enter__; per tmlk5pq3
-    # the timeout is surfaced as exit 1 + stderr message, no ATTENTION
-    # sentinel.
-    #
-    # NB: --refresh-org-members runs INSIDE the lock per security-hawk
-    # F4 (2026-05-28). The network call + cache write are within the
-    # audit envelope, and a parallel gitbulk run cannot race on the
-    # cache file.
+    # 2. Run the pipeline. Resource-scoped locking (node rsclk7nq): there is
+    # no single global lock. The shared caches lock themselves inside their
+    # helpers (org_lock honors security-hawk F4 / shawk7nq; default_branches_
+    # lock), and this handler takes sentinel_lock + run_state_lock("report")
+    # only around its terminal writes in _finish. A LockTimeoutError from any
+    # of them is surfaced as exit 1 + stderr, no ATTENTION (per tmlk5pq3).
     try:
-        with global_lock(
-            "shared",
-            timeout=_LOCK_TIMEOUT_SECONDS,
-            subcommand="report",
-        ):
-            return _run_under_lock(
-                args, policy, repos, repos_text, skipped_entries,
-                spec, repos_excluded,
-            )
+        return _run_under_lock(
+            args, policy, repos, repos_text, skipped_entries,
+            spec, repos_excluded,
+        )
     except LockTimeoutError as e:
         print(
             error_line(f"gitbulk report: timed out acquiring lock: {e}"),
@@ -912,9 +904,13 @@ def _finish(
 
     if attention:
         runid = _runid_from_run_dir(rs.run_dir)
-        sentinel.set_attention(exit_code, "report", runid, summary)
+        with sentinel_lock(timeout=_LOCK_TIMEOUT_SECONDS, subcommand="report"):
+            sentinel.set_attention(exit_code, "report", runid, summary)
 
-    rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
+    with run_state_lock(
+        "report", "exclusive", timeout=_LOCK_TIMEOUT_SECONDS, subcommand="report"
+    ):
+        rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
 
     # Tell the user what happened. Without this line, a successful
     # report produces no stdout — the user has to know to look at

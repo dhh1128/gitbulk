@@ -45,7 +45,12 @@ from gitbulk.org_members_cache import (
 )
 from gitbulk.invariants import InvariantContext, get, run_chain
 from gitbulk.invariants.base import Invariant, InvariantKind
-from gitbulk.locks import LockTimeoutError, global_lock
+from gitbulk.locks import (
+    LockTimeoutError,
+    repo_lock,
+    run_state_lock,
+    sentinel_lock,
+)
 from gitbulk.runstate import RunState
 from gitbulk.util.progress import Progress
 from gitbulk.util.style import error_line, summary_line
@@ -251,16 +256,17 @@ def prune_branches_handler(args: argparse.Namespace) -> int:
     spec = resolve_filter_spec(args, policy)
     repos, repos_excluded = select_repos(repos, spec)
 
+    # Resource-scoped locking (node rsclk7nq): no global lock. The org/
+    # default-branches caches self-lock in their helpers; each remote branch
+    # delete takes repo_lock(slug) so two gitbulk runs never mutate the SAME
+    # repo at once (different repos run in parallel); the terminal writes take
+    # sentinel_lock + run_state_lock("prune-branches"). Any LockTimeoutError
+    # surfaces as exit 1 (per tmlk5pq3).
     try:
-        with global_lock(
-            "exclusive",
-            timeout=_LOCK_TIMEOUT_SECONDS,
-            subcommand="prune-branches",
-        ):
-            return _run_under_lock(
-                args, policy, repos, repos_text, skipped_entries,
-                spec, repos_excluded,
-            )
+        return _run_under_lock(
+            args, policy, repos, repos_text, skipped_entries,
+            spec, repos_excluded,
+        )
     except LockTimeoutError as e:
         print(
             error_line(f"gitbulk prune-branches: timed out acquiring lock: {e}"),
@@ -408,7 +414,13 @@ def _run_under_lock(
         slug = cand["slug"]
         branch = cand["branch"]
         try:
-            gh.delete_branch_ref(slug, branch)
+            # repo_lock(slug): serialize this remote mutation against any other
+            # gitbulk run touching the SAME repo (node rsclk7nq resource #7).
+            with repo_lock(
+                slug, "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
+                subcommand="prune-branches",
+            ):
+                gh.delete_branch_ref(slug, branch)
         except GHError as e:
             failure_count += 1
             cand["error"] = str(e)
@@ -601,8 +613,13 @@ def _finish(
         rs.write_summary(f"# gitbulk prune-branches (FAILED)\n\n{summary}\n\n{synth}")
     if attention:
         runid = _runid_from_run_dir(rs.run_dir)
-        sentinel.set_attention(exit_code, "prune-branches", runid, summary)
-    rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
+        with sentinel_lock(timeout=_LOCK_TIMEOUT_SECONDS, subcommand="prune-branches"):
+            sentinel.set_attention(exit_code, "prune-branches", runid, summary)
+    with run_state_lock(
+        "prune-branches", "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
+        subcommand="prune-branches",
+    ):
+        rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
     print(summary_line(
         f"gitbulk prune-branches: {summary}. View: gitbulk show prune-branches",
         exit_code,

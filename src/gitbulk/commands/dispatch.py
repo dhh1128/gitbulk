@@ -88,7 +88,12 @@ from gitbulk.org_members_cache import (
 )
 from gitbulk.invariants import InvariantContext, get, run_chain
 from gitbulk.invariants.base import Invariant, InvariantKind
-from gitbulk.locks import LockTimeoutError, global_lock
+from gitbulk.locks import (
+    LockTimeoutError,
+    repo_lock,
+    run_state_lock,
+    sentinel_lock,
+)
 from gitbulk.pr_info import PRInfo
 from gitbulk.runstate import RunState
 from gitbulk.util.progress import Progress
@@ -423,16 +428,14 @@ def dispatch_handler(args: argparse.Namespace) -> int:
         return EXIT_STRUCTURAL_FAILURE
     assert prompt_path is not None  # narrowed by _validate_prompt contract
 
-    # 2. Acquire global EXCLUSIVE lock with the mutating-budget timeout.
+    # 2. Run the pipeline. Resource-scoped locking (node rsclk7nq): no global
+    # lock. Caches self-lock in their helpers; each PR's worktree create/remove
+    # takes repo_lock(slug) (NOT held across the agent pool); the terminal
+    # writes take sentinel_lock + run_state_lock("dispatch").
     try:
-        with global_lock(
-            "exclusive",
-            timeout=_LOCK_TIMEOUT_SECONDS,
-            subcommand="dispatch",
-        ):
-            return _run_under_lock(
-                args, policy, repos, repos_text, prompt_path, spec
-            )
+        return _run_under_lock(
+            args, policy, repos, repos_text, prompt_path, spec
+        )
     except LockTimeoutError as e:
         print(
             error_line(f"gitbulk dispatch: timed out acquiring lock: {e}"),
@@ -671,15 +674,23 @@ def _run_under_lock(
     for slug, pr in eligible_prs:
         repo = repo_by_slug[slug]
         try:
-            worktree_path = create_worktree(
-                repo.local_path,
-                slug,
-                pr.number,
-                pr.head_ref,
-                pr.head_sha,
-                worktree_root=policy.worktree_root,
-                runid=runid,
-            )
+            # repo_lock(slug): worktree creation mutates the clone's
+            # .git/worktrees admin — serialize it against another gitbulk run
+            # on the SAME repo (node rsclk7nq #6). NOT held across the agent
+            # pool below (that would serialize the whole long-running run).
+            with repo_lock(
+                slug, "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
+                subcommand="dispatch",
+            ):
+                worktree_path = create_worktree(
+                    repo.local_path,
+                    slug,
+                    pr.number,
+                    pr.head_ref,
+                    pr.head_sha,
+                    worktree_root=policy.worktree_root,
+                    runid=runid,
+                )
         except WorktreeError as e:
             # Worktree creation failed; record and skip this PR.
             # We DO NOT abort the whole run — the user's other 149
@@ -748,7 +759,11 @@ def _run_under_lock(
             _write_conflict_marker(worktree_path, slug, pr, r)
         else:
             try:
-                remove_worktree(repo.local_path, worktree_path)
+                with repo_lock(
+                    slug, "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
+                    subcommand="dispatch",
+                ):
+                    remove_worktree(repo.local_path, worktree_path)
             except WorktreeError as e:
                 # Best-effort: record and leave on disk for the operator.
                 preserved = True
@@ -905,9 +920,13 @@ def _finish(
 
     if attention:
         runid = _runid_from_run_dir(rs.run_dir)
-        sentinel.set_attention(exit_code, "dispatch", runid, summary)
+        with sentinel_lock(timeout=_LOCK_TIMEOUT_SECONDS, subcommand="dispatch"):
+            sentinel.set_attention(exit_code, "dispatch", runid, summary)
 
-    rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
+    with run_state_lock(
+        "dispatch", "exclusive", timeout=_LOCK_TIMEOUT_SECONDS, subcommand="dispatch"
+    ):
+        rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
     return exit_code
 
 

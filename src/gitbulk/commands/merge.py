@@ -56,7 +56,12 @@ from gitbulk.org_members_cache import (
 )
 from gitbulk.invariants import InvariantContext, get, run_chain
 from gitbulk.invariants.base import Invariant, InvariantKind
-from gitbulk.locks import LockTimeoutError, global_lock
+from gitbulk.locks import (
+    LockTimeoutError,
+    repo_lock,
+    run_state_lock,
+    sentinel_lock,
+)
 from gitbulk.pr_info import PRInfo
 from gitbulk.runstate import RunState
 from gitbulk.util.progress import Progress
@@ -377,16 +382,16 @@ def merge_handler(args: argparse.Namespace) -> int:
     spec = resolve_filter_spec(args, policy)
     repos, repos_excluded = select_repos(repos, spec)
 
+    # Resource-scoped locking (node rsclk7nq): no global lock. Caches self-lock
+    # in their helpers; each PR's approve/merge takes repo_lock(slug) so two
+    # gitbulk runs never mutate the SAME repo at once (different repos run in
+    # parallel — the user-approved consequence); the terminal writes take
+    # sentinel_lock + run_state_lock("merge").
     try:
-        with global_lock(
-            "exclusive",
-            timeout=_LOCK_TIMEOUT_SECONDS,
-            subcommand="merge",
-        ):
-            return _run_under_lock(
-                args, policy, repos, repos_text, skipped_entries,
-                spec, repos_excluded,
-            )
+        return _run_under_lock(
+            args, policy, repos, repos_text, skipped_entries,
+            spec, repos_excluded,
+        )
     except LockTimeoutError as e:
         print(
             error_line(f"gitbulk merge: timed out acquiring lock: {e}"),
@@ -745,11 +750,17 @@ def _run_under_lock(
         # an error and skip the merge for this PR.
         if (slug, pr.number) in primary_auto_approve_keys:
             try:
-                gh.approve_pr(
-                    slug,
-                    pr.number,
-                    body="Auto-approved by gitbulk (merge --approve).",
-                )
+                # repo_lock(slug): serialize this remote mutation against any
+                # other gitbulk run on the SAME repo (node rsclk7nq #7).
+                with repo_lock(
+                    slug, "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
+                    subcommand="merge",
+                ):
+                    gh.approve_pr(
+                        slug,
+                        pr.number,
+                        body="Auto-approved by gitbulk (merge --approve).",
+                    )
             except GHError as e:
                 failure_count += 1
                 rs.record_error(
@@ -785,12 +796,16 @@ def _run_under_lock(
                 },
             )
         try:
-            response = gh.merge_pr(
-                slug,
-                pr.number,
-                method=method,
-                delete_branch=True,
-            )
+            with repo_lock(
+                slug, "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
+                subcommand="merge",
+            ):
+                response = gh.merge_pr(
+                    slug,
+                    pr.number,
+                    method=method,
+                    delete_branch=True,
+                )
         except GHError as e:
             failure_count += 1
             rs.record_error(
@@ -1021,9 +1036,13 @@ def _finish(
 
     if attention:
         runid = _runid_from_run_dir(rs.run_dir)
-        sentinel.set_attention(exit_code, "merge", runid, summary)
+        with sentinel_lock(timeout=_LOCK_TIMEOUT_SECONDS, subcommand="merge"):
+            sentinel.set_attention(exit_code, "merge", runid, summary)
 
-    rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
+    with run_state_lock(
+        "merge", "exclusive", timeout=_LOCK_TIMEOUT_SECONDS, subcommand="merge"
+    ):
+        rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
 
     # One-line stdout summary so the user knows what happened without
     # having to know about ~/.cache/gitbulk/runs/. See report._finish

@@ -35,7 +35,7 @@ def test_global_lock_shared_calls_flock_with_LOCK_SH(isolated_cache, monkeypatch
         captured.append(op)
 
     monkeypatch.setattr(fcntl, "flock", fake_flock)
-    with locks.global_lock("shared"):
+    with locks.run_state_lock("audit", "shared"):
         pass
     assert captured == [fcntl.LOCK_SH]
 
@@ -47,14 +47,14 @@ def test_global_lock_exclusive_calls_flock_with_LOCK_EX(isolated_cache, monkeypa
         captured.append(op)
 
     monkeypatch.setattr(fcntl, "flock", fake_flock)
-    with locks.global_lock("exclusive"):
+    with locks.run_state_lock("audit", "exclusive"):
         pass
     assert captured == [fcntl.LOCK_EX]
 
 
 def test_invalid_mode_raises_value_error(isolated_cache):
     with pytest.raises(ValueError, match="invalid mode"):
-        with locks.global_lock("write-only"):  # type: ignore[arg-type]
+        with locks.run_state_lock("audit", "write-only"):  # type: ignore[arg-type]
             pass
 
 
@@ -80,9 +80,9 @@ def test_repo_lock_malformed_slug_raises(isolated_cache):
 
 
 def test_global_lock_writes_to_global_lock_file(isolated_cache):
-    with locks.global_lock("exclusive", subcommand="report"):
-        assert paths.global_lock_file().exists()
-        metadata = json.loads(paths.global_lock_file().read_text())
+    with locks.run_state_lock("audit", "exclusive", subcommand="report"):
+        assert paths.named_lock_file("runstate-audit").exists()
+        metadata = json.loads(paths.named_lock_file("runstate-audit").read_text())
         assert metadata["pid"] == os.getpid()
         assert metadata["subcommand"] == "report"
 
@@ -99,16 +99,16 @@ def test_repo_lock_writes_to_repo_lock_file(isolated_cache):
 
 
 def test_metadata_includes_pid_and_started_at_utc(isolated_cache):
-    with locks.global_lock("exclusive", subcommand="dispatch"):
-        metadata = json.loads(paths.global_lock_file().read_text())
+    with locks.run_state_lock("audit", "exclusive", subcommand="dispatch"):
+        metadata = json.loads(paths.named_lock_file("runstate-audit").read_text())
         assert metadata["pid"] == os.getpid()
         assert metadata["started_at"].endswith("+00:00") or metadata["started_at"].endswith("Z")
         assert metadata["subcommand"] == "dispatch"
 
 
 def test_metadata_subcommand_null_when_omitted(isolated_cache):
-    with locks.global_lock("shared"):
-        metadata = json.loads(paths.global_lock_file().read_text())
+    with locks.run_state_lock("audit", "shared"):
+        metadata = json.loads(paths.named_lock_file("runstate-audit").read_text())
         assert metadata["subcommand"] is None
 
 
@@ -116,10 +116,10 @@ def test_metadata_subcommand_null_when_omitted(isolated_cache):
 
 
 def test_lock_file_persists_after_release(isolated_cache):
-    with locks.global_lock("shared"):
+    with locks.run_state_lock("audit", "shared"):
         pass
     # The file is unlocked (we exited the context) but the file remains on disk
-    assert paths.global_lock_file().exists()
+    assert paths.named_lock_file("runstate-audit").exists()
 
 
 # ─── Timeout / blocking behavior ───────────────────────────────────────────
@@ -133,7 +133,7 @@ def test_no_timeout_omits_LOCK_NB(isolated_cache, monkeypatch):
         captured.append(op)
 
     monkeypatch.setattr(fcntl, "flock", fake_flock)
-    with locks.global_lock("shared"):
+    with locks.run_state_lock("audit", "shared"):
         pass
     assert captured == [fcntl.LOCK_SH]  # no LOCK_NB bit set
     assert not (captured[0] & fcntl.LOCK_NB)
@@ -146,7 +146,7 @@ def test_timeout_uses_LOCK_NB(isolated_cache, monkeypatch):
         captured.append(op)
 
     monkeypatch.setattr(fcntl, "flock", fake_flock)
-    with locks.global_lock("shared", timeout=1.0):
+    with locks.run_state_lock("audit", "shared", timeout=1.0):
         pass
     assert len(captured) == 1
     assert captured[0] & fcntl.LOCK_NB
@@ -156,14 +156,14 @@ def test_timeout_succeeds_after_retry(isolated_cache, monkeypatch):
     """First flock call raises BlockingIOError; second succeeds. Exercises the retry loop."""
     mock_flock = MagicMock(side_effect=[BlockingIOError("contention"), None])
     monkeypatch.setattr(fcntl, "flock", mock_flock)
-    with locks.global_lock("shared", timeout=2.0):
+    with locks.run_state_lock("audit", "shared", timeout=2.0):
         pass
     assert mock_flock.call_count == 2
 
 
 def test_timeout_expires_raises_LockTimeoutError(isolated_cache):
     """Hold the lock from a second FD in this process and try to re-acquire with timeout."""
-    fd_holder = os.open(paths.global_lock_file(), os.O_RDWR | os.O_CREAT, 0o644)
+    fd_holder = os.open(paths.named_lock_file("runstate-audit"), os.O_RDWR | os.O_CREAT, 0o644)
     fcntl.flock(fd_holder, fcntl.LOCK_EX)
     try:
         # Pre-write some metadata so the error path has a holder dict to find
@@ -180,7 +180,7 @@ def test_timeout_expires_raises_LockTimeoutError(isolated_cache):
             ).encode(),
         )
         with pytest.raises(LockTimeoutError) as exc_info:
-            with locks.global_lock("exclusive", timeout=0.2):
+            with locks.run_state_lock("audit", "exclusive", timeout=0.2):
                 pass
         err = exc_info.value
         assert err.holder is not None
@@ -188,19 +188,19 @@ def test_timeout_expires_raises_LockTimeoutError(isolated_cache):
         assert err.holder["subcommand"] == "report"
         assert "99999" in str(err)
         assert "report" in str(err)
-        assert err.lock_path == paths.global_lock_file()
+        assert err.lock_path == paths.named_lock_file("runstate-audit")
     finally:
         os.close(fd_holder)
 
 
 def test_timeout_error_message_when_no_holder_metadata(isolated_cache):
     """Lock file exists but is empty (no JSON to read)."""
-    paths.global_lock_file().write_text("")
-    fd_holder = os.open(paths.global_lock_file(), os.O_RDWR)
+    paths.named_lock_file("runstate-audit").write_text("")
+    fd_holder = os.open(paths.named_lock_file("runstate-audit"), os.O_RDWR)
     fcntl.flock(fd_holder, fcntl.LOCK_EX)
     try:
         with pytest.raises(LockTimeoutError) as exc_info:
-            with locks.global_lock("exclusive", timeout=0.2):
+            with locks.run_state_lock("audit", "exclusive", timeout=0.2):
                 pass
         assert exc_info.value.holder is None
         assert "no holder metadata" in str(exc_info.value)
@@ -325,7 +325,7 @@ def test_is_pid_alive_generic_oserror_treated_as_dead(monkeypatch):
 
 def test_locktimeout_message_shows_alive_when_holder_present(isolated_cache):
     # Use this process's own pid so the holder shows as alive.
-    fd_holder = os.open(paths.global_lock_file(), os.O_RDWR | os.O_CREAT, 0o644)
+    fd_holder = os.open(paths.named_lock_file("runstate-audit"), os.O_RDWR | os.O_CREAT, 0o644)
     fcntl.flock(fd_holder, fcntl.LOCK_EX)
     try:
         # Pre-write metadata referencing our own pid.
@@ -342,7 +342,7 @@ def test_locktimeout_message_shows_alive_when_holder_present(isolated_cache):
             ).encode(),
         )
         with pytest.raises(LockTimeoutError) as exc_info:
-            with locks.global_lock("exclusive", timeout=0.2):
+            with locks.run_state_lock("audit", "exclusive", timeout=0.2):
                 pass
         err = exc_info.value
         assert err.holder is not None
@@ -373,7 +373,7 @@ def test_locktimeout_message_no_alive_field(tmp_path):
 def test_locktimeout_message_shows_stale_when_holder_dead(isolated_cache):
     """When the recorded pid is gone, the message must say so clearly so the
     operator does not waste time chasing a nonexistent process."""
-    fd_holder = os.open(paths.global_lock_file(), os.O_RDWR | os.O_CREAT, 0o644)
+    fd_holder = os.open(paths.named_lock_file("runstate-audit"), os.O_RDWR | os.O_CREAT, 0o644)
     fcntl.flock(fd_holder, fcntl.LOCK_EX)
     try:
         # Pre-write metadata referencing a definitely-dead pid.
@@ -390,7 +390,7 @@ def test_locktimeout_message_shows_stale_when_holder_dead(isolated_cache):
             ).encode(),
         )
         with pytest.raises(LockTimeoutError) as exc_info:
-            with locks.global_lock("exclusive", timeout=0.2):
+            with locks.run_state_lock("audit", "exclusive", timeout=0.2):
                 pass
         err = exc_info.value
         assert err.holder is not None
@@ -406,11 +406,11 @@ def test_locktimeout_message_shows_stale_when_holder_dead(isolated_cache):
 
 def test_exclusive_blocks_concurrent_exclusive_attempt(isolated_cache):
     """Real fcntl behavior: when one FD holds EX, another EX with LOCK_NB fails."""
-    fd_holder = os.open(paths.global_lock_file(), os.O_RDWR | os.O_CREAT, 0o644)
+    fd_holder = os.open(paths.named_lock_file("runstate-audit"), os.O_RDWR | os.O_CREAT, 0o644)
     fcntl.flock(fd_holder, fcntl.LOCK_EX)
     try:
         with pytest.raises(LockTimeoutError):
-            with locks.global_lock("exclusive", timeout=0.15):
+            with locks.run_state_lock("audit", "exclusive", timeout=0.15):
                 pass
     finally:
         os.close(fd_holder)
@@ -418,11 +418,11 @@ def test_exclusive_blocks_concurrent_exclusive_attempt(isolated_cache):
 
 def test_shared_coexists_with_shared(isolated_cache):
     """Real fcntl behavior: two shared locks on the same file coexist."""
-    fd_holder = os.open(paths.global_lock_file(), os.O_RDWR | os.O_CREAT, 0o644)
+    fd_holder = os.open(paths.named_lock_file("runstate-audit"), os.O_RDWR | os.O_CREAT, 0o644)
     fcntl.flock(fd_holder, fcntl.LOCK_SH)
     try:
         # This must NOT block; timeout=0.5 is generous in case scheduling is slow
-        with locks.global_lock("shared", timeout=0.5):
+        with locks.run_state_lock("audit", "shared", timeout=0.5):
             pass
     finally:
         os.close(fd_holder)
@@ -444,7 +444,7 @@ def test_repo_locks_for_different_slugs_dont_contend(isolated_cache):
 
 def test_acquire_succeeds_when_holder_releases_mid_wait(isolated_cache):
     """A separate thread releases the lock partway through our wait."""
-    fd_holder = os.open(paths.global_lock_file(), os.O_RDWR | os.O_CREAT, 0o644)
+    fd_holder = os.open(paths.named_lock_file("runstate-audit"), os.O_RDWR | os.O_CREAT, 0o644)
     fcntl.flock(fd_holder, fcntl.LOCK_EX)
     released = threading.Event()
 
@@ -456,8 +456,289 @@ def test_acquire_succeeds_when_holder_releases_mid_wait(isolated_cache):
     t = threading.Thread(target=release_after_delay)
     t.start()
     try:
-        with locks.global_lock("exclusive", timeout=2.0):
+        with locks.run_state_lock("audit", "exclusive", timeout=2.0):
             assert released.wait(timeout=1.0)
     finally:
         t.join(timeout=2.0)
         os.close(fd_holder)
+
+
+# ─── Resource-scoped locks (node rsclk7nq) ──────────────────────────────────
+
+
+def _capture_flock(monkeypatch):
+    captured: list = []
+    monkeypatch.setattr(fcntl, "flock", lambda fd, op: captured.append(op))
+    return captured
+
+
+def test_run_state_lock_shared_uses_LOCK_SH(isolated_cache, monkeypatch):
+    captured = _capture_flock(monkeypatch)
+    with locks.run_state_lock("prune-worktrees", "shared"):
+        pass
+    assert captured == [fcntl.LOCK_SH]
+
+
+def test_run_state_lock_exclusive_uses_LOCK_EX(isolated_cache, monkeypatch):
+    captured = _capture_flock(monkeypatch)
+    with locks.run_state_lock("merge", "exclusive"):
+        pass
+    assert captured == [fcntl.LOCK_EX]
+
+
+def test_run_state_lock_is_keyed_by_target(isolated_cache):
+    """Different targets resolve to different lock files (so they never contend)."""
+    with locks.run_state_lock("prune-branches", "exclusive", subcommand="prune-branches"):
+        a = paths.named_lock_file("runstate-prune-branches")
+        assert a.exists()
+        meta = json.loads(a.read_text())
+        # The metadata subcommand (running command) is independent of the key.
+        assert meta["subcommand"] == "prune-branches"
+    b = paths.named_lock_file("runstate-prune-worktrees")
+    assert a != b
+
+
+def test_run_state_lock_label_independent_of_target(isolated_cache):
+    """`show` locks run-state `prune-worktrees` while the holder is `show`."""
+    with locks.run_state_lock("prune-worktrees", "shared", subcommand="show"):
+        path = paths.named_lock_file("runstate-prune-worktrees")
+        assert json.loads(path.read_text())["subcommand"] == "show"
+
+
+def test_repo_lock_shared_mode_uses_LOCK_SH(isolated_cache, monkeypatch):
+    captured = _capture_flock(monkeypatch)
+    with locks.repo_lock("owner/repo", "shared"):
+        pass
+    assert captured == [fcntl.LOCK_SH]
+
+
+def test_repo_lock_default_mode_is_exclusive(isolated_cache, monkeypatch):
+    captured = _capture_flock(monkeypatch)
+    with locks.repo_lock("owner/repo"):
+        pass
+    assert captured == [fcntl.LOCK_EX]
+
+
+@pytest.mark.parametrize(
+    "factory, lock_filename",
+    [
+        (lambda: locks.org_lock("provenant-dev"), "org-provenant-dev.lock"),
+        (lambda: locks.default_branches_lock(), "default-branches.lock"),
+        (lambda: locks.sentinel_lock(), "attention.lock"),
+        (lambda: locks.dashboard_lock(), "dashboard.lock"),
+        (lambda: locks.watchdog_ack_lock(), "watchdog-acked.lock"),
+    ],
+)
+def test_singleton_locks_are_exclusive_and_write_expected_file(
+    isolated_cache, monkeypatch, factory, lock_filename
+):
+    captured = _capture_flock(monkeypatch)
+    with factory():
+        pass
+    assert captured == [fcntl.LOCK_EX]
+    # With flock mocked the file is still created by _file_lock's os.open.
+    assert (paths.locks_dir() / lock_filename).exists()
+
+
+def test_singleton_lock_writes_metadata(isolated_cache):
+    with locks.org_lock("provenant-dev", subcommand="report"):
+        path = paths.named_lock_file("org-provenant-dev")
+        assert json.loads(path.read_text())["subcommand"] == "report"
+
+
+@pytest.mark.parametrize("bad", ["a/b", "a\\b", "..", ".", ""])
+def test_named_lock_file_rejects_unsafe_names(bad):
+    with pytest.raises(ValueError, match="invalid lock name"):
+        paths.named_lock_file(bad)
+
+
+def test_named_lock_file_valid_name(isolated_cache):
+    assert paths.named_lock_file("runstate-merge") == paths.locks_dir() / "runstate-merge.lock"
+
+
+# ─── No-forever-wait invariant (node rsclk7nq) ──────────────────────────────
+
+
+def test_all_production_lock_acquisitions_pass_a_timeout():
+    """Every `with <lock>(...)` in src/gitbulk MUST pass an explicit timeout=.
+
+    This is the structural guarantee that gitbulk never waits forever on a
+    lock: a contended acquisition always fails fast with LockTimeoutError
+    (surfaced as exit 1) instead of hanging. The keyed constructors default
+    timeout to None (block-forever) per hk5pq3nm.c, so the safety lives at the
+    CALL SITES — this guard enforces it for all current and future code.
+    locks.py (the definitions themselves) is excluded.
+    """
+    import io
+    import tokenize
+    from pathlib import Path
+
+    lock_names = {
+        "run_state_lock", "repo_lock", "org_lock", "default_branches_lock",
+        "sentinel_lock", "dashboard_lock", "watchdog_ack_lock",
+    }
+    root = Path(__file__).resolve().parents[1] / "src" / "gitbulk"
+    offenders: list[str] = []
+    for path in sorted(root.rglob("*.py")):
+        if path.name == "locks.py":
+            continue
+        toks = list(tokenize.generate_tokens(io.StringIO(path.read_text()).readline))
+        for i, tok in enumerate(toks):
+            if not (tok.type == tokenize.NAME and tok.string == "with"):
+                continue
+            for j in range(i + 1, min(i + 6, len(toks))):
+                tj = toks[j]
+                if (
+                    tj.type == tokenize.NAME
+                    and tj.string in lock_names
+                    and j + 1 < len(toks)
+                    and toks[j + 1].string == "("
+                ):
+                    depth, k = 0, j + 1
+                    while k < len(toks):
+                        s = toks[k].string
+                        if s == "(":
+                            depth += 1
+                        elif s == ")":
+                            depth -= 1
+                            if depth == 0:
+                                break
+                        k += 1
+                    names = [
+                        toks[x].string
+                        for x in range(j + 1, k + 1)
+                        if toks[x].type == tokenize.NAME
+                    ]
+                    if "timeout" not in names:
+                        offenders.append(f"{path.name}:{tj.start[0]} with {tj.string}(...)")
+                    break
+    assert not offenders, (
+        "lock acquisition(s) missing an explicit timeout= (would block "
+        "forever on contention):\n" + "\n".join(offenders)
+    )
+
+
+# ─── lock-status reporter hook (node rsclk7nq UX) ───────────────────────────
+
+
+class _RecordingReporter:
+    def __init__(self):
+        self.waits = []
+        self.acquires = []
+        self.gaveups = []
+
+    def waiting(self, *, label, holder, remaining, elapsed):
+        self.waits.append((label, holder, remaining, elapsed))
+
+    def acquired(self, *, label, waited):
+        self.acquires.append((label, waited))
+
+    def gave_up(self, *, label):
+        self.gaveups.append(label)
+
+
+@pytest.fixture
+def reporter(monkeypatch):
+    r = _RecordingReporter()
+    monkeypatch.setattr(locks, "_status_reporter", r)
+    return r
+
+
+def _hold(name: str, *, metadata: dict | None = None) -> int:
+    """EX-flock a named lock file from this process (simulating another holder),
+    optionally writing holder metadata. Caller closes the returned fd."""
+    fd = os.open(paths.named_lock_file(name), os.O_RDWR | os.O_CREAT, 0o644)
+    if metadata is not None:
+        os.write(fd, json.dumps(metadata).encode())
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def test_set_status_reporter_roundtrip(monkeypatch):
+    monkeypatch.setattr(locks, "_status_reporter", None)
+    marker = object()
+    locks.set_status_reporter(marker)
+    assert locks._status_reporter is marker
+    locks.set_status_reporter(None)
+    assert locks._status_reporter is None
+
+
+def test_reporter_uncontended_acquire_reports_waited_zero(isolated_cache, reporter):
+    with locks.run_state_lock("merge", "exclusive", timeout=1.0):
+        pass
+    assert reporter.waits == []
+    assert reporter.gaveups == []
+    assert reporter.acquires == [("run-state (merge)", 0.0)]
+
+
+def test_reporter_timeout_calls_gave_up_and_reads_holder_once(
+    isolated_cache, reporter
+):
+    fd = _hold(
+        "runstate-merge",
+        metadata={
+            "pid": 4321,
+            "started_at": "1970-01-01T00:00:00+00:00",
+            "subcommand": "prune-branches",
+        },
+    )
+    try:
+        with pytest.raises(LockTimeoutError):
+            with locks.run_state_lock("merge", "exclusive", timeout=0.3):
+                pass
+    finally:
+        os.close(fd)
+    assert len(reporter.waits) >= 1          # ticked while blocked
+    assert reporter.gaveups == ["run-state (merge)"]
+    assert reporter.acquires == []           # never acquired
+    # holder metadata read ONCE, then reused each tick (same dict object).
+    holder_ids = {id(w[1]) for w in reporter.waits}
+    assert len(holder_ids) == 1
+    assert reporter.waits[0][1]["subcommand"] == "prune-branches"
+    # countdown decreases toward zero.
+    assert reporter.waits[0][2] <= 0.3
+
+
+def test_reporter_acquire_after_wait_reports_positive_waited(
+    isolated_cache, reporter
+):
+    fd = _hold("runstate-merge")
+    released = threading.Event()
+
+    def release():
+        time.sleep(0.15)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        released.set()
+
+    t = threading.Thread(target=release)
+    t.start()
+    try:
+        with locks.run_state_lock("merge", "exclusive", timeout=2.0):
+            assert released.wait(timeout=1.0)
+    finally:
+        t.join(timeout=2.0)
+        os.close(fd)
+    assert len(reporter.waits) >= 1
+    assert reporter.gaveups == []
+    assert len(reporter.acquires) == 1
+    assert reporter.acquires[0][0] == "run-state (merge)"
+    assert reporter.acquires[0][1] > 0       # actually waited
+
+
+@pytest.mark.parametrize(
+    "filename,expected",
+    [
+        ("runstate-merge.lock", "run-state (merge)"),
+        ("runstate-prune-worktrees.lock", "run-state (prune-worktrees)"),
+        ("dhh1128__gitbulk.lock", "repo (dhh1128/gitbulk)"),
+        ("org-provenant-dev.lock", "org-members (provenant-dev)"),
+        ("default-branches.lock", "default-branches"),
+        ("attention.lock", "ATTENTION sentinel"),
+        ("dashboard.lock", "dashboard"),
+        ("watchdog-acked.lock", "watchdog-ack"),
+        ("run.lock", "global"),
+        ("weird-name.lock", "weird-name"),
+    ],
+)
+def test_label_for(filename, expected):
+    assert locks._label_for(Path("/x") / filename) == expected

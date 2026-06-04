@@ -1065,7 +1065,7 @@ def test_dispatch_lock_timeout_exits_1(
     class _BoomLock:
         def __enter__(self):
             raise LockTimeoutError(
-                paths.global_lock_file(),
+                paths.named_lock_file("default-branches"),
                 {
                     "pid": 999,
                     "started_at": "1970-01-01T00:00:00+00:00",
@@ -1077,12 +1077,17 @@ def test_dispatch_lock_timeout_exits_1(
         def __exit__(self, *a):  # pragma: no cover — never reached
             return False
 
-    monkeypatch.setattr(
-        "gitbulk.commands.dispatch.global_lock", lambda *a, **kw: _BoomLock()
+    fake = FakeGHClient(
+        user={"login": "dhh1128"}, default_branches={"dhh1128/alpha": "main"}
     )
-    fake = FakeGHClient(user={"login": "dhh1128"})
     monkeypatch.setattr(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
+    )
+    # default_branches_lock (resource #3) times out — reached in prime, before
+    # any worktree is created (node rsclk7nq); surfaced as exit 1, no sentinel.
+    monkeypatch.setattr(
+        "gitbulk.default_branch_cache.default_branches_lock",
+        lambda *a, **kw: _BoomLock(),
     )
     rc = dispatch_handler(
         _make_args(prompt=prompt_file, code_root=code_root)

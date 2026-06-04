@@ -10,14 +10,19 @@ See this.i nodes ``tp4kq2nr`` (the 4-layer notification model),
 from __future__ import annotations
 
 import json
-import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 from gitbulk import __version__, paths
+from gitbulk.util import atomicio
+
+#: Safety cap on runid-collision retries in :meth:`RunState.begin`. A genuine
+#: collision needs two same-subcommand runs in the same UTC second; the cap
+#: only guards against a pathological loop and is far above any real value.
+_RUNID_COLLISION_LIMIT = 1000
 
 #: Schema version stamped onto every artifact this module writes.
 #: Bump (and document a corresponding decision node in ``this.i``) when
@@ -33,22 +38,20 @@ def _utc_now_iso() -> str:
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` atomically via .tmp + rename."""
-    tmp = path.parent / (path.name + ".tmp")
-    tmp.write_text(text)
-    os.replace(tmp, path)
+    """Write ``text`` to ``path`` atomically (unique tmp + rename).
+
+    Thin alias for :func:`gitbulk.util.atomicio.atomic_write_text`; kept as
+    the module's internal vocabulary and for the per-run callers below.
+    """
+    atomicio.atomic_write_text(path, text)
 
 
 def _atomic_write_symlink(symlink_path: Path, target: Path) -> None:
-    """Create or replace a symlink atomically. The link target is stored
-    as a path relative to the symlink's parent directory so the cache
-    tree can be relocated without breaking symlinks."""
-    tmp = symlink_path.parent / (symlink_path.name + ".tmp")
-    if tmp.exists() or tmp.is_symlink():
-        tmp.unlink()
-    relative_target = os.path.relpath(target, start=symlink_path.parent)
-    tmp.symlink_to(relative_target)
-    os.replace(tmp, symlink_path)
+    """Create or replace a symlink atomically (unique tmp + rename).
+
+    Thin alias for :func:`gitbulk.util.atomicio.atomic_write_symlink`.
+    """
+    atomicio.atomic_write_symlink(symlink_path, target)
 
 
 def _append_jsonl(path: Path, event: dict[str, Any]) -> None:
@@ -75,9 +78,28 @@ class RunState:
         *,
         when: datetime | None = None,
     ) -> "RunState":
-        runid = paths.new_runid(when)
-        run_dir = paths.run_dir(runid, subcommand)
-        run_dir.mkdir(parents=True, exist_ok=False)
+        # runid is a UTC timestamp to the second (node 3pw7qkn2). Two runs of
+        # the SAME subcommand started in the same second would collide on the
+        # run-dir name; mkdir(exist_ok=False) would then crash the second run.
+        # A lock cannot fix this (both processes compute the same runid), so on
+        # collision we advance the timestamp by one second and retry. This keeps
+        # every runid a valid strptime-able timestamp — so gc's `-<sub>` suffix
+        # match, the lexicographic-is-chronological sort, and every downstream
+        # `_runid_from_run_dir` parser keep working (node rsclk7nq, Phase 0).
+        base = when if when is not None else datetime.now(timezone.utc)
+        for offset in range(_RUNID_COLLISION_LIMIT):
+            runid = paths.new_runid(base + timedelta(seconds=offset))
+            run_dir = paths.run_dir(runid, subcommand)
+            try:
+                run_dir.mkdir(parents=True, exist_ok=False)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise FileExistsError(
+                f"could not allocate a unique run dir for {subcommand!r} after "
+                f"{_RUNID_COLLISION_LIMIT} attempts starting at {base.isoformat()}"
+            )
 
         # Initial empty state.yaml so a crash before any record_repo_state
         # still leaves a parseable file.

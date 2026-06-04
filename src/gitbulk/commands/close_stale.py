@@ -58,7 +58,12 @@ from gitbulk.org_members_cache import (
 )
 from gitbulk.invariants import InvariantContext, get, run_chain
 from gitbulk.invariants.base import Invariant, InvariantKind
-from gitbulk.locks import LockTimeoutError, global_lock
+from gitbulk.locks import (
+    LockTimeoutError,
+    repo_lock,
+    run_state_lock,
+    sentinel_lock,
+)
 from gitbulk.pr_info import PRComment, PRInfo
 from gitbulk.runstate import RunState
 from gitbulk.util.progress import Progress
@@ -257,16 +262,14 @@ def close_stale_handler(args: argparse.Namespace) -> int:
     spec = resolve_filter_spec(args, policy)
     repos, repos_excluded = select_repos(repos, spec)
 
+    # Resource-scoped locking (node rsclk7nq): no global lock. Caches self-lock
+    # in their helpers; each per-PR remote mutation takes repo_lock(slug); the
+    # terminal writes take sentinel_lock + run_state_lock("close-stale").
     try:
-        with global_lock(
-            "exclusive",
-            timeout=_LOCK_TIMEOUT_SECONDS,
-            subcommand="close-stale",
-        ):
-            return _run_under_lock(
-                args, policy, repos, repos_text, skipped_entries,
-                spec, repos_excluded,
-            )
+        return _run_under_lock(
+            args, policy, repos, repos_text, skipped_entries,
+            spec, repos_excluded,
+        )
     except LockTimeoutError as e:
         print(
             error_line(f"gitbulk close-stale: timed out acquiring lock: {e}"),
@@ -575,7 +578,11 @@ def _run_under_lock(
                 effective.stale_age_days, effective.stale_cooloff_days
             )
             try:
-                gh.post_comment(slug, number, body)
+                with repo_lock(
+                    slug, "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
+                    subcommand="close-stale",
+                ):
+                    gh.post_comment(slug, number, body)
             except GHError as e:
                 failure_count += 1
                 rs.record_error(
@@ -589,7 +596,11 @@ def _run_under_lock(
             warn_count += 1
         elif decision == "close":
             try:
-                gh.close_pr(slug, number, delete_branch=False)
+                with repo_lock(
+                    slug, "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
+                    subcommand="close-stale",
+                ):
+                    gh.close_pr(slug, number, delete_branch=False)
             except GHError as e:
                 failure_count += 1
                 rs.record_error(
@@ -808,9 +819,14 @@ def _finish(
 
     if attention:
         runid = _runid_from_run_dir(rs.run_dir)
-        sentinel.set_attention(exit_code, "close-stale", runid, summary)
+        with sentinel_lock(timeout=_LOCK_TIMEOUT_SECONDS, subcommand="close-stale"):
+            sentinel.set_attention(exit_code, "close-stale", runid, summary)
 
-    rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
+    with run_state_lock(
+        "close-stale", "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
+        subcommand="close-stale",
+    ):
+        rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
 
     # One-line stdout summary; see report._finish for the rationale.
     print(summary_line(f"gitbulk close-stale: {summary}. View: gitbulk show close-stale", exit_code))

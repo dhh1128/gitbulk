@@ -377,3 +377,32 @@ def test_prime_persists_archived_false_when_not_archived():
     )
     prime_default_branches(gh, ["a/b"], now=_now())
     assert load_cache()["a/b"].archived is False
+
+
+# ─── lost-update prevention under default_branches_lock (node rsclk7nq) ──────
+
+
+def test_prime_rereads_under_lock_preserving_concurrent_write(monkeypatch):
+    """An entry written by a concurrent prime AFTER our initial load but BEFORE
+    our save must survive: prime re-reads the file inside the lock before
+    merging, so it never lost-updates the other writer."""
+    gh = FakeGHClient(default_branches={"a/b": "main"})
+
+    # The network prefetch runs after the initial (unlocked) load and before
+    # the locked persist — hook it to simulate another process appending c/d.
+    orig_prefetch = gh.prefetch_default_branches
+
+    def prefetch_then_concurrent_write(slugs, on_progress=None):
+        orig_prefetch(slugs, on_progress=on_progress)
+        save_cache(
+            {"c/d": CachedBranch(branch="trunk", fetched_at=_now(), archived=False)}
+        )
+
+    monkeypatch.setattr(gh, "prefetch_default_branches", prefetch_then_concurrent_write)
+
+    prime_default_branches(gh, ["a/b"], now=_now())
+
+    final = load_cache()
+    assert "a/b" in final  # our own fetch landed
+    assert "c/d" in final  # the concurrent writer's entry was NOT lost
+    assert final["c/d"].branch == "trunk"

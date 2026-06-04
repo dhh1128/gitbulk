@@ -33,9 +33,16 @@ from pathlib import Path
 import yaml
 
 from gitbulk import paths
+from gitbulk.locks import watchdog_ack_lock
+from gitbulk.util import atomicio
 
 #: Schema version stamped into the cache file.
 _SCHEMA_VERSION = 1
+
+#: Lock budget for the watchdog-ack cache (resource #9, node rsclk7nq). The
+#: critical section is file-only (load->modify->save), so this is a generous
+#: ceiling on a stuck holder, not a real wait.
+_LOCK_TIMEOUT_SECONDS = 60.0
 
 #: Entries older than this are pruned at write time.
 _RETENTION = timedelta(days=7)
@@ -85,45 +92,50 @@ def record_ack(slug: str, sha: str, now: datetime) -> None:
     """
     path = _ack_file()
     cutoff = now - _RETENTION
-    # Load and parse existing entries; preserve unknown keys defensively
-    # (a future schema version might add fields we don't recognize).
-    existing: list[dict] = []
-    if path.exists():
-        try:
-            doc = yaml.safe_load(path.read_text())
-            if isinstance(doc, dict) and doc.get("version") == _SCHEMA_VERSION:
-                raw = doc.get("acked")
-                if isinstance(raw, list):
-                    existing = [e for e in raw if isinstance(e, dict)]
-        except yaml.YAMLError:
-            existing = []
-    # Drop the pair we're about to re-record (idempotent re-ack) and
-    # drop anything older than the retention window.
-    kept: list[dict] = []
-    for e in existing:
-        if e.get("slug") == slug and e.get("sha") == sha:
-            continue  # replaced below
-        at_raw = e.get("acked_at")
-        if isinstance(at_raw, str):
-            try:
-                at = datetime.fromisoformat(at_raw.replace("Z", "+00:00"))
-            except ValueError:
-                # Unparseable timestamp → drop conservatively.
-                continue
-            if at < cutoff:
-                continue
-        kept.append(e)
-    kept.append(
-        {
-            "slug": slug,
-            "sha": sha,
-            "acked_at": now.astimezone(timezone.utc).isoformat(),
-        }
-    )
     paths.cache_dir().mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        yaml.safe_dump({"version": _SCHEMA_VERSION, "acked": kept})
-    )
+    # watchdog_ack_lock (resource #9, node rsclk7nq) makes load->modify->save a
+    # single critical section so a concurrent record_ack cannot lost-update us;
+    # the write itself is also atomic (Phase 0) so external readers never see a
+    # torn file.
+    with watchdog_ack_lock(timeout=_LOCK_TIMEOUT_SECONDS):
+        # Load and parse existing entries; preserve unknown keys defensively
+        # (a future schema version might add fields we don't recognize).
+        existing: list[dict] = []
+        if path.exists():
+            try:
+                doc = yaml.safe_load(path.read_text())
+                if isinstance(doc, dict) and doc.get("version") == _SCHEMA_VERSION:
+                    raw = doc.get("acked")
+                    if isinstance(raw, list):
+                        existing = [e for e in raw if isinstance(e, dict)]
+            except yaml.YAMLError:
+                existing = []
+        # Drop the pair we're about to re-record (idempotent re-ack) and
+        # drop anything older than the retention window.
+        kept: list[dict] = []
+        for e in existing:
+            if e.get("slug") == slug and e.get("sha") == sha:
+                continue  # replaced below
+            at_raw = e.get("acked_at")
+            if isinstance(at_raw, str):
+                try:
+                    at = datetime.fromisoformat(at_raw.replace("Z", "+00:00"))
+                except ValueError:
+                    # Unparseable timestamp → drop conservatively.
+                    continue
+                if at < cutoff:
+                    continue
+            kept.append(e)
+        kept.append(
+            {
+                "slug": slug,
+                "sha": sha,
+                "acked_at": now.astimezone(timezone.utc).isoformat(),
+            }
+        )
+        atomicio.atomic_write_text(
+            path, yaml.safe_dump({"version": _SCHEMA_VERSION, "acked": kept})
+        )
 
 
 __all__ = ["load_acked", "record_ack"]

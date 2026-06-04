@@ -424,3 +424,41 @@ def test_schema_version_is_one():
     """Phase 2 initial schema. Bumping this is a coordinated migration."""
     assert SCHEMA_VERSION == 1
     assert omc.SCHEMA_VERSION == 1
+
+
+# ─── org_lock wiring: double-checked refresh (node rsclk7nq / shawk7nq) ──────
+
+
+def test_ensure_warm_path_does_not_acquire_org_lock(isolated_cache, monkeypatch):
+    """A fresh cache returns on the fast path WITHOUT taking org_lock."""
+    import contextlib
+
+    save_cache(_cm(datetime.now(timezone.utc)))  # fresh under default 24h ttl
+    entered: list[bool] = []
+
+    @contextlib.contextmanager
+    def spy_lock(*a, **k):
+        entered.append(True)
+        yield
+
+    monkeypatch.setattr(omc, "org_lock", spy_lock)
+    gh = FakeGHClient(org_members={"org": ["alice"]})
+
+    assert ensure_org_members_fresh(gh, _policy(org="org")) is None
+    assert entered == []  # warm path never locked
+    assert gh.call_count["org_members"] == 0  # and never refetched
+
+
+def test_ensure_double_check_skips_refresh_when_concurrently_refreshed(
+    isolated_cache, monkeypatch
+):
+    """If another run refreshes between the outer freshness check and the
+    locked re-check, we must NOT refetch (the double-checked inner return)."""
+    stale = _cm(datetime.now(timezone.utc) - timedelta(hours=48))
+    fresh = _cm(datetime.now(timezone.utc))
+    seq = iter([stale, fresh])  # outer load = stale, inner (under lock) = fresh
+    monkeypatch.setattr(omc, "load_cache", lambda org: next(seq))
+    gh = FakeGHClient(org_members={"org": ["alice"]})
+
+    assert ensure_org_members_fresh(gh, _policy(org="org")) is None
+    assert gh.call_count["org_members"] == 0  # double-check avoided the refetch
