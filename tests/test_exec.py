@@ -300,6 +300,27 @@ def test_happy_path_three_targets_all_complete(claude_fake, tmp_log_dir, tmp_wd)
         assert meta["timed_out"] is False
 
 
+def test_redact_argv_whole_token_and_embedded():
+    """SEC-F5: the prompt is redacted whether it's a standalone token OR
+    embedded in a larger token (a custom template may use --prompt={prompt})."""
+    from gitbulk.exec import _redact_argv
+
+    # Standalone token (the built-in preset shape).
+    assert _redact_argv(["tool", "-p", "SECRET"], "SECRET") == [
+        "tool", "-p", "<prompt:6 chars>"
+    ]
+    # Embedded in a longer token — must still be redacted.
+    assert _redact_argv(["tool", "--prompt=SECRET", "x"], "SECRET") == [
+        "tool", "--prompt=<prompt:6 chars>", "x"
+    ]
+
+
+def test_redact_argv_empty_prompt_is_noop():
+    from gitbulk.exec import _redact_argv
+
+    assert _redact_argv(["a", "b"], "") == ["a", "b"]
+
+
 def test_meta_records_redacted_agent_argv_env_none(claude_fake, tmp_log_dir, tmp_wd):
     """SEC-F5: meta.yaml records the effective argv with the prompt elided and
     env-keys null when the full environment is inherited."""

@@ -253,10 +253,18 @@ def _log_paths(log_dir: Path, key: str) -> tuple[Path, Path, Path]:
 
 
 def _redact_argv(argv: list[str], prompt: str) -> list[str]:
-    """Return ``argv`` with any element equal to the (possibly large/sensitive)
-    prompt replaced by a length placeholder, for the audit record (SEC-F5)."""
+    """Return ``argv`` with the (possibly large/sensitive) prompt replaced by a
+    length placeholder, for the audit record (SEC-F5).
+
+    Redacts the prompt as a SUBSTRING of each token, not just whole-token
+    matches: a custom template may embed ``{prompt}`` inside a larger token
+    (e.g. ``--prompt={prompt}``), and the full prompt must not survive there
+    either. An empty prompt is a no-op (``str.replace("")`` would otherwise
+    splice the placeholder between every character)."""
+    if not prompt:
+        return list(argv)
     placeholder = f"<prompt:{len(prompt)} chars>"
-    return [placeholder if a == prompt else a for a in argv]
+    return [a.replace(prompt, placeholder) for a in argv]
 
 
 def _write_meta(
