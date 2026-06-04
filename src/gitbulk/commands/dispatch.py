@@ -87,6 +87,7 @@ from gitbulk.org_members_cache import (
     ensure_org_members_fresh,
 )
 from gitbulk.invariants import InvariantContext, get, run_chain
+from gitbulk.isolated_clone import create_isolated_clone, remove_isolated_clone
 from gitbulk.invariants.base import Invariant, InvariantKind
 from gitbulk.locks import (
     LockTimeoutError,
@@ -759,9 +760,11 @@ def _run_under_lock(
     prompt_text = prompt_path.read_text()
     runid = _runid_from_run_dir(rs.run_dir)
     targets: list[ExecTarget] = []
-    # Map ExecTarget.key → (slug, pr, worktree_path) so the post-pass
-    # cleanup can find the worktree without re-deriving the path.
-    target_meta: dict[str, tuple[str, PRInfo, Path]] = {}
+    # Map ExecTarget.key → (slug, pr, workspace_path, is_clone) so the post-pass
+    # cleanup can find the workspace and tear it down correctly. ``is_clone`` is
+    # True for a sandboxed agent's self-contained clone (agecln4k), False for a
+    # linked worktree.
+    target_meta: dict[str, tuple[str, PRInfo, Path, bool]] = {}
 
     # Resolve the agent backend(s) up front: --agent → per-repo agent: →
     # default_agent → claude (this.i agprof4k). The run default is resolved
@@ -809,40 +812,51 @@ def _run_under_lock(
                     context={"slug": slug, "pr": pr.number},
                 )
                 continue
+        # A sandboxed agent (agsbx3k) gets a self-contained CLONE instead of a
+        # linked worktree (SEC-F1 / agecln4k): a worktree's .git points into the
+        # operator clone, which the sandbox cannot bind. claude/unsandboxed
+        # agents keep the cheaper linked worktree.
+        is_clone = getattr(backend_by_name[name], "_sandbox", "none") != "none"
         try:
-            # repo_lock(slug): worktree creation mutates the clone's
-            # .git/worktrees admin — serialize it against another gitbulk run
-            # on the SAME repo (node rsclk7nq #6). NOT held across the agent
-            # pool below (that would serialize the whole long-running run).
+            # repo_lock(slug): workspace creation reads/mutates the clone's
+            # .git admin — serialize it against another gitbulk run on the SAME
+            # repo (node rsclk7nq #6). NOT held across the agent pool below.
             with repo_lock(
                 slug, "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
                 subcommand="dispatch",
             ):
-                worktree_path = create_worktree(
-                    repo.local_path,
-                    slug,
-                    pr.number,
-                    pr.head_ref,
-                    pr.head_sha,
-                    worktree_root=policy.worktree_root,
-                    runid=runid,
-                )
+                if is_clone:
+                    workspace_path = create_isolated_clone(
+                        repo.local_path, slug, pr.number, pr.head_ref,
+                        pr.head_sha, worktree_root=policy.worktree_root,
+                        runid=runid,
+                    )
+                else:
+                    workspace_path = create_worktree(
+                        repo.local_path, slug, pr.number, pr.head_ref,
+                        pr.head_sha, worktree_root=policy.worktree_root,
+                        runid=runid,
+                    )
                 # Least privilege (this.i agpriv8n): gitbulk performs the
-                # networked fetch itself, BEFORE the agent runs, so the agent
-                # can rebase against origin/<base> with no network and no
-                # credentials of its own. On fetch failure the worktree is
+                # networked base fetch itself, BEFORE the agent runs, so the
+                # agent can rebase against origin/<base> with no network and no
+                # credentials of its own. On fetch failure the workspace is
                 # removed and the PR skipped (the agent could not rebase
-                # offline anyway). Still under repo_lock — the fetch updates
-                # the clone's shared refs/remotes/*.
-                fetched = fetch_base(worktree_path, pr.base_ref)
+                # offline anyway).
+                fetched = fetch_base(workspace_path, pr.base_ref)
                 if fetched.status is not RebaseStatus.CLEAN:
-                    remove_worktree(repo.local_path, worktree_path)
+                    if is_clone:
+                        remove_isolated_clone(
+                            workspace_path, worktree_root=policy.worktree_root
+                        )
+                    else:
+                        remove_worktree(repo.local_path, workspace_path)
         except WorktreeError as e:
-            # Worktree creation/teardown failed; record and skip this PR.
+            # Workspace creation/teardown failed; record and skip this PR.
             # We DO NOT abort the whole run — the user's other 149
             # repos still deserve a shot.
             rs.record_error(
-                f"worktree creation failed for {slug}#{pr.number}: {e}",
+                f"workspace creation failed for {slug}#{pr.number}: {e}",
                 level="ERROR",
                 context={
                     "slug": slug,
@@ -864,12 +878,12 @@ def _run_under_lock(
         targets.append(
             ExecTarget(
                 key=key,
-                working_directory=worktree_path,
+                working_directory=workspace_path,
                 prompt=prompt_text,
                 input_text=None,
             )
         )
-        target_meta[key] = (slug, pr, worktree_path)
+        target_meta[key] = (slug, pr, workspace_path, is_clone)
         # Only non-default backends need a per-target entry; absent keys fall
         # back to ``default_backend`` in the kernel.
         if name != default_name:
@@ -917,7 +931,7 @@ def _run_under_lock(
     push_problem_keys: list[str] = []
     escalations_dir = rs.run_dir / "escalations"
     for r in results:
-        slug, pr, worktree_path = target_meta[r.key]
+        slug, pr, worktree_path, is_clone = target_meta[r.key]
         repo = repo_by_slug[slug]
         # Gap 1: the agent's RESOLVED:/ESCALATED: verdict lives only in its
         # stdout log; lift it so summary.md/state.yaml tell the true story.
@@ -982,12 +996,17 @@ def _run_under_lock(
                     slug, "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
                     subcommand="dispatch",
                 ):
-                    remove_worktree(repo.local_path, worktree_path)
+                    if is_clone:
+                        remove_isolated_clone(
+                            worktree_path, worktree_root=policy.worktree_root
+                        )
+                    else:
+                        remove_worktree(repo.local_path, worktree_path)
             except WorktreeError as e:
                 # Best-effort: record and leave on disk for the operator.
                 preserved = True
                 rs.record_error(
-                    f"worktree teardown failed for {slug}#{pr.number}: {e}",
+                    f"workspace teardown failed for {slug}#{pr.number}: {e}",
                     level="WARNING",
                     context={
                         "slug": slug,

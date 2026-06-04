@@ -580,6 +580,16 @@ less-trusted *backend* can do. The compensating controls (this.i `agtmpl9k`):
   are load-bearing for non-Claude agents — and why `claude` remains the trusted
   default served by the native client.
 
+**Post-review correction (2026-06-04, this.i `agsecr5n`).** An adversarial
+security review of this very feature found the sandbox was initially
+**non-functional** — it bound a linked worktree whose `.git` points into the
+operator clone, so git couldn't run, and it was tested only by argv-shape
+assertions (never e2e). Fixed: sandboxed agents now run in a self-contained
+clone (this.i `agecln4k`), validated by a real-`bwrap` e2e test with a
+regression control (`agtste9k`). The review also found least privilege was
+opt-in (now secure-by-default presets) and there was no foreign-author gate (now
+added). See `agsecr5n` for the full disposition of all five findings.
+
 **Threat → control → test matrix** (each row has an adversarial test in
 `tests/test_agent_security.py` / `tests/test_rebase.py` / `tests/test_dispatch.py`,
 this.i `agatk5n`):

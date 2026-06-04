@@ -40,3 +40,9 @@ gitbulk = ["manual-install-instructions.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    # Real-binary, no-network integration tests (real git + a local bare
+    # origin + real bubblewrap). Excluded from the hermetic coverage gate
+    # (`-m "not e2e"`); run in their own CI job. See this.i node agtste9k.
+    "e2e: real-binary integration tests (git/bwrap); excluded from coverage",
+]

@@ -767,6 +767,107 @@ def test_dispatch_default_agent_sandbox_unavailable_refuses(
     assert created == []  # aborted before any worktree
 
 
+def _sandboxed_gemini_setup(monkeypatch, write_config, fresh_org_cache,
+                            fake_clones):
+    """A run whose agent (gemini) requests a working sandbox → isolated clone."""
+    monkeypatch.setattr("gitbulk.agent.bwrap_available", lambda: True)
+    write_config(
+        repos_slugs=["dhh1128/alpha"],
+        extra={
+            "default_agent": "gemini",
+            "agents": {"gemini": {"sandbox": "fs-only"}},
+        },
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake_clones("dhh1128/alpha")
+    pr = _make_pr(slug="dhh1128/alpha", number=1, author="dhh1128")
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
+    )
+
+
+def test_dispatch_sandboxed_agent_uses_isolated_clone(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones, tmp_path,
+):
+    """A sandboxed agent gets a self-contained clone (not a linked worktree),
+    torn down via remove_isolated_clone (SEC-F1 / agecln4k)."""
+    _sandboxed_gemini_setup(monkeypatch, write_config, fresh_org_cache, fake_clones)
+    created: list = []
+    removed: list = []
+
+    def _fake_create(repo_path, slug, num, head_ref, head_sha, *,
+                     worktree_root, runid):
+        p = tmp_path / f"clone-{num}"
+        p.mkdir()
+        created.append(p)
+        return p
+
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.create_isolated_clone", _fake_create
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.remove_isolated_clone",
+        lambda p, *, worktree_root: removed.append(p),
+    )
+    _stub_is_conflict(monkeypatch, conflicts_for_paths=[])
+    _stub_execute_targets(
+        monkeypatch,
+        results_by_key={_key_for_pr("dhh1128/alpha", 1): {
+            "status": "completed", "exit_code": 0}},
+    )
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, apply=True, code_root=code_root,
+                   skip_check=_LOCAL_SKIPS)
+    )
+    assert len(created) == 1  # isolated clone, not a worktree
+    assert removed == created  # torn down via remove_isolated_clone
+
+
+def test_dispatch_sandboxed_prefetch_failure_removes_clone(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones, tmp_path,
+):
+    """Fetch failure on a sandboxed target removes the clone and skips the PR."""
+    from gitbulk.rebase import RebaseResult, RebaseStatus
+
+    _sandboxed_gemini_setup(monkeypatch, write_config, fresh_org_cache, fake_clones)
+    created: list = []
+    removed: list = []
+
+    def _fake_create(*a, **k):
+        p = tmp_path / "c"
+        p.mkdir(exist_ok=True)
+        created.append(p)
+        return p
+
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.create_isolated_clone", _fake_create
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.remove_isolated_clone",
+        lambda p, *, worktree_root: removed.append(p),
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.fetch_base",
+        lambda wt, base: RebaseResult(RebaseStatus.ERROR, "offline"),
+    )
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, apply=True, code_root=code_root,
+                   skip_check=_LOCAL_SKIPS)
+    )
+    assert len(removed) == 1  # the clone was cleaned up on fetch failure
+    latest = paths.latest_run_symlink("dispatch").resolve()
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    assert "dhh1128/alpha" not in state.get("repos", {})
+
+
 def test_dispatch_sandbox_warn_run_runs_but_flags_attention(
     monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
     prompt_file, fake_clones,
@@ -1210,7 +1311,7 @@ def test_dispatch_apply_worktree_create_error_skips_pr(
         for line in (latest / "errors.log").read_text().splitlines()
         if line.strip()
     ]
-    assert any("worktree creation failed" in e["message"] for e in errors)
+    assert any("workspace creation failed" in e["message"] for e in errors)
 
 
 # ─── Universal invariant Fail (gh.authenticated) → exit 1 ──────────────────

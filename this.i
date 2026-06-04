@@ -2772,6 +2772,59 @@ Gitbulk Triage Tool = goal:
         (agtste9k).
       approved-by: daniel, 2026-06-04
 
+    Sandboxed Agents Use A Self-Contained Clone = decision:
+      id: agecln4k
+      why: >
+        The SEC-F1 fix (see agsecr5n). A bwrap sandbox can only bind whole
+        directories; a linked ``git worktree`` (worktree.create_worktree) has a
+        ``.git`` FILE pointing into the operator clone's
+        ``.git/worktrees/<name>`` whose commondir is the clone's
+        objects/refs/config/hooks — none of which the sandbox binds, and
+        ``--tmpfs $HOME`` shadows the clone outright. So inside the sandbox git
+        fails 'not a git repository'. Binding the clone's ``.git`` to fix that
+        would re-expose its hooks/ to the auto-approve agent (plant a
+        post-checkout hook that fires on the operator's next real git op).
+
+        Therefore a SANDBOXED agent (sandbox != none) gets a self-contained
+        repo via gitbulk.isolated_clone.create_isolated_clone:
+        ``git clone --no-hardlinks --no-checkout`` of the operator clone (own
+        .git, objects copied — not shared, default hooks), origin reset to the
+        REAL remote, ``core.hooksPath`` pointed at an empty dir (so nothing in
+        hooks/ runs), the PR head fetched from the real remote and checked out
+        detached. All networked/credentialed steps run OUTSIDE the sandbox
+        (gitbulk's job); the agent then runs bound to that dir ALONE — git works
+        and there is no filesystem path to the operator clone, other repos, or
+        creds. Teardown is rmtree (no worktree admin entry to unregister; guarded
+        to stay under worktree_root). claude / unsandboxed agents keep the
+        cheaper linked worktree. fetch_base / verify_resolved_for_push /
+        force_push_with_lease operate on either workspace identically, so the
+        agpriv8n flow is unchanged. Cost: a clone per sandboxed PR — acceptable
+        for a personal tool dispatching a handful of conflicting PRs.
+
+    E2E Tests For Real-Binary Security Controls = decision:
+      id: agtste9k
+      why: >
+        SEC-F1 shipped a sandbox that never worked because it was tested only by
+        argv-SHAPE assertions (asserting the bwrap argv looked right) and never
+        run end-to-end — false confidence in a load-bearing security control.
+        Rule going forward: OS-confinement / real-binary behavior gets an e2e
+        test that actually spawns the binary. gitbulk now has a tests/e2e/ tier
+        (pytest marker ``e2e``) that runs REAL git + REAL bwrap with NO network
+        (a local bare repo is the origin), proving git works inside the sandbox
+        over an isolated clone (agecln4k) AND — as a regression control — that
+        the old linked-worktree approach fails. The tier is:
+          - skipif(not bwrap_available()) so locked-down runners skip cleanly;
+          - EXCLUDED from the hermetic 100%-coverage gate (run with
+            ``-m "not e2e"``) — coverage of isolated_clone.py / sandbox.py comes
+            from hermetic unit tests; e2e is additive behavioral confidence, not
+            a coverage source;
+          - run in a DEDICATED ci.yml ``e2e`` job (installs bubblewrap, relaxes
+            the Ubuntu-24 AppArmor userns restriction, probes bwrap) so its
+            environment-specific result never blocks the core gate.
+        This honors AGENTS.md 'no network in tests' (local bare origin only)
+        while closing the gap that argv-shape testing left.
+      approved-by: daniel, 2026-06-04
+
     Repo-Level Dispatch Opens A PR = decision:
       id: dsprp7kq
       why: >

@@ -247,6 +247,21 @@ Defense-in-depth — **not** the primary control (that is §4 + §6). Per-profil
   tasks that need neither network nor creds — which, thanks to §4, includes
   `resolve-conflicts`.** This is the tightest, recommended policy for that class.
 
+**Workspace (SEC-F1, this.i `agecln4k`).** A linked `git worktree` cannot run
+inside the sandbox — its `.git` is a pointer into the operator's clone
+(objects/refs/config/hooks), which the sandbox does not bind, and binding it
+would re-expose the clone's hooks to the auto-approve agent. So a **sandboxed
+agent gets a self-contained `git clone --no-hardlinks`** instead: its own `.git`
+(no shared objects/hooks/config), `origin` reset to the real remote,
+`core.hooksPath` neutralized, the head fetched + checked out by gitbulk
+*outside* the sandbox. The agent then runs bound to that directory alone — git
+works, and there is no filesystem path from the agent to the operator's clone,
+other repos, or credentials. Unsandboxed/claude agents keep the cheaper linked
+worktree. This is validated by a **real-`bwrap` e2e test** (`tests/e2e/`,
+auto-skips when bwrap/userns are absent), with a regression control proving the
+linked-worktree approach fails — the test that the original argv-shape-only
+suite lacked (this.i `agtste9k`).
+
 Mechanics:
 
 - A `wrapper:` prefix in the resolved invocation (`[bwrap, <args...>, <agent

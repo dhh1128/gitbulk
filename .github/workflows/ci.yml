@@ -37,10 +37,54 @@ jobs:
       - name: Run tests with branch coverage gate
         run: |
           uv run --python ${{ matrix.python-version }} pytest -v \
+            -m "not e2e" \
             --cov=src/gitbulk \
             --cov-branch \
             --cov-report=term-missing \
             --cov-fail-under=100
+
+  # Real-binary integration: exercise the bubblewrap sandbox + isolated-clone
+  # workspace with real git/bwrap (no network — a local bare repo is the
+  # origin). Separate from `test` so its environment-specific skips/failures
+  # never block the hermetic 100%-coverage gate (this.i agtste9k).
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
+
+      - name: Install bubblewrap + enable unprivileged user namespaces
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          # Ubuntu 24.04 restricts unprivileged userns via AppArmor; relax it so
+          # bwrap can run. Best-effort: the e2e tests skip themselves if the
+          # probe still fails, so this never hard-fails the job on a locked-down
+          # runner.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_clone=1 || true
+          if bwrap --ro-bind / / -- true; then
+            echo "bwrap OK"
+          else
+            echo "bwrap unavailable; e2e tests will skip"
+          fi
+
+      - name: Set up uv (with cache)
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install package from lockfile
+        run: uv sync --frozen --extra test
+
+      - name: Run e2e (real git + bwrap) integration tests
+        run: uv run pytest -v -m e2e
 
   # Exercise the release-asset construction (shared with release.yml) on every
   # push/PR, without publishing — so the release path is validated pre-tag.
