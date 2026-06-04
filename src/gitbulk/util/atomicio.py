@@ -50,10 +50,12 @@ def atomic_write_symlink(symlink_path: Path, target: Path) -> None:
     tree can be relocated without breaking symlinks (per kp7nw4mq.e).
     """
     relative_target = os.path.relpath(target, start=symlink_path.parent)
-    tmp = _unique_tmp(symlink_path)
-    # mkstemp made a regular file; drop it so the unique name is free for a
-    # symlink. The name is unique, so no other process competes for it.
-    tmp.unlink()
+    # Create the symlink DIRECTLY at a unique name. os.symlink is itself an
+    # atomic create (it fails if the name already exists), so there is no
+    # create-then-unlink window where another writer could grab the temp path
+    # — addressing the Copilot review on PR #3. The 16-hex-char random token
+    # makes a name collision (and thus the loud FileExistsError) negligible.
+    tmp = symlink_path.parent / f".{symlink_path.name}.{os.urandom(8).hex()}.tmp"
     try:
         os.symlink(relative_target, tmp)
         os.replace(tmp, symlink_path)
