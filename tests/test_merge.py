@@ -460,7 +460,7 @@ def test_lock_timeout_exit_structural(
     class _BoomLock:
         def __enter__(self):
             raise LockTimeoutError(
-                paths.global_lock_file(),
+                paths.named_lock_file("default-branches"),
                 {
                     "pid": 999,
                     "started_at": "1970-01-01T00:00:00+00:00",
@@ -472,12 +472,17 @@ def test_lock_timeout_exit_structural(
         def __exit__(self, *a):  # pragma: no cover — never reached
             return False
 
-    monkeypatch.setattr(
-        "gitbulk.commands.merge.global_lock", lambda *a, **kw: _BoomLock()
+    fake = FakeGHClient(
+        user={"login": "dhh1128"}, default_branches={"dhh1128/alpha": "main"}
     )
-    fake = FakeGHClient(user={"login": "dhh1128"})
     monkeypatch.setattr(
         "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+    # default_branches_lock (resource #3) times out — the first resource lock
+    # the pipeline reaches (node rsclk7nq); surfaced as exit 1, no sentinel.
+    monkeypatch.setattr(
+        "gitbulk.default_branch_cache.default_branches_lock",
+        lambda *a, **kw: _BoomLock(),
     )
     rc = merge_handler(_make_args(code_root=code_root))
     assert rc == EXIT_STRUCTURAL_FAILURE

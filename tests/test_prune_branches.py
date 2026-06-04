@@ -424,8 +424,11 @@ def test_skip_check_yields_exit_4(
     assert rc == EXIT_OVERRIDES_APPLIED
 
 
-def test_lock_timeout_returns_structural_failure(monkeypatch, isolated_xdg, code_root, write_config):
+def test_lock_timeout_returns_structural_failure(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
     write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])  # warm org → no org_lock
     from gitbulk.locks import LockTimeoutError
 
     class _BoomLock:
@@ -435,8 +438,15 @@ def test_lock_timeout_returns_structural_failure(monkeypatch, isolated_xdg, code
         def __exit__(self, *a):
             return False
 
+    fake = FakeGHClient(
+        user={"login": "dhh1128"}, default_branches={"dhh1128/alpha": "main"}
+    )
+    _install(monkeypatch, fake)
+    # default_branches_lock (resource #3) times out — the first resource lock
+    # the pipeline reaches (node rsclk7nq); the handler surfaces it as exit 1.
     monkeypatch.setattr(
-        "gitbulk.commands.prune_branches.global_lock", lambda *a, **k: _BoomLock()
+        "gitbulk.default_branch_cache.default_branches_lock",
+        lambda *a, **k: _BoomLock(),
     )
     rc = prune_branches_handler(_args(code_root=code_root))
     assert rc == EXIT_STRUCTURAL_FAILURE

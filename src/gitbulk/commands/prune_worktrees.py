@@ -35,7 +35,12 @@ from gitbulk.org_members_cache import (
 )
 from gitbulk.invariants import InvariantContext, get, run_chain
 from gitbulk.invariants.base import Invariant, InvariantKind
-from gitbulk.locks import LockTimeoutError, global_lock
+from gitbulk.locks import (
+    LockTimeoutError,
+    repo_lock,
+    run_state_lock,
+    sentinel_lock,
+)
 from gitbulk.runstate import RunState
 from gitbulk.util.progress import Progress
 from gitbulk.util.style import error_line, summary_line
@@ -222,15 +227,15 @@ def prune_worktrees_handler(args: argparse.Namespace) -> int:
     spec = resolve_filter_spec(args, policy)
     repos, repos_excluded = select_repos(repos, spec)
 
+    # Resource-scoped locking (node rsclk7nq): no global lock. Caches self-lock
+    # in their helpers; the per-repo clone reads/removes take repo_lock(slug)
+    # (shared for the worktree-list read, exclusive for the removals); the
+    # terminal writes take sentinel_lock + run_state_lock("prune-worktrees").
     try:
-        with global_lock(
-            "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
-            subcommand="prune-worktrees",
-        ):
-            return _run_under_lock(
-                args, policy, repos, repos_text, skipped_entries,
-                spec, repos_excluded,
-            )
+        return _run_under_lock(
+            args, policy, repos, repos_text, skipped_entries,
+            spec, repos_excluded,
+        )
     except LockTimeoutError as e:
         print(
             error_line(f"gitbulk prune-worktrees: timed out acquiring lock: {e}"),
@@ -335,7 +340,15 @@ def _run_under_lock(
         scan.update(i, repo.slug)
         slug = repo.slug
         try:
-            worktrees = list_worktrees(repo.local_path)
+            # repo_lock(slug, shared): the worktree-list read is git against
+            # the clone, so it serializes against another run's worktree
+            # removal on the SAME repo (node rsclk7nq #6). Released before the
+            # network call below.
+            with repo_lock(
+                slug, "shared", timeout=_LOCK_TIMEOUT_SECONDS,
+                subcommand="prune-worktrees",
+            ):
+                worktrees = list_worktrees(repo.local_path)
             open_prs = gh.my_open_prs([slug], author=None).get(slug, [])
         except (WorktreeError, GHError) as e:
             rs.record_error(
@@ -375,7 +388,18 @@ def _run_under_lock(
         clone = clone_by_slug[slug]
         wt_path = Path(cand["path"])
         try:
-            remove_linked_worktree(clone, wt_path)
+            # repo_lock(slug, exclusive): both git mutations on the clone (the
+            # worktree removal and the merged-branch delete) run under one
+            # acquisition so another gitbulk run never touches this clone mid-
+            # operation (node rsclk7nq #6).
+            with repo_lock(
+                slug, "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
+                subcommand="prune-worktrees",
+            ):
+                remove_linked_worktree(clone, wt_path)
+                cand["removed"] = True
+                removed_count += 1
+                branch_deleted = delete_merged_local_branch(clone, cand["branch"])
         except WorktreeError as e:
             failure_count += 1
             cand["error"] = str(e)
@@ -385,9 +409,6 @@ def _run_under_lock(
                 context={"slug": slug, "path": str(wt_path), "error": str(e)},
             )
             continue
-        cand["removed"] = True
-        removed_count += 1
-        branch_deleted = delete_merged_local_branch(clone, cand["branch"])
         cand["branch_deleted"] = branch_deleted
         rs.record_error(
             f"removed worktree {wt_path} ({cand['branch']}); "
@@ -574,8 +595,13 @@ def _finish(
         rs.write_summary(f"# gitbulk prune-worktrees (FAILED)\n\n{summary}\n\n{synth}")
     if attention:
         runid = _runid_from_run_dir(rs.run_dir)
-        sentinel.set_attention(exit_code, "prune-worktrees", runid, summary)
-    rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
+        with sentinel_lock(timeout=_LOCK_TIMEOUT_SECONDS, subcommand="prune-worktrees"):
+            sentinel.set_attention(exit_code, "prune-worktrees", runid, summary)
+    with run_state_lock(
+        "prune-worktrees", "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
+        subcommand="prune-worktrees",
+    ):
+        rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
     print(summary_line(
         f"gitbulk prune-worktrees: {summary}. View: gitbulk show prune-worktrees",
         exit_code,
