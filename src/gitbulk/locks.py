@@ -44,6 +44,46 @@ _MODE_TO_OP = {
 
 _POLL_INTERVAL = 0.1  # seconds; how often we retry while waiting under a timeout
 
+#: Optional lock-status reporter (node rsclk7nq UX). Default None = silent, so
+#: the library, tests, and embeds emit nothing; the CLI installs a TTY reporter
+#: so an interactive user can see when one gitbulk run is waiting on another.
+_status_reporter = None
+
+
+def set_status_reporter(reporter) -> None:
+    """Install (or clear, with ``None``) the lock-status reporter.
+
+    A reporter is duck-typed with ``waiting(label, holder, remaining,
+    elapsed)``, ``acquired(label, waited)``, and ``gave_up(label)``; it is
+    consulted only while an acquisition is actually BLOCKED (uncontended
+    acquires stay silent). It engages only when a bounded ``timeout`` is set —
+    which every CLI acquisition passes — so an indefinite ``timeout=None`` wait
+    (tests/embeds) keeps the original blocking behavior with no status.
+    """
+    global _status_reporter
+    _status_reporter = reporter
+
+
+def _label_for(path: Path) -> str:
+    """Friendly name for a lock file, for the status line."""
+    name = path.stem  # strip the .lock suffix
+    fixed = {
+        "default-branches": "default-branches",
+        "attention": "ATTENTION sentinel",
+        "dashboard": "dashboard",
+        "watchdog-acked": "watchdog-ack",
+        "run": "global",
+    }
+    if name in fixed:
+        return fixed[name]
+    if name.startswith("runstate-"):
+        return f"run-state ({name[len('runstate-'):]})"
+    if name.startswith("org-"):
+        return f"org-members ({name[len('org-'):]})"
+    if "__" in name:  # normalized owner__repo slug
+        return f"repo ({name.replace('__', '/')})"
+    return name
+
 
 class LockTimeoutError(TimeoutError):
     """Raised when a timeout-bounded lock acquisition fails to acquire in time.
@@ -115,18 +155,41 @@ def _read_holder_metadata(path: Path) -> dict | None:
 
 def _acquire(fd: int, lock_op: int, lock_path: Path, timeout: float | None) -> None:
     if timeout is None:
+        # Indefinite wait: a single blocking flock, no status (the pre-feature
+        # behavior; only tests/embeds use timeout=None — the CLI always bounds).
         fcntl.flock(fd, lock_op)
         return
-    deadline = time.monotonic() + timeout
+    reporter = _status_reporter
+    label = _label_for(lock_path) if reporter is not None else ""
+    start = time.monotonic()
+    deadline = start + timeout
+    holder: dict | None = None
+    waited = False
     while True:
         try:
             fcntl.flock(fd, lock_op | fcntl.LOCK_NB)
-            return
+            break
         except BlockingIOError:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if reporter is not None:
+                    reporter.gave_up(label=label)
                 raise LockTimeoutError(lock_path, _read_holder_metadata(lock_path))
+            waited = True
+            if reporter is not None:
+                if holder is None:  # read the holder once, not every tick
+                    holder = _read_holder_metadata(lock_path)
+                reporter.waiting(
+                    label=label,
+                    holder=holder,
+                    remaining=remaining,
+                    elapsed=time.monotonic() - start,
+                )
             time.sleep(min(_POLL_INTERVAL, remaining))
+    if reporter is not None:
+        reporter.acquired(
+            label=label, waited=(time.monotonic() - start) if waited else 0.0
+        )
 
 
 def _write_metadata(fd: int, subcommand: str | None) -> None:

@@ -1569,6 +1569,18 @@ Gitbulk Triage Tool = goal:
         dropped. tmlk5pq3's bounded-timeout policy and LockTimeoutError
         handling carry over unchanged to every keyed lock.
 
+        LOCK-STATUS UX (2026-06-04): locks._acquire calls a pluggable,
+        default-silent reporter (set_status_reporter) while BLOCKED, so an
+        interactive user running two commands sees one waiting on the other.
+        cli installs util/lockstatus.TtyLockStatusReporter; library/tests stay
+        silent (no behavior change). Wait-only (uncontended acquires render
+        nothing); live stderr line with a COUNTDOWN to timeout; folds into an
+        active Progress bar (progress.active_progress + set_wait_suffix) so a
+        repo_lock wait mid-apply shares the bar's line. Auto-on when stderr is
+        a TTY; GITBULK_LOCK_STATUS=off disables; only engages when a bounded
+        timeout is set (timeout=None keeps the original blocking flock, no
+        status). Full design: docs/design/resource-scoped-locking.md §11.
+
         ROLLOUT (all landed): Phase 0 (hardening) -> Phase 1 (show/summarize
         off global_lock onto run_state_lock — fixed the reported symptom) ->
         Phase 2 (repo_lock + cache/org/sentinel locks across report + the six

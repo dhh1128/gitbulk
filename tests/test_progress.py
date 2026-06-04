@@ -100,3 +100,68 @@ def test_progress_context_manager_calls_done():
     with Progress(3, prefix="ctx: ", stream=buf) as p:
         p.update(1, "first")
     assert buf.getvalue().endswith("\r")
+
+
+# ─── wait-suffix fold + active registry (node rsclk7nq UX) ──────────────────
+
+
+@pytest.fixture(autouse=True)
+def _reset_active_progress():
+    yield
+    import gitbulk.util.progress as prog
+    prog._active = None
+
+
+def test_progress_set_wait_suffix_folds_into_line():
+    buf = _TTYBuffer()
+    p = Progress(3, prefix="rebasing: ", stream=buf)
+    p.update(2, "owner/repo")
+    p.set_wait_suffix("waiting 27s")
+    assert "rebasing: 2/3 — owner/repo — waiting 27s" in buf.getvalue()
+
+
+def test_progress_clear_wait_suffix_repaints_without_it():
+    buf = _TTYBuffer()
+    p = Progress(3, prefix="x ", stream=buf)
+    p.update(1, "m")
+    p.set_wait_suffix("waiting")
+    p.clear_wait_suffix()
+    assert "waiting" not in buf.getvalue().split("\r")[-1]
+
+
+def test_progress_clear_wait_suffix_noop_when_absent():
+    buf = _TTYBuffer()
+    p = Progress(2, stream=buf)
+    p.update(1)
+    before = buf.getvalue()
+    p.clear_wait_suffix()
+    assert buf.getvalue() == before
+
+
+def test_progress_set_wait_suffix_noop_when_disabled():
+    buf = io.StringIO()  # not a TTY
+    p = Progress(3, stream=buf)
+    p.set_wait_suffix("x")
+    p.clear_wait_suffix()
+    assert buf.getvalue() == ""
+
+
+def test_active_progress_tracks_current_bar():
+    from gitbulk.util import progress as prog
+
+    assert prog.active_progress() is None
+    buf = _TTYBuffer()
+    p = Progress(3, stream=buf)
+    p.update(1)
+    assert prog.active_progress() is p
+    p.done()
+    assert prog.active_progress() is None
+
+
+def test_active_progress_none_for_disabled_bar():
+    from gitbulk.util import progress as prog
+
+    buf = io.StringIO()  # not a TTY → disabled, never registers
+    p = Progress(3, stream=buf)
+    p.update(1)
+    assert prog.active_progress() is None

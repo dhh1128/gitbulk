@@ -236,3 +236,26 @@ expose more concurrency, so they ship first, independently of the lock model:
 
 All inter-process contention tests use subprocess spawns (per `hk5pq3nm.h` —
 `fcntl.flock` is per-process; threads in one process all see the lock as held).
+
+## 11. Interactive lock-status indicator
+
+So a user running two commands at once can *see* one waiting on the other,
+`locks._acquire` calls a pluggable, default-silent reporter
+(`set_status_reporter`) while an acquisition is **blocked**. The CLI installs a
+TTY reporter (`util/lockstatus.TtyLockStatusReporter`); the library/tests stay
+silent (no behavior change).
+
+- **Wait-only**: nothing renders on the ~35 uncontended acquisitions per run;
+  the live line appears only when actually blocked.
+- **Live line on stderr** (never stdout), sticky via `\r`, with a **countdown**:
+  `⏳ waiting on repo (owner/foo) lock — held by merge (pid 4821 running) — 27s left`.
+  Glyph/color gate through `Style` (`[waiting]` ASCII fallback).
+- **Folds into an active `Progress` bar** (`progress.active_progress()` +
+  `set_wait_suffix`) so a `repo_lock` wait mid-apply shares the bar's line
+  instead of fighting it: `rebasing: 3/10 — owner/foo — ⏳ waiting … 27s left`.
+- **Gating**: auto-on only when stderr is a TTY (cron/pipes silent);
+  `GITBULK_LOCK_STATUS=off` disables. The reporter engages only when a bounded
+  `timeout` is set (always, in the CLI) — an indefinite `timeout=None` wait
+  keeps the original blocking `flock` with no status.
+- Cleared before any other output (the `timed out` error / summary) so lines
+  never mangle.

@@ -27,6 +27,17 @@ from __future__ import annotations
 import sys
 from typing import IO
 
+#: The currently-rendering enabled Progress, if any. Lets the lock-status
+#: reporter (node rsclk7nq UX) FOLD a "waiting on <lock>" message into the live
+#: bar instead of fighting it for the stderr line. Only one bar renders at a
+#: time in practice (commands use them sequentially).
+_active: "Progress | None" = None
+
+
+def active_progress() -> "Progress | None":
+    """Return the Progress bar currently owning the terminal line, or None."""
+    return _active
+
 
 class Progress:
     """Stateful one-line progress indicator. Use as a context manager
@@ -44,6 +55,9 @@ class Progress:
         self._stream = stream if stream is not None else sys.stderr
         self._enabled = self._stream.isatty() and total > 0
         self._last_len = 0
+        self._last_n = 0
+        self._last_message = ""
+        self._wait_suffix = ""
 
     def update(self, n: int, message: str = "") -> None:
         """Print "N/total — message" overwriting the previous line.
@@ -54,18 +68,43 @@ class Progress:
         """
         if not self._enabled:
             return
-        if message:
-            line = f"{self._prefix}{n}/{self._total} — {message}"
-        else:
-            line = f"{self._prefix}{n}/{self._total}"
+        global _active
+        _active = self
+        self._last_n = n
+        self._last_message = message
+        self._render()
+
+    def _render(self) -> None:
+        line = f"{self._prefix}{self._last_n}/{self._total}"
+        if self._last_message:
+            line += f" — {self._last_message}"
+        if self._wait_suffix:
+            line += f" — {self._wait_suffix}"
         # Pad with spaces to overwrite the previous (longer) line.
         pad = max(0, self._last_len - len(line))
         self._stream.write(f"\r{line}{' ' * pad}")
         self._stream.flush()
         self._last_len = len(line)
 
+    def set_wait_suffix(self, text: str) -> None:
+        """Fold a transient suffix (e.g. a lock-wait notice) into the bar."""
+        if not self._enabled:
+            return
+        self._wait_suffix = text
+        self._render()
+
+    def clear_wait_suffix(self) -> None:
+        """Remove the wait suffix and repaint the bar without it."""
+        if not self._enabled or not self._wait_suffix:
+            return
+        self._wait_suffix = ""
+        self._render()
+
     def done(self) -> None:
         """Clear the progress line so subsequent output starts clean."""
+        global _active
+        if _active is self:
+            _active = None
         if not self._enabled or self._last_len == 0:
             return
         self._stream.write("\r" + " " * self._last_len + "\r")
@@ -79,4 +118,4 @@ class Progress:
         self.done()
 
 
-__all__ = ["Progress"]
+__all__ = ["Progress", "active_progress"]

@@ -616,3 +616,129 @@ def test_all_production_lock_acquisitions_pass_a_timeout():
         "lock acquisition(s) missing an explicit timeout= (would block "
         "forever on contention):\n" + "\n".join(offenders)
     )
+
+
+# ─── lock-status reporter hook (node rsclk7nq UX) ───────────────────────────
+
+
+class _RecordingReporter:
+    def __init__(self):
+        self.waits = []
+        self.acquires = []
+        self.gaveups = []
+
+    def waiting(self, *, label, holder, remaining, elapsed):
+        self.waits.append((label, holder, remaining, elapsed))
+
+    def acquired(self, *, label, waited):
+        self.acquires.append((label, waited))
+
+    def gave_up(self, *, label):
+        self.gaveups.append(label)
+
+
+@pytest.fixture
+def reporter(monkeypatch):
+    r = _RecordingReporter()
+    monkeypatch.setattr(locks, "_status_reporter", r)
+    return r
+
+
+def _hold(name: str, *, metadata: dict | None = None) -> int:
+    """EX-flock a named lock file from this process (simulating another holder),
+    optionally writing holder metadata. Caller closes the returned fd."""
+    fd = os.open(paths.named_lock_file(name), os.O_RDWR | os.O_CREAT, 0o644)
+    if metadata is not None:
+        os.write(fd, json.dumps(metadata).encode())
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
+
+
+def test_set_status_reporter_roundtrip(monkeypatch):
+    monkeypatch.setattr(locks, "_status_reporter", None)
+    marker = object()
+    locks.set_status_reporter(marker)
+    assert locks._status_reporter is marker
+    locks.set_status_reporter(None)
+    assert locks._status_reporter is None
+
+
+def test_reporter_uncontended_acquire_reports_waited_zero(isolated_cache, reporter):
+    with locks.run_state_lock("merge", "exclusive", timeout=1.0):
+        pass
+    assert reporter.waits == []
+    assert reporter.gaveups == []
+    assert reporter.acquires == [("run-state (merge)", 0.0)]
+
+
+def test_reporter_timeout_calls_gave_up_and_reads_holder_once(
+    isolated_cache, reporter
+):
+    fd = _hold(
+        "runstate-merge",
+        metadata={
+            "pid": 4321,
+            "started_at": "1970-01-01T00:00:00+00:00",
+            "subcommand": "prune-branches",
+        },
+    )
+    try:
+        with pytest.raises(LockTimeoutError):
+            with locks.run_state_lock("merge", "exclusive", timeout=0.3):
+                pass
+    finally:
+        os.close(fd)
+    assert len(reporter.waits) >= 1          # ticked while blocked
+    assert reporter.gaveups == ["run-state (merge)"]
+    assert reporter.acquires == []           # never acquired
+    # holder metadata read ONCE, then reused each tick (same dict object).
+    holder_ids = {id(w[1]) for w in reporter.waits}
+    assert len(holder_ids) == 1
+    assert reporter.waits[0][1]["subcommand"] == "prune-branches"
+    # countdown decreases toward zero.
+    assert reporter.waits[0][2] <= 0.3
+
+
+def test_reporter_acquire_after_wait_reports_positive_waited(
+    isolated_cache, reporter
+):
+    fd = _hold("runstate-merge")
+    released = threading.Event()
+
+    def release():
+        time.sleep(0.15)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        released.set()
+
+    t = threading.Thread(target=release)
+    t.start()
+    try:
+        with locks.run_state_lock("merge", "exclusive", timeout=2.0):
+            assert released.wait(timeout=1.0)
+    finally:
+        t.join(timeout=2.0)
+        os.close(fd)
+    assert len(reporter.waits) >= 1
+    assert reporter.gaveups == []
+    assert len(reporter.acquires) == 1
+    assert reporter.acquires[0][0] == "run-state (merge)"
+    assert reporter.acquires[0][1] > 0       # actually waited
+
+
+@pytest.mark.parametrize(
+    "filename,expected",
+    [
+        ("runstate-merge.lock", "run-state (merge)"),
+        ("runstate-prune-worktrees.lock", "run-state (prune-worktrees)"),
+        ("dhh1128__gitbulk.lock", "repo (dhh1128/gitbulk)"),
+        ("org-provenant-dev.lock", "org-members (provenant-dev)"),
+        ("default-branches.lock", "default-branches"),
+        ("attention.lock", "ATTENTION sentinel"),
+        ("dashboard.lock", "dashboard"),
+        ("watchdog-acked.lock", "watchdog-ack"),
+        ("run.lock", "global"),
+        ("weird-name.lock", "weird-name"),
+    ],
+)
+def test_label_for(filename, expected):
+    assert locks._label_for(Path("/x") / filename) == expected
