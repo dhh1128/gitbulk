@@ -37,6 +37,7 @@ byte-identical to pre-feature behavior.
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import subprocess
@@ -50,6 +51,14 @@ from gitbulk.claude import (
     ProductionClaudeClient,
 )
 from gitbulk.config.repos import ConfigError
+from gitbulk.sandbox import SANDBOX_NONE, bwrap_available, wrap_argv
+
+_log = logging.getLogger(__name__)
+
+#: How to behave when a profile requests a sandbox the host cannot provide.
+SANDBOX_FALLBACK_REFUSE = "refuse"
+SANDBOX_FALLBACK_WARN_RUN = "warn-run"
+VALID_SANDBOX_FALLBACKS = {SANDBOX_FALLBACK_REFUSE, SANDBOX_FALLBACK_WARN_RUN}
 
 #: The placeholders the template engine substitutes.
 PROMPT_PLACEHOLDER = "{prompt}"
@@ -225,11 +234,43 @@ class CommandAgentBackend:
     """An :class:`~gitbulk.claude.AgentBackend` driven by an :class:`AgentProfile`."""
 
     def __init__(
-        self, profile: AgentProfile, *, default_timeout: float = _DEFAULT_TIMEOUT
+        self,
+        profile: AgentProfile,
+        *,
+        default_timeout: float = _DEFAULT_TIMEOUT,
+        sandbox_fallback: str = SANDBOX_FALLBACK_REFUSE,
+        extra_env: dict[str, str] | None = None,
     ) -> None:
         self.profile = profile
         self._binary = _pin_binary(profile.command[0])
         self._default_timeout = default_timeout
+        # Scoped-token injection seam (this.i agtok2n): a caller (e.g. a future
+        # per-repo short-lived-token minter) supplies env vars that always reach
+        # the child, on top of the ``env`` allowlist. None ⇒ no extra vars.
+        self._extra_env = extra_env
+        # Resolve the effective sandbox now (this.i agsbx3k). If the profile
+        # asks for a sandbox the host can't provide, REFUSE by default rather
+        # than silently downgrade (a silent downgrade defeats the purpose);
+        # ``warn-run`` opts into running unsandboxed with a loud warning.
+        sb = profile.sandbox
+        if sb != SANDBOX_NONE and not bwrap_available():
+            if sandbox_fallback == SANDBOX_FALLBACK_WARN_RUN:
+                _log.warning(
+                    "agent %r requests sandbox %r but bubblewrap is "
+                    "unavailable; running UNSANDBOXED (sandbox_fallback="
+                    "warn-run)",
+                    profile.name,
+                    sb,
+                )
+                sb = SANDBOX_NONE
+            else:
+                raise AgentConfigError(
+                    f"agent {profile.name!r} requires sandbox {profile.sandbox!r} "
+                    f"but bubblewrap is unavailable on this host. Install bwrap "
+                    f"and enable unprivileged user namespaces, or set "
+                    f"'sandbox_fallback: warn-run' to run unsandboxed."
+                )
+        self._sandbox = sb
 
     def plan(
         self,
@@ -240,7 +281,6 @@ class CommandAgentBackend:
         timeout: float | None = None,
         working_directory: Path | None = None,
     ) -> AgentInvocation:
-        del working_directory  # not reflected in the argv itself
         profile = self.profile
         effective_model = model if model is not None else profile.model
 
@@ -266,11 +306,27 @@ class CommandAgentBackend:
         else:
             effective_timeout = self._default_timeout
 
+        env = _scoped_env(profile.env)
+        if self._extra_env:
+            # Injected (e.g. scoped-token) vars always reach the child, on top
+            # of the allowlist or — if env is inherited — the full environment.
+            base = env if env is not None else dict(os.environ)
+            env = {**base, **self._extra_env}
+
+        argv = [self._binary, *argv_tail]
+        # Defense-in-depth: wrap in a bwrap sandbox when the profile asks for
+        # one and we have a worktree to bind (this.i agsbx3k). cwd is set inside
+        # the sandbox by wrap_argv, so the bare argv carries no path assumptions.
+        if self._sandbox != SANDBOX_NONE and working_directory is not None:
+            argv = wrap_argv(
+                argv, worktree=working_directory, policy=self._sandbox
+            )
+
         return AgentInvocation(
-            argv=[self._binary, *argv_tail],
+            argv=argv,
             use_stdin=use_stdin,
             stdin_data=stdin_data,
-            env=_scoped_env(profile.env),
+            env=env,
             timeout=effective_timeout,
         )
 
@@ -477,23 +533,36 @@ def backend_for(
     *,
     slug: str | None = None,
     default_timeout: float = _DEFAULT_TIMEOUT,
+    token_env: dict[str, str] | None = None,
 ):
     """Build the effective :class:`~gitbulk.claude.AgentBackend` for a run/target.
 
     The ``claude`` default is served by the native
     :class:`ProductionClaudeClient` so the no-config path is byte-identical to
-    pre-feature behavior; every other agent uses :class:`CommandAgentBackend`.
+    pre-feature behavior; every other agent uses :class:`CommandAgentBackend`,
+    which applies the profile's sandbox (subject to ``policy.sandbox_fallback``)
+    and any injected ``token_env`` (scoped-token seam, this.i agtok2n).
+
+    Raises :class:`AgentConfigError` if the profile requires a sandbox the host
+    cannot provide and the fallback policy is ``refuse`` (the default).
     """
     name = resolve_agent_name(policy, requested, slug=slug)
     profile = resolve_profile(policy, name)
     if name == "claude":
+        # The trusted native path: no generic sandbox/token plumbing.
         kwargs: dict = {}
         if profile.model is not None:
             kwargs["default_model"] = profile.model
         if profile.timeout is not None:
             kwargs["default_timeout"] = profile.timeout
         return ProductionClaudeClient(**kwargs)
-    return CommandAgentBackend(profile, default_timeout=default_timeout)
+    fallback = getattr(policy, "sandbox_fallback", None) or SANDBOX_FALLBACK_REFUSE
+    return CommandAgentBackend(
+        profile,
+        default_timeout=default_timeout,
+        sandbox_fallback=fallback,
+        extra_env=token_env,
+    )
 
 
 __all__ = [

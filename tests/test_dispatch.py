@@ -722,6 +722,100 @@ def test_dispatch_apply_per_repo_agent_builds_per_target_backend(
     assert build_calls == [None, "dhh1128/alpha"]
 
 
+def test_dispatch_default_agent_sandbox_unavailable_refuses(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """If the run's default agent requires a sandbox the host can't provide
+    (refuse fallback), dispatch aborts structurally before touching worktrees
+    (this.i agsbx3k — no silent unsandboxed downgrade)."""
+    monkeypatch.setattr("gitbulk.agent.bwrap_available", lambda: False)
+    write_config(
+        repos_slugs=["dhh1128/alpha"],
+        extra={
+            "default_agent": "gemini",
+            "agents": {"gemini": {"sandbox": "fs-only"}},
+        },
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake_clones("dhh1128/alpha")
+    pr = _make_pr(slug="dhh1128/alpha", number=1)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
+    )
+    created: list = []
+    _stub_worktree_create(monkeypatch, paths_seen=created)
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.execute_targets",
+        lambda *a, **k: pytest.fail("must not run the pool when refusing"),
+    )
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, apply=True, code_root=code_root,
+                   skip_check=_LOCAL_SKIPS)
+    )
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    assert created == []  # aborted before any worktree
+
+
+def test_dispatch_per_repo_sandbox_refusal_skips_only_that_pr(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """A per-repo agent that refuses (sandbox unavailable) skips just that PR;
+    the default-agent PR still runs."""
+    monkeypatch.setattr("gitbulk.agent.bwrap_available", lambda: False)
+    write_config(
+        repos_slugs=["dhh1128/alpha", "dhh1128/beta"],
+        extra={
+            "agents": {"gemini": {"sandbox": "fs-only"}},
+            "repos": {"dhh1128/alpha": {"agent": "gemini"}},
+        },
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake_clones("dhh1128/alpha")
+    fake_clones("dhh1128/beta")
+    pr1 = _make_pr(slug="dhh1128/alpha", number=1)
+    pr2 = _make_pr(slug="dhh1128/beta", number=2)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main", "dhh1128/beta": "main"},
+        my_open_prs={"dhh1128/alpha": [pr1], "dhh1128/beta": [pr2]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
+    )
+    _stub_worktree_create(monkeypatch, paths_seen=[])
+    _stub_worktree_remove(monkeypatch, removed=[])
+    _stub_is_conflict(monkeypatch, conflicts_for_paths=[])
+    _stub_execute_targets(
+        monkeypatch,
+        results_by_key={_key_for_pr("dhh1128/beta", 2): {
+            "status": "completed", "exit_code": 0}},
+    )
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, apply=True, code_root=code_root,
+                   skip_check=_LOCAL_SKIPS)
+    )
+    latest = paths.latest_run_symlink("dispatch").resolve()
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    # alpha (gemini, refused) skipped; beta (default claude) ran.
+    assert "dhh1128/beta" in state["repos"]
+    assert "dhh1128/alpha" not in state["repos"]
+    errors = [
+        json.loads(line)
+        for line in (latest / "errors.log").read_text().splitlines()
+        if line.strip()
+    ]
+    assert any("agent unavailable for dhh1128/alpha" in e["message"] for e in errors)
+
+
 # ─── --apply: 1 PR claude-fails → exit 2 ───────────────────────────────────
 
 

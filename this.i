@@ -2672,6 +2672,57 @@ Gitbulk Triage Tool = goal:
         (scoped tokens).
       approved-by: daniel, 2026-06-04
 
+    Per-Profile Bubblewrap Sandbox = decision:
+      id: agsbx3k
+      why: >
+        Defense-in-depth on top of least-privilege (agpriv8n) and env scoping
+        (agenv6q) — NOT the primary control. A non-claude backend can be run in
+        an unprivileged ``bwrap`` user namespace (gitbulk.sandbox) so a hostile
+        or prompt-injected agent cannot read the operator's credentials or other
+        clones, and (fs+no-net) cannot reach the network at all.
+
+        Profile ``sandbox:`` ∈ {none, fs-only, fs+no-net}. ``wrap_argv`` binds
+        only a read-only system toolchain (the system dirs that exist) plus the
+        worktree (rw, cwd), shadows ``$HOME`` with a tmpfs, unshares
+        user/pid/ipc/uts/cgroup, and for ``fs+no-net`` also ``--unshare-net``.
+        Credential locations (~/.ssh, ~/.aws, ~/.config/gh) and the other ~149
+        clones are simply never mounted. ``--die-with-parent`` preserves the
+        execk7nm SIGTERM→SIGKILL timeout semantics.
+
+        ``fs+no-net`` is viable for resolve-conflicts precisely BECAUSE agpriv8n
+        removed the agent's need for network/credentials — the two controls
+        compose. claude (the trusted native path, ProductionClaudeClient) is
+        intentionally not put through the generic sandbox; sandboxing targets
+        the less-trusted pluggable backends.
+
+        Availability is capability-probed (``bwrap_available``: bwrap installed
+        AND unprivileged userns actually works, since many hosts have bwrap but
+        disable userns). REFUSE-IF-UNAVAILABLE is the default
+        (``sandbox_fallback: refuse``): if a profile requests a sandbox the host
+        can't provide, gitbulk refuses to run rather than silently downgrade to
+        unsandboxed (a silent downgrade defeats the purpose). ``warn-run`` opts
+        into running unsandboxed with a loud warning. Refusal is raised at
+        backend construction: dispatch resolves the run default before creating
+        any worktree (refuse → structural abort, cheap) and per-repo overrides
+        inside the loop (refuse → skip just that PR). Linux-only; containers /
+        firejail were rejected (heavier / setuid attack surface) for a one-box
+        cron tool. Enforced by tests/test_sandbox.py + the adversarial
+        fs+no-net / refuse tests (agatk5n).
+
+    Scoped-Token Injection Seam = decision:
+      id: agtok2n
+      why: >
+        Even with agpriv8n, some future tasks (e.g. a codeowners-style agent
+        that must read remote state) need a token. Rather than hand the agent
+        the full ambient ``gh`` auth, the design leaves a seam to inject a
+        short-lived, single-repo credential: ``CommandAgentBackend(extra_env=)``
+        and ``backend_for(token_env=)`` merge caller-supplied env vars into the
+        child on top of the ``env`` allowlist (agenv6q). Blast radius on leak =
+        one repo, expires fast. Phase 4 lands the plumbing + tests; the actual
+        minting (fine-grained PAT / GitHub App installation token) is follow-on
+        — the seam exists so it can be added without reworking the backend.
+      approved-by: daniel, 2026-06-04
+
     Repo-Level Dispatch Opens A PR = decision:
       id: dsprp7kq
       why: >

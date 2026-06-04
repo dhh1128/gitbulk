@@ -36,8 +36,14 @@ _TOP_LEVEL_KEYS = {
     "worktree_root",
     "agents",  # pluggable coding-agent profiles (this.i agprof4k)
     "default_agent",  # run-level default agent name
+    "sandbox_fallback",  # behavior when a requested sandbox is unavailable
     "notifications",  # forward-compat placeholder; contents ignored
 }
+
+#: Accepted values for the top-level ``sandbox_fallback`` (this.i agsbx3k).
+#: Mirrors gitbulk.agent.VALID_SANDBOX_FALLBACKS; duplicated to keep config
+#: parsing free of an import on the agent/subprocess machinery.
+_VALID_SANDBOX_FALLBACKS = {"refuse", "warn-run"}
 
 #: Keys allowed inside one ``filters.<name>`` block. Mirror the v1
 #: filter dimensions (this.i node ``flt7arg2``); singular forms because
@@ -139,6 +145,10 @@ class Policy:
     agents: dict[str, "AgentProfile"] = field(default_factory=dict)
     #: Run-level default agent name; ``None`` ⇒ the ``claude`` preset.
     default_agent: str | None = None
+    #: What to do when a profile requests a sandbox the host can't provide
+    #: (this.i agsbx3k): ``None``/``"refuse"`` ⇒ refuse to run; ``"warn-run"``
+    #: ⇒ run unsandboxed with a warning.
+    sandbox_fallback: str | None = None
 
 
 # ─── Validation helpers ────────────────────────────────────────────────────
@@ -406,6 +416,12 @@ def load_policy(path: Path | None = None) -> Policy:
     if raw.get("default_agent") is not None:
         kwargs["default_agent"] = _ensure_str(
             raw["default_agent"], f"{path}.default_agent"
+        )
+    if raw.get("sandbox_fallback") is not None:
+        kwargs["sandbox_fallback"] = _ensure_str(
+            raw["sandbox_fallback"],
+            f"{path}.sandbox_fallback",
+            allowed=_VALID_SANDBOX_FALLBACKS,
         )
     # "notifications" key, if present, is intentionally ignored
     return Policy(**kwargs)

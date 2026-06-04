@@ -41,6 +41,17 @@ def test_default_agent_parsed(tmp_path):
     assert load_policy(p).default_agent == "copilot"
 
 
+def test_sandbox_fallback_parsed(tmp_path):
+    p = _write_policy(tmp_path, "sandbox_fallback: warn-run\n")
+    assert load_policy(p).sandbox_fallback == "warn-run"
+
+
+def test_sandbox_fallback_invalid_rejected(tmp_path):
+    p = _write_policy(tmp_path, "sandbox_fallback: yolo\n")
+    with pytest.raises(ConfigError, match="sandbox_fallback"):
+        load_policy(p)
+
+
 def test_agent_field_defaults_none():
     assert RepoOverride().agent is None
     assert Policy().default_agent is None

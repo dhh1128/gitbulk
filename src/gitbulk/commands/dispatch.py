@@ -70,7 +70,7 @@ from pathlib import Path
 from typing import Iterable
 
 from gitbulk import paths, sentinel
-from gitbulk.agent import backend_for, resolve_agent_name
+from gitbulk.agent import AgentConfigError, backend_for, resolve_agent_name
 from gitbulk.config.policy import Policy, load_policy
 from gitbulk.config.repos import RepoEntry, load_repos
 from gitbulk.default_branch_cache import prime_default_branches
@@ -679,8 +679,52 @@ def _run_under_lock(
     # cleanup can find the worktree without re-deriving the path.
     target_meta: dict[str, tuple[str, PRInfo, Path]] = {}
 
+    # Resolve the agent backend(s) up front: --agent → per-repo agent: →
+    # default_agent → claude (this.i agprof4k). The run default is resolved
+    # FIRST — if it requires a sandbox the host can't provide (agsbx3k), refuse
+    # the whole run cheaply before any worktree exists. Per-repo overrides are
+    # resolved inside the loop so a refusing one skips just that PR. Backends
+    # are cached by resolved name (build each distinct one once).
+    requested_agent = getattr(args, "agent", None)
+    default_name = resolve_agent_name(policy, requested_agent)
+    try:
+        default_backend = backend_for(policy, requested_agent)
+    except AgentConfigError as e:
+        return _finish(
+            rs,
+            EXIT_STRUCTURAL_FAILURE,
+            summary=f"agent unavailable: {e}",
+            policy=policy,
+            attention=False,
+            all_repos=repos,
+            passing_repos=passing_repos,
+            skipped_repos=skipped_repos,
+            eligible_prs=eligible_prs,
+            results=None,
+            apply=True,
+            prompt_path=prompt_path,
+        )
+    backend_by_name: dict = {default_name: default_backend}
+    backends: dict = {}
+
     for slug, pr in eligible_prs:
         repo = repo_by_slug[slug]
+        # Resolve this PR's backend before creating its worktree, so a per-repo
+        # agent that refuses (sandbox unavailable) skips the PR with nothing to
+        # clean up.
+        name = resolve_agent_name(policy, requested_agent, slug=slug)
+        if name not in backend_by_name:
+            try:
+                backend_by_name[name] = backend_for(
+                    policy, requested_agent, slug=slug
+                )
+            except AgentConfigError as e:
+                rs.record_error(
+                    f"agent unavailable for {slug}#{pr.number}: {e}",
+                    level="ERROR",
+                    context={"slug": slug, "pr": pr.number},
+                )
+                continue
         try:
             # repo_lock(slug): worktree creation mutates the clone's
             # .git/worktrees admin — serialize it against another gitbulk run
@@ -742,28 +786,13 @@ def _run_under_lock(
             )
         )
         target_meta[key] = (slug, pr, worktree_path)
+        # Only non-default backends need a per-target entry; absent keys fall
+        # back to ``default_backend`` in the kernel.
+        if name != default_name:
+            backends[key] = backend_by_name[name]
 
     # 10. Run the bounded pool.
     log_dir = rs.run_dir / "dispatch-logs"
-    # Resolve the agent backend(s): --agent → per-repo agent: → default_agent
-    # → claude (this.i agprof4k). The run default is the fallback; a per-repo
-    # override yields a per-target backend (cached by resolved name so we build
-    # each distinct backend once). The no-config path returns a
-    # ProductionClaudeClient, so existing behavior is unchanged.
-    requested_agent = getattr(args, "agent", None)
-    default_backend = backend_for(policy, requested_agent)
-    default_name = resolve_agent_name(policy, requested_agent)
-    backend_by_name: dict = {default_name: default_backend}
-    backends: dict = {}
-    for key, (slug, _pr, _wt) in target_meta.items():
-        name = resolve_agent_name(policy, requested_agent, slug=slug)
-        if name == default_name:
-            continue
-        if name not in backend_by_name:
-            backend_by_name[name] = backend_for(
-                policy, requested_agent, slug=slug
-            )
-        backends[key] = backend_by_name[name]
     concurrency = int(getattr(args, "concurrency", _DEFAULT_CONCURRENCY))
     timeout_per_target = float(
         getattr(args, "timeout", _DEFAULT_PER_TARGET_TIMEOUT)

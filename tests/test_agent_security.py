@@ -13,6 +13,8 @@ Phase 4 adds the sandbox/verify-before-push tests; this file covers Phase 2
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from gitbulk.agent import AgentConfigError, CommandAgentBackend, parse_agent_profile
@@ -153,3 +155,52 @@ def test_bad_agents_block_rejected_by_load_policy(tmp_path):
     cfg.write_text("agents:\n  evil:\n    command: 'tool -p {prompt}'\n")
     with pytest.raises(Exception, match="not a single string"):
         load_policy(cfg)
+
+
+# ─── T1 / agsbx3k — bwrap sandbox isolates a hostile agent ──────────────────
+
+
+def _sandboxed_plan(monkeypatch, policy, tmp_path):
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda name: f"/canonical/{name}")
+    monkeypatch.setattr("gitbulk.agent.bwrap_available", lambda: True)
+    # Let the REAL wrap_argv run, but make every system dir "exist" and bwrap
+    # resolvable, so we assert the real composed argv.
+    monkeypatch.setattr("gitbulk.sandbox.shutil.which", lambda n: "/usr/bin/bwrap")
+    monkeypatch.setattr("gitbulk.sandbox.Path.exists", lambda self: True)
+    from gitbulk.agent import AgentProfile, CommandAgentBackend
+
+    b = CommandAgentBackend(AgentProfile(name="evil", **policy))
+    return b.plan("p", working_directory=tmp_path)
+
+
+def test_fs_no_net_sandbox_cuts_network_and_hides_creds(monkeypatch, tmp_path):
+    inv = _sandboxed_plan(
+        monkeypatch,
+        {"command": ("evil", "-p", "{prompt}"), "sandbox": "fs+no-net"},
+        tmp_path,
+    )
+    argv = inv.argv
+    assert argv[0] == "/usr/bin/bwrap"
+    assert "--unshare-net" in argv  # no network egress
+    home = str(Path.home())
+    # No credential location is bound into the sandbox.
+    for secret in (f"{home}/.ssh", f"{home}/.aws", f"{home}/.config/gh"):
+        assert secret not in argv
+    # The worktree IS available (the one writable path).
+    assert str(tmp_path) in argv
+
+
+def test_sandbox_refuses_when_host_cannot_provide_it(monkeypatch, tmp_path):
+    """refuse-if-unavailable: gitbulk does NOT silently run unsandboxed."""
+    import shutil
+
+    monkeypatch.setattr(shutil, "which", lambda name: f"/canonical/{name}")
+    monkeypatch.setattr("gitbulk.agent.bwrap_available", lambda: False)
+    from gitbulk.agent import AgentProfile, CommandAgentBackend
+
+    with pytest.raises(AgentConfigError, match="bubblewrap is unavailable"):
+        CommandAgentBackend(
+            AgentProfile(name="x", command=("x", "{prompt}"), sandbox="fs-only")
+        )

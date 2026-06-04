@@ -448,3 +448,106 @@ def test_backend_for_per_repo_override():
     b = backend_for(pol, None, slug="o/r")
     assert isinstance(b, CommandAgentBackend)
     assert b.profile.name == "cursor"
+
+
+# ─── sandbox (this.i agsbx3k) ──────────────────────────────────────────────
+
+
+def test_sandbox_wraps_argv_when_available(monkeypatch, tmp_path):
+    monkeypatch.setattr("gitbulk.agent.bwrap_available", lambda: True)
+    seen = {}
+
+    def fake_wrap(argv, *, worktree, policy):
+        seen["worktree"] = worktree
+        seen["policy"] = policy
+        return ["bwrap", "--", *argv]
+
+    monkeypatch.setattr("gitbulk.agent.wrap_argv", fake_wrap)
+    b = CommandAgentBackend(_profile(sandbox="fs+no-net"))
+    inv = b.plan("p", working_directory=tmp_path)
+    assert inv.argv[0] == "bwrap"
+    assert seen == {"worktree": tmp_path, "policy": "fs+no-net"}
+
+
+def test_sandbox_not_wrapped_without_worktree(monkeypatch):
+    monkeypatch.setattr("gitbulk.agent.bwrap_available", lambda: True)
+    monkeypatch.setattr(
+        "gitbulk.agent.wrap_argv",
+        lambda *a, **k: pytest.fail("should not wrap without a worktree"),
+    )
+    b = CommandAgentBackend(_profile(sandbox="fs-only"))
+    inv = b.plan("p", working_directory=None)
+    assert inv.argv[0] == "/canonical/tool"
+
+
+def test_sandbox_unavailable_refuses_by_default(monkeypatch):
+    monkeypatch.setattr("gitbulk.agent.bwrap_available", lambda: False)
+    with pytest.raises(AgentConfigError, match="bubblewrap is unavailable"):
+        CommandAgentBackend(_profile(sandbox="fs-only"))
+
+
+def test_sandbox_unavailable_warn_run_downgrades(monkeypatch, caplog):
+    monkeypatch.setattr("gitbulk.agent.bwrap_available", lambda: False)
+    monkeypatch.setattr(
+        "gitbulk.agent.wrap_argv",
+        lambda *a, **k: pytest.fail("warn-run must not wrap"),
+    )
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        b = CommandAgentBackend(
+            _profile(sandbox="fs-only"), sandbox_fallback="warn-run"
+        )
+        inv = b.plan("p", working_directory=Path("/wt"))
+    assert inv.argv[0] == "/canonical/tool"  # unsandboxed
+    assert any("UNSANDBOXED" in r.message for r in caplog.records)
+
+
+def test_sandbox_none_never_probes(monkeypatch):
+    monkeypatch.setattr(
+        "gitbulk.agent.bwrap_available",
+        lambda: pytest.fail("must not probe when sandbox is none"),
+    )
+    CommandAgentBackend(_profile(sandbox="none"))  # no probe, no raise
+
+
+# ─── scoped-token seam (this.i agtok2n) ────────────────────────────────────
+
+
+def test_extra_env_merges_into_allowlist(monkeypatch):
+    monkeypatch.setenv("PATH", "/bin")
+    b = CommandAgentBackend(
+        _profile(env=("MYKEY",)), extra_env={"SCOPED_TOKEN": "abc"}
+    )
+    monkeypatch.setenv("MYKEY", "v")
+    env = b.plan("p").env
+    assert env["SCOPED_TOKEN"] == "abc"
+    assert env["PATH"] == "/bin"
+
+
+def test_extra_env_applies_even_when_inheriting(monkeypatch):
+    monkeypatch.setenv("GH_TOKEN", "inherited")
+    b = CommandAgentBackend(_profile(env=None), extra_env={"SCOPED_TOKEN": "abc"})
+    env = b.plan("p").env
+    assert env is not None
+    assert env["SCOPED_TOKEN"] == "abc"
+    assert env["GH_TOKEN"] == "inherited"  # inherit path still carries env
+
+
+def test_backend_for_passes_sandbox_fallback_and_token(monkeypatch):
+    monkeypatch.setattr("gitbulk.agent.bwrap_available", lambda: False)
+    pol = Policy(
+        default_agent="custom",
+        agents={
+            "custom": parse_agent_profile(
+                "custom",
+                {"command": ["c", "{prompt}"], "sandbox": "fs-only"},
+                "w",
+            )
+        },
+        sandbox_fallback="warn-run",
+    )
+    # warn-run + unavailable → builds (would raise under refuse).
+    b = backend_for(pol, None, token_env={"T": "1"})
+    assert isinstance(b, CommandAgentBackend)
+    assert b._extra_env == {"T": "1"}
