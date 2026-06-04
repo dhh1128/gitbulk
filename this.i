@@ -2515,6 +2515,46 @@ Gitbulk Triage Tool = goal:
       approved-by: daniel, 2026-05-28
       # was: tension mp7kn4qz (Dispatch Execution Kernel, deferred at Phase 0)
 
+    Pluggable Coding-Agent Seam = decision:
+      id: agbknd7q
+      why: >
+        Formalize the boundary between gitbulk and the coding agent it
+        dispatches so backends other than Claude Code (Gemini CLI, GitHub
+        Copilot CLI, Cursor agent, or a fully custom tool) can be driven
+        through one small, config-driven interface — without weakening, and
+        ideally strengthening, the safety posture. Full design + the locked
+        forks live in docs/pluggable-agents.md.
+
+        Before this change the invocation was hardcoded in TWO places that
+        had drifted into near-duplicates: ``ProductionClaudeClient.run_prompt``
+        (used by summarize) and ``exec._claude_argv`` (used by dispatch's
+        parallel kernel), both emitting ``claude -p <prompt> --model <m>
+        --dangerously-skip-permissions``. Phase 1 unifies them: a single
+        ``AgentInvocation`` value (argv + use_stdin + env + timeout) is
+        produced by one ``plan()`` method on the backend; ``run_prompt`` is
+        reimplemented on top of ``plan()``, and the kernel sources its argv
+        from ``claude.plan(...)`` instead of building its own. The
+        ``ClaudeClient`` Protocol is retained; ``AgentBackend`` is the
+        generalized superset (adds ``plan``), with ``FakeAgentBackend`` /
+        ``ProductionAgentBackend`` aliases. A minimal backend exposing only
+        ``run_prompt`` still works via the legacy argv fallback in the kernel,
+        so user-supplied implementations are not forced to add ``plan``.
+
+        Deliberately behavior-preserving at Phase 1: argv shape, stdin,
+        timeout, and env (inherited; ``env=None``) are byte-identical to the
+        prior code, proven by the unchanged 1556-test baseline plus new
+        ``plan()`` tests. Config-driven profiles/presets (agprof4k), the
+        least-privilege push rework (agpriv8n), env scoping (agenv6q), and
+        the bwrap sandbox (agsbx3k) build on this seam in later phases. This
+        is also the substantive start on threat-model T1 (the dispatch agent
+        running with full ambient authority); see agatk5n for the adversarial
+        test discipline.
+
+        Subprocess-vs-plan judgment unchanged from execk7nm: the kernel still
+        owns its ``subprocess.Popen`` (needed for SIGTERM→SIGKILL and CTRL+C
+        drain); ``plan()`` only supplies the argv/env, it does not run.
+      approved-by: daniel, 2026-06-04
+
     Repo-Level Dispatch Opens A PR = decision:
       id: dsprp7kq
       why: >

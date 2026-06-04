@@ -15,10 +15,14 @@ from unittest.mock import patch
 import pytest
 
 from gitbulk.claude import (
+    AgentBackend,
+    AgentInvocation,
     ClaudeClient,
     ClaudeError,
     ClaudeTimeoutError,
+    FakeAgentBackend,
     FakeClaudeClient,
+    ProductionAgentBackend,
     ProductionClaudeClient,
 )
 
@@ -51,6 +55,65 @@ def test_fake_satisfies_claudeclient_protocol():
 def test_production_satisfies_claudeclient_protocol():
     prod = ProductionClaudeClient()
     assert isinstance(prod, ClaudeClient)
+
+
+# ─── AgentBackend generalization (this.i agbknd7q) ─────────────────────────
+
+
+def test_both_clients_satisfy_agentbackend_protocol():
+    assert isinstance(FakeClaudeClient(), AgentBackend)
+    assert isinstance(ProductionClaudeClient(), AgentBackend)
+
+
+def test_agent_backend_aliases_point_at_claude_clients():
+    assert FakeAgentBackend is FakeClaudeClient
+    assert ProductionAgentBackend is ProductionClaudeClient
+
+
+def test_production_plan_builds_claude_argv():
+    inv = ProductionClaudeClient().plan("do a thing")
+    assert isinstance(inv, AgentInvocation)
+    assert inv.argv == [
+        "claude",
+        "-p",
+        "do a thing",
+        "--model",
+        "claude-sonnet-4-6",
+        "--dangerously-skip-permissions",
+    ]
+    assert inv.use_stdin is False
+    assert inv.env is None
+    assert inv.timeout == 300.0
+
+
+def test_production_plan_use_stdin_and_model_override():
+    inv = ProductionClaudeClient().plan(
+        "p", input_text="state", model="opus", timeout=12.0
+    )
+    assert inv.use_stdin is True
+    assert "opus" in inv.argv
+    assert inv.timeout == 12.0
+
+
+def test_fake_plan_mirrors_production_argv_and_reads_overrides():
+    fake = FakeClaudeClient({"": "x"})
+    fake._claude_path = "/usr/local/bin/claude"  # type: ignore[attr-defined]
+    fake._default_model = "fake-model"  # type: ignore[attr-defined]
+    inv = fake.plan("PROMPT")
+    assert inv.argv == [
+        "/usr/local/bin/claude",
+        "-p",
+        "PROMPT",
+        "--model",
+        "fake-model",
+        "--dangerously-skip-permissions",
+    ]
+
+
+def test_fake_plan_defaults_when_attrs_unset():
+    inv = FakeClaudeClient({"": "x"}).plan("p")
+    assert inv.argv[0] == "claude"
+    assert inv.argv[4] == "claude-sonnet-4-6"
 
 
 # ─── FakeClaudeClient ──────────────────────────────────────────────────────

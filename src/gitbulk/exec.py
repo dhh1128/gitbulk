@@ -333,7 +333,21 @@ def _run_one(
     if on_progress is not None:
         on_progress(target.key, "running")
 
-    argv = _claude_argv(claude, target.prompt, model)
+    # Source the argv from the backend's launch plan when it exposes one
+    # (both built-in clients do). A minimal backend with only ``run_prompt``
+    # falls back to the legacy claude-shaped argv builder so a user-supplied
+    # implementation still works (see this.i ``agbknd7q`` / ``execk7nm``).
+    plan = getattr(claude, "plan", None)
+    if callable(plan):
+        argv = plan(
+            target.prompt,
+            input_text=target.input_text,
+            model=model,
+            working_directory=target.working_directory,
+            timeout=timeout_per_target,
+        ).argv
+    else:
+        argv = _claude_argv(claude, target.prompt, model)
     # Children write directly to the log files; we never buffer
     # gigabytes of triage output in memory.
     stdout_fh = stdout_path.open("w")
