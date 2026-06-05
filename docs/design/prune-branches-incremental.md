@@ -1,11 +1,27 @@
 # Incremental, parallel, plan-based `prune-branches`
 
-> **Status:** design proposal (2026-06-04). Not yet implemented.
-> **Authoritative source once built:** new `this.i` nodes under `prnbr4kq`
-> (`gitbulk prune-branches`) — proposed ids in §11. This file is the narrative
-> explainer; `this.i` is the binding record. Touches the run-state surface
-> governed by `rsclk7nq` (resource-scoped locking) and the data-loss guard
-> `prdls2nq`.
+> **Status:** IMPLEMENTED 2026-06-04 on branch `feat/prune-branches-incremental`
+> across four commits (P1 parallel scan → P4 re-validation). Binding record:
+> `this.i` nodes `prnpl3kq`/`prnsc7nr`/`prnsh5kp`/`prnpf8nq`/`prnrv6kq` and
+> tension `prntn9kp` under `prnbr4kq`. This file is the narrative explainer.
+> Touches the run-state surface governed by `rsclk7nq` (resource-scoped
+> locking) and the data-loss guard `prdls2nq`.
+>
+> **Where the build refined this design (read before trusting the prose below):**
+> - The runstate envelope `SCHEMA_VERSION` was **not** bumped to 2 — only this
+>   subcommand's payload changed, so the plan version lives in the
+>   `prune_plan.version` extra (2) instead. §3's `schema_version: 2` is the
+>   one inaccuracy.
+> - Per-branch SHA reuse (§5, `prnsh5kp`) is realized by storing **all**
+>   deep-classified branches in the plan — including the unsurfaced "no closed
+>   PR" skips — so a stale rescan cache-hits the bulk of branches, not just
+>   delete verdicts. The summary still filters to PR-citing rows, so the report
+>   is unchanged. `--force-scan` / `--max-age 0` disable SHA reuse too.
+> - P4 re-validation (§7.1) additionally does a **fresh open-PR fetch** per
+>   candidate repo (cached) to catch the "used again" case; an unverifiable tip
+>   *or* open-PR fetch biases to `refused`.
+> - Freshness (§6) is evaluated **per repo** for both dry-run and apply; a
+>   second run within the window reuses the whole repo with zero network.
 
 ---
 
