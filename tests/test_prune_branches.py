@@ -100,14 +100,38 @@ def _args(*, apply=False, code_root=None, skip_check=None,
     )
 
 
+# The single reference "now" every test timestamp derives from. The handler
+# computes its own "now" via ``pb._utc_now`` (pinned to this value by the
+# autouse ``_pin_clock`` fixture below), and the ``_classify_branch`` unit
+# tests pass this same constant as their explicit ``now`` argument. Deriving
+# the date helpers from it (rather than wall-clock ``datetime.now()``) makes
+# a "``days_ago`` days old" PR genuinely that old relative to the clock the
+# code uses, so grace-boundary tests exercise the real boundary (TST-F3).
+NOW = datetime(2026, 6, 3, tzinfo=timezone.utc)
+
+
+# The genuine, unpatched production clock, captured before any test pins it,
+# so ``test_utc_now_returns_aware`` can assert on the real implementation.
+_REAL_UTC_NOW = pb._utc_now
+
+
+@pytest.fixture(autouse=True)
+def _pin_clock(monkeypatch):
+    """Pin the handler's clock to ``NOW`` so handler-path grace decisions are
+    deterministic and consistent with the date helpers (TST-F3). Tests that
+    need to advance time monkeypatch ``pb._utc_now`` themselves afterwards;
+    that later setattr wins over this autouse default."""
+    monkeypatch.setattr(pb, "_utc_now", lambda: NOW)
+
+
 def _open_pr(slug, number, *, head_ref, base_ref="main"):
     return PRInfo(
         slug=slug, number=number, title=f"open {number}",
         url="u", author="dhh1128", base_ref=base_ref, head_ref=head_ref,
         head_sha="f" * 40, state="OPEN", is_draft=False,
         mergeable_state="CLEAN",
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc),
+        created_at=NOW,
+        updated_at=NOW,
         last_pushed_at=None, labels=(), review_decision=None,
         checks_status=None,
     )
@@ -118,7 +142,7 @@ def _closed(slug, number, *, head_ref, head_sha, merged=True, days_ago=30):
         number=number, title=f"closed {number}", url="u", merged=merged,
         base_ref="main", head_ref=head_ref, head_sha=head_sha,
         head_repo_slug=slug,
-        closed_at=datetime.now(timezone.utc) - timedelta(days=days_ago),
+        closed_at=NOW - timedelta(days=days_ago),
     )
 
 
@@ -152,9 +176,6 @@ def _br(name="feat", sha="a" * 40, protected=False):
 def _policy():
     from gitbulk.config.policy import Policy
     return Policy()
-
-
-NOW = datetime(2026, 6, 3, tzinfo=timezone.utc)
 
 
 def test_classify_skips_default_branch():
@@ -212,6 +233,29 @@ def test_classify_skips_within_grace_period():
     fake = FakeGHClient(closed_prs_for_head={("o/r", "feat"): [pr]})
     out = _classify_branch(fake, _policy(), "o/r", "main", _br(), set(), set(), NOW)
     assert out["decision"] == "skip" and "grace period" in out["reason"]
+
+
+@pytest.mark.parametrize(
+    "days_ago, expected",
+    [
+        (6, "skip"),    # one day inside the 7-day grace window → kept
+        (7, "delete"),  # exactly at the boundary (age >= grace) → deletable
+    ],
+)
+def test_classify_grace_boundary_flips_at_one_day(days_ago, expected):
+    """The grace boundary is exercised for the RIGHT reason now that the date
+    helper derives its ``closed_at`` from the same ``NOW`` the classifier
+    uses (TST-F3): a PR closed ``days_ago`` days ago is genuinely that old, so
+    moving across the 7-day boundary by a single day flips the decision.
+    Head SHA matches the tip so the only thing under test is the grace gate."""
+    pr = _closed("o/r", 1, head_ref="feat", head_sha="a" * 40, days_ago=days_ago)
+    fake = FakeGHClient(closed_prs_for_head={("o/r", "feat"): [pr]})
+    out = _classify_branch(
+        fake, _policy(), "o/r", "main", _br(sha="a" * 40), set(), set(), NOW
+    )
+    assert out["decision"] == expected
+    if expected == "skip":
+        assert "grace period" in out["reason"]
 
 
 def test_classify_deletes_merged_with_matching_head_sha():
@@ -1184,7 +1228,8 @@ def test_cli_wrapper_delegates(monkeypatch):
 
 
 def test_utc_now_returns_aware():
-    assert pb._utc_now().tzinfo is not None
+    # Assert on the genuine implementation, not the pinned test clock.
+    assert _REAL_UTC_NOW().tzinfo is not None
 
 
 def test_dry_run_skip_check_exits_4(

@@ -116,11 +116,34 @@ def _entry(path, branch="feat", *, is_main=False, is_detached=False,
     )
 
 
+# The single reference "now" every test timestamp derives from. The handler
+# computes its own "now" via ``pw._utc_now`` (pinned to this value by the
+# autouse ``_pin_clock`` fixture below), and the ``_classify_worktree`` unit
+# tests pass this same constant as their explicit ``now`` argument. Deriving
+# the date helpers from it (rather than wall-clock ``datetime.now()``) makes
+# a "``days_ago`` days old" PR genuinely that old relative to the clock the
+# code uses, so grace-boundary tests exercise the real boundary (TST-F3).
+NOW = datetime(2026, 6, 3, tzinfo=timezone.utc)
+
+# The genuine, unpatched production clock, captured before any test pins it,
+# so ``test_utc_now_returns_aware`` can assert on the real implementation.
+_REAL_UTC_NOW = pw._utc_now
+
+
+@pytest.fixture(autouse=True)
+def _pin_clock(monkeypatch):
+    """Pin the handler's clock to ``NOW`` so handler-path grace decisions are
+    deterministic and consistent with the date helpers (TST-F3). Tests that
+    need to control time monkeypatch ``pw._utc_now`` themselves afterwards;
+    that later setattr wins over this autouse default."""
+    monkeypatch.setattr(pw, "_utc_now", lambda: NOW)
+
+
 def _closed(slug, number, *, head_ref, merged=True, days_ago=30):
     return ClosedPRRef(
         number=number, title="t", url="u", merged=merged, base_ref="main",
         head_ref=head_ref, head_sha="z" * 40, head_repo_slug=slug,
-        closed_at=datetime.now(timezone.utc) - timedelta(days=days_ago),
+        closed_at=NOW - timedelta(days=days_ago),
     )
 
 
@@ -129,13 +152,10 @@ def _open_pr(slug, number, head_ref):
         slug=slug, number=number, title="o", url="u", author="dhh1128",
         base_ref="main", head_ref=head_ref, head_sha="f" * 40, state="OPEN",
         is_draft=False, mergeable_state="CLEAN",
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc), last_pushed_at=None,
+        created_at=NOW,
+        updated_at=NOW, last_pushed_at=None,
         labels=(), review_decision=None, checks_status=None,
     )
-
-
-NOW = datetime(2026, 6, 3, tzinfo=timezone.utc)
 
 
 @pytest.fixture
@@ -608,7 +628,8 @@ def test_cli_wrapper_delegates(monkeypatch):
 
 
 def test_utc_now_returns_aware():
-    assert pw._utc_now().tzinfo is not None
+    # Assert on the genuine implementation, not the pinned test clock.
+    assert _REAL_UTC_NOW().tzinfo is not None
 
 
 def test_dry_run_skip_check_exits_4(
