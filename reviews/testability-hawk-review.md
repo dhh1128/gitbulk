@@ -1,5 +1,7 @@
 # Testability Review: gitbulk
 
+> **Resolution status (2026-06-05):** TST-F1 ✅ merged (#9), TST-F2 ✅ merged (#9), TST-F3 ✅ merged (#15), TST-F4 ✅ merged (#15), TST-F5 (= MNT-F2) ✅ merged (#14). All addressed. See `review-panel-review.md` → Resolution status.
+
 **Date:** 2026-06-05
 **Effort level:** medium
 **Run label:** review

@@ -13,6 +13,32 @@
 
 Posture is solid for a mature CLI but the review surfaced one serious security gap and documentation drift. Most urgent: SEC-F1, the default no-config claude dispatch backend runs claude with skip-permissions and full ambient env and no sandbox, which is RCE-with-identity by default. Other milestone-blocking HIGH recommend-fix items: OPS-F1 (release.yml publishes the binary without running pytest), OPS-F2 (AGENTS.md falsely says no CI workflows exist), MNT-F1 (architecture.md is stale), TST-F2 (test fixtures duplicated across five files with no conftest), and TST-F1 (flaky scan-order test). MNT-F2 and TST-F5 describe the same duplicated-command-helper issue. Recommend gating the milestone on SEC-F1, OPS-F1, OPS-F2, and MNT-F1, then sweeping the HIGH testability items.
 
+## Resolution status (updated 2026-06-05)
+
+**18 of 19 findings resolved and merged to `main`; 1 deferred.** Fixes shipped as PRs #6–#15 (see `git log`). Post-merge `main` validation: hermetic gate 1783 passed at 100% branch coverage; e2e 3 passed.
+
+| id | status | PR |
+| --- | --- | --- |
+| SEC-F1 | ✅ DONE (merged) | #6 |
+| OPS-F1 | ✅ DONE (merged) | #8 |
+| OPS-F2 | ✅ DONE (merged) | #7 |
+| TST-F1 | ✅ DONE (merged) | #9 |
+| TST-F2 | ✅ DONE (merged) | #9 |
+| MNT-F1 | ✅ DONE (merged) | #11 |
+| SEC-F2 | ✅ DONE (merged) | #12 |
+| OPS-F3 | ✅ DONE (merged) | #12 |
+| OPS-F4 | ✅ DONE (merged) | #12 |
+| OPS-F5 | ✅ MOOT — closed by OPS-F1 (its own revisit-condition) | — |
+| TST-F3 | ✅ DONE (merged) | #15 |
+| TST-F4 | ✅ DONE (merged) | #15 |
+| MNT-F2 (=TST-F5) | ✅ DONE (merged) | #14 |
+| MNT-F3 | ✅ DONE (merged) | #13 |
+| SEC-F3 | ✅ DONE (merged) | #10 |
+| SEC-F4 | ⏳ DEFERRED — revisit before open-sourcing / accepting external test PRs (enabling now risks the unicode gate flagging intentional non-ASCII test fixtures) | — |
+| SEC-F5 | ✅ DONE (merged) | #10 |
+| MNT-F4 | ✅ DONE (merged) | #13 |
+| MNT-F5 | ✅ DONE (merged) — `dispatch.py` TODO uses an `[ISSUE-TBD]` placeholder pending a real issue id | #14 |
+
 ## All findings
 
 | id | severity | confidence | location | disposition | effort | reported_by | title |

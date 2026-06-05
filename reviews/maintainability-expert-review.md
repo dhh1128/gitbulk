@@ -1,5 +1,7 @@
 # Maintainability Review: gitbulk
 
+> **Resolution status (2026-06-05):** MNT-F1 ✅ merged (#11), MNT-F2 ✅ merged (#14), MNT-F3 ✅ merged (#13), MNT-F4 ✅ merged (#13), MNT-F5 ✅ merged (#14). All addressed. See `review-panel-review.md` → Resolution status.
+
 **Date:** 2026-06-05
 **Effort level:** medium
 **Run label:** review

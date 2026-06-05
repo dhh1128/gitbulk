@@ -1,5 +1,7 @@
 # DevOps / CI/CD Review: gitbulk
 
+> **Resolution status (2026-06-05):** OPS-F1 ✅ merged (#8), OPS-F2 ✅ merged (#7), OPS-F3 ✅ merged (#12), OPS-F4 ✅ merged (#12). OPS-F5 ✅ MOOT — closed by OPS-F1 (its own revisit-condition). All addressed. See `review-panel-review.md` → Resolution status.
+
 **Date:** 2026-06-05
 **Effort level:** medium
 **Run label:** review

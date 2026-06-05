@@ -1,5 +1,7 @@
 # Security Review: gitbulk
 
+> **Resolution status (2026-06-05):** SEC-F1 ✅ merged (#6), SEC-F2 ✅ merged (#12), SEC-F3 ✅ merged (#10), SEC-F5 ✅ merged (#10). **SEC-F4 ⏳ DEFERRED** — revisit before open-sourcing / accepting external test PRs (enabling now risks the unicode gate flagging intentional non-ASCII test fixtures). See `review-panel-review.md` → Resolution status.
+
 **Date:** 2026-06-05
 **Effort level:** deep
 **Mode:** unattended (orchestrated)
