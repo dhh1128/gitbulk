@@ -639,6 +639,20 @@ def test_sigint_drains_remaining_queued_targets(
     monkeypatch.setattr(exec_mod, "_MONITOR_TICK_SECONDS", 0.005)
     script = _FakeRunnerScript()
 
+    # Capture the run's _RunCtx so the signaler can synchronise on stop_event
+    # ACTUALLY being set by the handler, instead of betting on a fixed sleep
+    # (the bet raced the async signal delivery and made this test flaky).
+    # _install_sigint_handler already receives the ctx, so wrapping it is a
+    # zero-production-change seam.
+    captured: dict = {}
+    _real_install = exec_mod._install_sigint_handler
+
+    def _capturing_install(ctx):
+        captured["ctx"] = ctx
+        return _real_install(ctx)
+
+    monkeypatch.setattr(exec_mod, "_install_sigint_handler", _capturing_install)
+
     # Target 0 hangs on a barrier so it's still in-flight when we
     # signal. Targets 1 and 2 are queued and should become interrupted.
     barrier = threading.Event()
@@ -649,17 +663,22 @@ def test_sigint_drains_remaining_queued_targets(
         ExecTarget("t2", tmp_wd, "p2"),
     ]
 
-    # Fire SIGINT once the first worker is in-flight, then release.
+    # Fire SIGINT once the first worker is in-flight, then release t0 only
+    # after stop_event is set — so t1/t2 are guaranteed to be dequeued with it
+    # already set (concurrency=1 keeps the worker blocked on t0 until then).
     def signaler():
-        # Wait for first FakePopen to appear.
-        for _ in range(200):
-            if script.created:
-                break
-            time.sleep(0.005)
-        # Send SIGINT to ourselves → stop_event.set().
+        # Wait for the first FakePopen AND the captured ctx (both exist well
+        # before t0 finishes, since the worker is blocked on the barrier).
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not (
+            script.created and "ctx" in captured
+        ):
+            time.sleep(0.001)
+        # Send SIGINT to ourselves → the handler sets stop_event.
         os.kill(os.getpid(), signal.SIGINT)
-        # Now release the in-flight worker so the run can finish.
-        time.sleep(0.05)
+        # Deterministic gate: only release the in-flight worker once the
+        # handler has observably set stop_event.
+        assert captured["ctx"].stop_event.wait(timeout=5.0)
         barrier.set()
 
     threading.Thread(target=signaler, daemon=True).start()
