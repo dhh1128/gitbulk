@@ -1,31 +1,29 @@
 """Claude CLI boundary for gitbulk.
 
-The :class:`ClaudeClient` Protocol is the only legitimate surface
-between gitbulk code and the ``claude`` CLI. Two implementations live
-here:
+The :class:`ClaudeClient` / :class:`AgentBackend` Protocols are the only
+legitimate surface between gitbulk code and a coding-agent CLI. This module
+holds the agent-neutral *boundary*: the Protocols, the
+:class:`AgentInvocation` launch plan, the error types, and
+:class:`FakeClaudeClient` (canned responses; used by every test in the
+project per AGENTS.md "no network in tests").
 
-  - :class:`ProductionClaudeClient` subprocesses to ``claude -p`` for
-    real.
-  - :class:`FakeClaudeClient` returns canned responses; used by every
-    test in the project per AGENTS.md "no network in tests."
+The single *production* implementation is :class:`gitbulk.agent.CommandAgentBackend`,
+which drives any agent — ``claude`` included (SEC-F1) — from its
+:class:`~gitbulk.agent.AgentProfile`. There is no agent-specific production
+client here. The two consumers are the Phase 3 ``summarize`` subcommand
+(pipes a report's ``state.yaml`` to the agent) and the Phase 4 ``dispatch``
+subcommand (runs per-PR prompts inside worktrees); both resolve their backend
+through :func:`gitbulk.agent.backend_for`.
 
-This module mirrors the shape of :mod:`gitbulk.gh` (see this.i node
-``ghclmp7n``): Protocol + Fake + Production. The two consumers in this
-codebase are the Phase 3 ``summarize`` subcommand (pipes a report's
-``state.yaml`` to ``claude -p``) and the Phase 4 ``dispatch``
-subcommand (runs per-PR prompts inside worktrees).
-
-Design departure from :class:`ProductionGHClient`: NO retry policy.
-A failed claude invocation is almost always a thinking problem (the
-prompt or the model is wrong), not a transient infrastructure
-problem. Retrying with the same prompt would burn API budget without
-changing the outcome. The caller decides whether to re-prompt with a
-different shape.
+Design note (carried over from the gh client, this.i node ``ghclmp7n``): NO
+retry policy. A failed agent invocation is almost always a thinking problem
+(the prompt or the model is wrong), not a transient infrastructure problem.
+Retrying with the same prompt would burn API budget without changing the
+outcome. The caller decides whether to re-prompt with a different shape.
 """
 
 from __future__ import annotations
 
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Protocol, runtime_checkable
@@ -227,11 +225,14 @@ class FakeClaudeClient:
         timeout: float | None = None,
         working_directory: Path | None = None,
     ) -> AgentInvocation:
-        """Build the same argv shape the production client would.
+        """Build a representative ``claude``-shaped launch plan for tests.
 
         Reads ``_claude_path`` / ``_default_model`` off ``self`` if a test
         set them (the kernel's argv-shape tests do), else falls back to the
-        production defaults so injected fakes and production stay aligned.
+        same defaults as the ``claude`` preset so injected fakes and the real
+        :class:`~gitbulk.agent.CommandAgentBackend` stay aligned. (Flag *order*
+        here is illustrative — claude is order-insensitive — and need not match
+        the preset's exactly.)
         """
         del working_directory  # not reflected in the claude argv
         claude_path = getattr(self, "_claude_path", "claude")
@@ -256,155 +257,9 @@ class FakeClaudeClient:
         )
 
 
-# ─── ProductionClaudeClient ─────────────────────────────────────────────────
-
-
-class ProductionClaudeClient:
-    """Real :class:`ClaudeClient` that subprocesses to ``claude -p``.
-
-    Default model = ``claude-sonnet-4-6`` (matches multiprompt.py's
-    default per ``../origin-platform/scripts/multiprompt-spec.md`` —
-    the same model expectation gitbulk's Phase 4 dispatch will share).
-    Default timeout 300s, generous enough for a typical triage prompt
-    + the model's first-token latency.
-
-    Constructor knobs (all keyword-only):
-
-      - ``claude_path``: path to the ``claude`` executable; default
-        ``"claude"``. A bare name is resolved to an absolute path via
-        ``shutil.which`` at construction (security-hawk F2 parity with
-        :class:`gitbulk.gh.ProductionGHClient`), so a later ``PATH``
-        prepend cannot substitute the binary; an unresolvable name falls
-        back to itself (see ``__init__`` for the deliberate divergence
-        from the gh client).
-      - ``default_model``: model alias or full name passed via
-        ``--model`` when the caller doesn't override.
-      - ``default_timeout``: per-call timeout seconds when caller
-        passes ``timeout=None``.
-
-    All invocations include ``--dangerously-skip-permissions`` because
-    gitbulk runs unattended from cron; an interactive permission prompt
-    would deadlock the cron job. The user has already consented by
-    configuring gitbulk to run claude in the first place.
-
-    Flag verification: ``claude -p ... --model <m>
-    --dangerously-skip-permissions`` was checked for deprecation
-    warnings on 2026-05-28; see the comment at the call site.
-    """
-
-    def __init__(
-        self,
-        *,
-        claude_path: str = "claude",
-        default_model: str = "claude-sonnet-4-6",
-        default_timeout: float = 300.0,
-    ) -> None:
-        import shutil
-
-        # Resolve a bare ``claude_path`` to an absolute path via
-        # ``shutil.which`` at construction, mirroring the security-hawk F2
-        # fix in :class:`gitbulk.gh.ProductionGHClient`: once resolved, a
-        # later ``PATH``-prepend cannot substitute the ``claude`` binary
-        # out from under a constructed client. An absolute path is trusted
-        # as-is (no lookup).
-        #
-        # Divergence from ProductionGHClient (deliberate): an unresolvable
-        # bare name falls back to itself rather than raising. ``gh`` is
-        # essential to every subcommand, so an unresolvable ``gh`` is a
-        # loud construction failure; ``claude`` is used only by
-        # ``dispatch`` / ``summarize``, where a missing binary already
-        # surfaces gracefully (exec.py's per-target "failed to launch"
-        # path; summarize's ClaudeError handling) instead of aborting the
-        # whole run — and a name that doesn't resolve cannot be
-        # PATH-hijacked, so the fallback costs no security.
-        if Path(claude_path).is_absolute():
-            resolved = claude_path
-        else:
-            found = shutil.which(claude_path)
-            resolved = found if found is not None else claude_path
-        self._claude_path = resolved
-        self._default_model = default_model
-        self._default_timeout = default_timeout
-
-    def plan(
-        self,
-        prompt: str,
-        *,
-        input_text: str | None = None,
-        model: str | None = None,
-        timeout: float | None = None,
-        working_directory: Path | None = None,
-    ) -> AgentInvocation:
-        """Resolve the ``claude -p`` launch plan (no subprocess spawned)."""
-        del working_directory  # not reflected in the claude argv itself
-        effective_model = model if model is not None else self._default_model
-        effective_timeout = (
-            timeout if timeout is not None else self._default_timeout
-        )
-        # verified non-deprecated against claude CLI 2026-05-28
-        return AgentInvocation(
-            argv=[
-                self._claude_path,
-                "-p",
-                prompt,
-                "--model",
-                effective_model,
-                "--dangerously-skip-permissions",
-            ],
-            use_stdin=input_text is not None,
-            stdin_data=input_text,
-            env=None,
-            timeout=effective_timeout,
-        )
-
-    def run_prompt(
-        self,
-        prompt: str,
-        *,
-        input_text: str | None = None,
-        model: str | None = None,
-        timeout: float | None = None,
-        working_directory: Path | None = None,
-    ) -> str:
-        inv = self.plan(
-            prompt,
-            input_text=input_text,
-            model=model,
-            timeout=timeout,
-            working_directory=working_directory,
-        )
-        command: tuple[str, ...] = tuple(inv.argv)
-        effective_timeout = inv.timeout
-        cwd = str(working_directory) if working_directory is not None else None
-        try:
-            completed = subprocess.run(
-                list(command),
-                input=inv.stdin_data,
-                capture_output=True,
-                text=True,
-                timeout=effective_timeout,
-                check=False,
-                cwd=cwd,
-                env=inv.env,
-            )
-        except subprocess.TimeoutExpired as exc:
-            raise ClaudeTimeoutError(
-                f"claude timed out after {effective_timeout}s: {exc}",
-                command=command,
-            )
-        if completed.returncode != 0:
-            stderr = (completed.stderr or "").strip()
-            raise ClaudeError(
-                f"claude failed (exit {completed.returncode}): {stderr}",
-                command=command,
-            )
-        return completed.stdout
-
-
-#: Generalized aliases (this.i ``agbknd7q``). The ``*ClaudeClient`` names are
-#: retained for back-compat; new code should prefer the agent-neutral names.
+#: Generalized alias (this.i ``agbknd7q``). The ``FakeClaudeClient`` name is
+#: retained for back-compat; new code should prefer the agent-neutral name.
 FakeAgentBackend = FakeClaudeClient
-ProductionAgentBackend = ProductionClaudeClient
 
 __all__ = [
     "AgentBackend",
@@ -414,6 +269,4 @@ __all__ = [
     "ClaudeTimeoutError",
     "FakeAgentBackend",
     "FakeClaudeClient",
-    "ProductionAgentBackend",
-    "ProductionClaudeClient",
 ]

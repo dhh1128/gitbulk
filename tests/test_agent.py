@@ -28,7 +28,6 @@ from gitbulk.claude import (
     AgentInvocation,
     ClaudeError,
     ClaudeTimeoutError,
-    ProductionClaudeClient,
 )
 from gitbulk.config.policy import Policy, RepoOverride
 
@@ -403,9 +402,42 @@ def test_resolve_agent_name_no_slug_uses_default():
 # ─── backend_for ────────────────────────────────────────────────────────────
 
 
-def test_backend_for_claude_returns_production_client():
+def test_backend_for_claude_returns_command_backend():
+    # SEC-F1: claude is no longer a special-cased native client; it is a
+    # CommandAgentBackend like every other agent.
     b = backend_for(Policy(), None)
-    assert isinstance(b, ProductionClaudeClient)
+    assert isinstance(b, CommandAgentBackend)
+    assert b.profile.name == "claude"
+
+
+def test_claude_preset_is_env_scoped():
+    # SEC-F1: the built-in claude preset ships an env allowlist (it is no
+    # longer ``None``/inherit-everything), and that allowlist excludes the
+    # operator's credential-bearing vars while granting claude's own.
+    env = PRESETS["claude"].env
+    assert env is not None
+    assert "ANTHROPIC_API_KEY" in env
+    assert "GH_TOKEN" not in env
+    assert "AWS_SECRET_ACCESS_KEY" not in env
+    assert "SSH_AUTH_SOCK" not in env
+
+
+def test_backend_for_claude_does_not_inherit_operator_creds(monkeypatch):
+    # SEC-F1 regression: the default no-config cron dispatch path must drop
+    # GH_TOKEN / cloud / SSH creds while keeping claude's own auth + the
+    # minimal safe base (HOME, so OAuth login in ~/.claude keeps working).
+    monkeypatch.setenv("HOME", "/home/op")
+    monkeypatch.setenv("GH_TOKEN", "secret-gh")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret-aws")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant")
+    inv = backend_for(Policy(), None).plan("do a thing")
+    assert inv.env is not None
+    assert "GH_TOKEN" not in inv.env
+    assert "AWS_SECRET_ACCESS_KEY" not in inv.env
+    assert "SSH_AUTH_SOCK" not in inv.env
+    assert inv.env["ANTHROPIC_API_KEY"] == "sk-ant"
+    assert inv.env["HOME"] == "/home/op"
 
 
 def test_backend_for_claude_applies_profile_overrides():
@@ -417,12 +449,15 @@ def test_backend_for_claude_applies_profile_overrides():
         }
     )
     b = backend_for(pol, None)
-    assert isinstance(b, ProductionClaudeClient)
-    assert b._default_model == "opus"
-    assert b._default_timeout == 42.0
+    assert isinstance(b, CommandAgentBackend)
+    assert b.profile.name == "claude"
+    assert b.profile.model == "opus"
+    inv = b.plan("p")
+    assert "opus" in inv.argv
+    assert inv.timeout == 42.0
 
 
-def test_backend_for_claude_with_null_model_omits_default_model():
+def test_backend_for_claude_with_null_model_omits_model_args():
     pol = Policy(
         agents={
             "claude": parse_agent_profile(
@@ -431,10 +466,10 @@ def test_backend_for_claude_with_null_model_omits_default_model():
         }
     )
     b = backend_for(pol, None)
-    assert isinstance(b, ProductionClaudeClient)
-    assert b._default_timeout == 30.0
-    # model not overridden → the client's own class default stands.
-    assert b._default_model == "claude-sonnet-4-6"
+    assert isinstance(b, CommandAgentBackend)
+    inv = b.plan("p")
+    assert "--model" not in inv.argv
+    assert inv.timeout == 30.0
 
 
 def test_backend_for_non_claude_returns_command_backend():

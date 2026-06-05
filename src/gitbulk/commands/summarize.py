@@ -234,8 +234,8 @@ def _run(
     # state_text was read under run_state_lock("report") in the handler.
 
     # Resolve the agent backend: --agent → default_agent → claude (this.i
-    # agprof4k). The no-config path returns a ProductionClaudeClient, so
-    # behavior is unchanged for existing users.
+    # agprof4k). Every agent — claude included (SEC-F1) — is a
+    # CommandAgentBackend with its profile's env allowlist applied.
     claude = backend_for(policy, getattr(args, "agent", None))
     try:
         output = claude.run_prompt(

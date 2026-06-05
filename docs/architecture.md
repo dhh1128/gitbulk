@@ -183,9 +183,11 @@ src/gitbulk/
   org_members_cache.py    — org members cache reader/writer (CachedMembers,
                             save/load, refresh_cache, freshness check)
   gh.py                   — GHClient Protocol + ProductionGHClient + FakeGHClient
-  claude.py               — ClaudeClient Protocol + ProductionClaudeClient
+  claude.py               — ClaudeClient/AgentBackend Protocols + AgentInvocation
                             + FakeClaudeClient (no retry; bad prompts are
-                            thinking problems)
+                            thinking problems). The production backend is
+                            agent.CommandAgentBackend (SEC-F1 removed the
+                            native ProductionClaudeClient).
   pr_info.py              — frozen PRInfo dataclass (node prdtm4kn)
   exec.py                 — in-tree parallel claude executor (execk7nm);
                             ExecTarget / ExecResult / execute_targets;
