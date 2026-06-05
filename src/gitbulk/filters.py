@@ -48,11 +48,13 @@ class FilterSpec:
     bases: tuple[str, ...] = ()
     mergeable_states: tuple[str, ...] = ()
     authors: tuple[str, ...] = ()
-    # TODO(flt7arg2): v2 dimensions land here — on-disk path, PR age,
-    # regex match, negation, single --pr targeting. New repo-level dims
-    # extend constrains_repos + _matches_repo; PR-level dims extend
-    # constrains_prs + select_prs; remember to widen resolve_filter_spec,
-    # the policy `filters:` parser, and filter_summary_line in lockstep.
+    # TECH_DEBT: filter spec v2 dimensions [this.i node flt7arg2]
+    # v2 dimensions land here — on-disk path, PR age, regex match, negation,
+    # single --pr targeting. New repo-level dims extend constrains_repos +
+    # _matches_repo; PR-level dims extend constrains_prs + select_prs;
+    # remember to widen resolve_filter_spec, the policy `filters:` parser,
+    # and filter_summary_line in lockstep. (Cross-module: tracked by this.i
+    # node flt7arg2.)
 
     @property
     def is_empty(self) -> bool:
