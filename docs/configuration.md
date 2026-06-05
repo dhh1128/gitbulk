@@ -89,6 +89,53 @@ See [`config/gitbulk.yaml.example`](https://github.com/dhh1128/gitbulk/blob/main
 for the complete annotated reference, including the disposable
 `worktree_root`.
 
+### `agents` / `default_agent` — which coding agent to drive
+
+`dispatch` and `summarize` shell out to a CLI coding agent. By default that is
+Claude Code (the `claude` preset), and **if you set nothing here, behavior is
+identical to before this feature existed.** You can point gitbulk at a different
+agent with one line, or define a fully custom one. The full design and security
+model live in [`pluggable-agents.md`](pluggable-agents.md).
+
+```yaml
+default_agent: gemini            # built-in presets: claude | gemini | copilot | cursor
+
+agents:
+  gemini:
+    model: gemini-2.5-pro        # override just one field of a preset
+  myagent:                       # a fully custom backend
+    command: [mytool, run, "{prompt}"]   # argv LIST (never a shell string)
+    model_args: [--model, "{model}"]     # appended only when a model is set
+    prompt_via: arg              # arg | stdin
+    env: [MYTOOL_API_KEY]        # allowlist — see below
+    sandbox: fs+no-net           # none | fs-only | fs+no-net
+
+repos:
+  someorg/some-repo:
+    agent: copilot               # per-repo override
+```
+
+Selection order: `--agent` flag → per-repo `agent:` → `default_agent` →
+`claude`.
+
+Security-relevant fields:
+
+- **`command` is an argv list, never a shell string** (a string is rejected).
+  `{prompt}`/`{model}` substitute *within a single token*, so prompt text can't
+  inject arguments, and the binary is pinned via `which` at load.
+- **`env`** is an allowlist: only the named variables (plus a minimal safe base —
+  `PATH`, `HOME`, locale) are passed to the agent. Omit it to inherit the full
+  environment (the backward-compatible default, which hands the agent your
+  `GH_TOKEN`/SSH/cloud creds — prefer an allowlist for non-Claude agents).
+- **`sandbox`** runs the agent in an unprivileged [bubblewrap](https://github.com/containers/bubblewrap)
+  namespace. `fs+no-net` is the tightest (no network; `~/.ssh`/`~/.aws`/other
+  clones not mounted) and is appropriate for conflict-resolution, which gitbulk
+  arranges to need no network or credentials. Requires `bwrap` + unprivileged
+  user namespaces; see [running unattended](running-unattended.md). When a
+  requested sandbox isn't available, the top-level `sandbox_fallback`
+  (`refuse` default, or `warn-run`) decides whether gitbulk refuses to run or
+  runs unsandboxed with a warning.
+
 ## Next steps
 
 With both files in place, run [`gitbulk report`](commands.md#report) to see

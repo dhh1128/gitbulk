@@ -26,13 +26,54 @@ different shape.
 from __future__ import annotations
 
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Protocol, runtime_checkable
 
 
+@dataclass(frozen=True)
+class AgentInvocation:
+    """A fully-resolved plan for launching one coding-agent subprocess.
+
+    This is the single value that both invocation paths agree on — the
+    blocking ``run_prompt`` (used by ``summarize``) and the parallel
+    ``execute_targets`` kernel (used by ``dispatch``). Centralizing argv
+    construction here is the seam that lets gitbulk drive agents other than
+    Claude (see docs/pluggable-agents.md, this.i ``agbknd7q``).
+
+    Attributes:
+        argv: the exact argv list. ``argv[0]`` is the resolved agent binary
+            (absolute when resolvable). NEVER passed to a shell — list-form
+            only, so attacker-influenceable prompt/worktree text in later
+            elements cannot break out (threat-model §5).
+        use_stdin: when True, ``stdin_data`` must be written to the child's
+            stdin (the prompt and/or ``input_text`` is delivered there rather
+            than as an argv element).
+        stdin_data: the exact text to feed on stdin, or ``None`` for no stdin.
+            Computed by :meth:`plan` so callers (both ``run_prompt`` and the
+            parallel kernel) feed one canonical value regardless of whether
+            the backend takes its prompt via argv or stdin.
+        env: the exact environment for the child, or ``None`` to inherit the
+            parent environment (today's behavior). Per-profile scoping is the
+            ``env`` allowlist on a profile (this.i ``agenv6q``).
+        timeout: effective per-call timeout in seconds.
+    """
+
+    argv: list[str]
+    use_stdin: bool = False
+    stdin_data: str | None = None
+    env: dict[str, str] | None = None
+    timeout: float | None = None
+
+
 @runtime_checkable
 class ClaudeClient(Protocol):
-    """Read/produce-text boundary against the ``claude`` CLI."""
+    """Read/produce-text boundary against the ``claude`` CLI.
+
+    Retained as the historical name; :class:`AgentBackend` is the
+    generalized alias (same surface plus :meth:`plan`). New code should
+    type against :class:`AgentBackend`.
+    """
 
     def run_prompt(
         self,
@@ -55,6 +96,44 @@ class ClaudeClient(Protocol):
         :class:`ClaudeTimeoutError` (a subclass of both
         :class:`ClaudeError` and :class:`TimeoutError`) on timeout.
         """
+        ...
+
+
+@runtime_checkable
+class AgentBackend(Protocol):
+    """Generalized coding-agent boundary (Claude, Gemini, Copilot, …).
+
+    Superset of :class:`ClaudeClient`: same blocking ``run_prompt`` plus
+    :meth:`plan`, which yields the :class:`AgentInvocation` the parallel
+    ``execute_targets`` kernel needs to launch a child itself (it manages
+    its own :class:`subprocess.Popen` for SIGTERM→SIGKILL escalation — see
+    this.i ``execk7nm``). Both built-in clients implement it. A minimal
+    backend exposing only ``run_prompt`` still works with the kernel via a
+    legacy argv fallback, but does not satisfy this Protocol.
+    """
+
+    def plan(
+        self,
+        prompt: str,
+        *,
+        input_text: str | None = None,
+        model: str | None = None,
+        timeout: float | None = None,
+        working_directory: Path | None = None,
+    ) -> AgentInvocation:
+        """Resolve a launch plan without running anything."""
+        ...
+
+    def run_prompt(
+        self,
+        prompt: str,
+        *,
+        input_text: str | None = None,
+        model: str | None = None,
+        timeout: float | None = None,
+        working_directory: Path | None = None,
+    ) -> str:
+        """Run the agent and return its stdout."""
         ...
 
 
@@ -139,6 +218,43 @@ class FakeClaudeClient:
             f"(first 60 chars): {prompt[:60]!r}"
         )
 
+    def plan(
+        self,
+        prompt: str,
+        *,
+        input_text: str | None = None,
+        model: str | None = None,
+        timeout: float | None = None,
+        working_directory: Path | None = None,
+    ) -> AgentInvocation:
+        """Build the same argv shape the production client would.
+
+        Reads ``_claude_path`` / ``_default_model`` off ``self`` if a test
+        set them (the kernel's argv-shape tests do), else falls back to the
+        production defaults so injected fakes and production stay aligned.
+        """
+        del working_directory  # not reflected in the claude argv
+        claude_path = getattr(self, "_claude_path", "claude")
+        effective_model = (
+            model
+            if model is not None
+            else getattr(self, "_default_model", "claude-sonnet-4-6")
+        )
+        return AgentInvocation(
+            argv=[
+                claude_path,
+                "-p",
+                prompt,
+                "--model",
+                effective_model,
+                "--dangerously-skip-permissions",
+            ],
+            use_stdin=input_text is not None,
+            stdin_data=input_text,
+            env=None,
+            timeout=timeout,
+        )
+
 
 # ─── ProductionClaudeClient ─────────────────────────────────────────────────
 
@@ -210,6 +326,37 @@ class ProductionClaudeClient:
         self._default_model = default_model
         self._default_timeout = default_timeout
 
+    def plan(
+        self,
+        prompt: str,
+        *,
+        input_text: str | None = None,
+        model: str | None = None,
+        timeout: float | None = None,
+        working_directory: Path | None = None,
+    ) -> AgentInvocation:
+        """Resolve the ``claude -p`` launch plan (no subprocess spawned)."""
+        del working_directory  # not reflected in the claude argv itself
+        effective_model = model if model is not None else self._default_model
+        effective_timeout = (
+            timeout if timeout is not None else self._default_timeout
+        )
+        # verified non-deprecated against claude CLI 2026-05-28
+        return AgentInvocation(
+            argv=[
+                self._claude_path,
+                "-p",
+                prompt,
+                "--model",
+                effective_model,
+                "--dangerously-skip-permissions",
+            ],
+            use_stdin=input_text is not None,
+            stdin_data=input_text,
+            env=None,
+            timeout=effective_timeout,
+        )
+
     def run_prompt(
         self,
         prompt: str,
@@ -219,29 +366,26 @@ class ProductionClaudeClient:
         timeout: float | None = None,
         working_directory: Path | None = None,
     ) -> str:
-        effective_model = model if model is not None else self._default_model
-        effective_timeout = (
-            timeout if timeout is not None else self._default_timeout
-        )
-        # verified non-deprecated against claude CLI 2026-05-28
-        command: tuple[str, ...] = (
-            self._claude_path,
-            "-p",
+        inv = self.plan(
             prompt,
-            "--model",
-            effective_model,
-            "--dangerously-skip-permissions",
+            input_text=input_text,
+            model=model,
+            timeout=timeout,
+            working_directory=working_directory,
         )
+        command: tuple[str, ...] = tuple(inv.argv)
+        effective_timeout = inv.timeout
         cwd = str(working_directory) if working_directory is not None else None
         try:
             completed = subprocess.run(
                 list(command),
-                input=input_text,
+                input=inv.stdin_data,
                 capture_output=True,
                 text=True,
                 timeout=effective_timeout,
                 check=False,
                 cwd=cwd,
+                env=inv.env,
             )
         except subprocess.TimeoutExpired as exc:
             raise ClaudeTimeoutError(
@@ -257,10 +401,19 @@ class ProductionClaudeClient:
         return completed.stdout
 
 
+#: Generalized aliases (this.i ``agbknd7q``). The ``*ClaudeClient`` names are
+#: retained for back-compat; new code should prefer the agent-neutral names.
+FakeAgentBackend = FakeClaudeClient
+ProductionAgentBackend = ProductionClaudeClient
+
 __all__ = [
+    "AgentBackend",
+    "AgentInvocation",
     "ClaudeClient",
     "ClaudeError",
     "ClaudeTimeoutError",
+    "FakeAgentBackend",
     "FakeClaudeClient",
+    "ProductionAgentBackend",
     "ProductionClaudeClient",
 ]

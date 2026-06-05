@@ -32,9 +32,33 @@ by editing the analysis.
     `ProductionClaudeClient` resolves its binary via `shutil.which` at
     construction (commit `565372d`). The broader T6 review-policy / CODEOWNERS
     items remain open.
-- **Still open / highest-leverage:** T1 (sandbox the dispatch agent), T3
-  (server-side branch protection + token scoping — operational), T5 (sign
-  releases), and the remaining open-source-readiness items in §3.4. See §6.
+- **2026-06-04 — pluggable coding agents + dispatch hardening (branch
+  `feat/pluggable-agents`; see docs/pluggable-agents.md, this.i `agbknd7q`…
+  `agatk5n`):** this is the substantive remediation of **T1** and adds a new,
+  deliberately-accepted surface (the T6/§3.4-4 "config chooses the binary"
+  class). Both are reconciled in **§3.5** below. In brief:
+  - **T1 — substantially addressed.** The dispatch agent no longer performs any
+    networked/credentialed/irreversible git op: gitbulk pre-fetches the base and
+    performs the `force-push-with-lease` itself, after independently verifying
+    the worktree (the agent's verdict is advisory). The agent's task is now
+    local-only, so it can be run env-scoped and inside an unprivileged
+    bubblewrap sandbox (`fs+no-net`) that hides `~/.ssh`/`~/.aws`/`~/.config/gh`
+    and the other clones and cuts network egress. Foreign-author dispatch
+    gating (§3.3-fix item 1) and the `.agent-bin`-on-dispatch idea (item 4)
+    remain open. *(this.i `agpriv8n`, `agenv6q`, `agsbx3k`)*
+  - **New surface accepted:** agents are now selectable/configurable
+    (`agents:` / `--agent`), which is exactly the config-driven-binary pattern
+    §3.4-4 flags. Accepted on purpose with compensating controls (no-shell
+    argv-lists, `shutil.which` pinning, env allowlist, sandbox); see **§3.5**.
+- **Still open / highest-leverage:** T3 (server-side branch protection + token
+  scoping — operational), T5 (sign releases), the remaining T1 items
+  (foreign-author gating, runtime shim), and the open-source-readiness items in
+  §3.4. See §6.
+- **Line-number caveat:** the 2026-06-04 work refactored `dispatch.py`,
+  `exec.py`, `claude.py`, and `prompts/resolve-conflicts.md`; line references
+  below that point into those files predate it and should be re-verified against
+  HEAD. The agent invocation now lives behind `gitbulk.agent` /
+  `gitbulk.claude.AgentBackend.plan`, not the old `exec._claude_argv`.
 
 ---
 
@@ -509,6 +533,78 @@ impact than 1–5 (shims are dev-time), but it's a quiet erosion.
 
 ---
 
+### 3.5 Pluggable coding agents — a deliberately-accepted surface (2026-06-04)
+
+The `feat/pluggable-agents` work lets gitbulk drive coding agents other than
+Claude (Gemini, Copilot, Cursor, or a custom CLI), selected by config
+(`default_agent:` / per-repo `agent:`) or `--agent`, and configured by an
+`agents:` block (built-in presets + a custom `command` template). **This is
+exactly the "config/CLI chooses which binary runs" pattern that §3.4(4) / T6
+names a red flag.** It is accepted on purpose, because the *capability* it adds
+to an attacker who can already write `~/.config/gitbulk/` is **nil** — that
+attacker is A2, who already has the workstation and can edit the crontab or the
+dispatch prompt (§3.2.1) — while the controls it ships **reduce** what a
+less-trusted *backend* can do. The compensating controls (this.i `agtmpl9k`):
+
+- **No shell, ever.** `command`/`model_args` are argv **lists**; a scalar string
+  is a hard config error. `{prompt}`/`{model}` substitute *within a single
+  token*, so attacker-influenceable prompt/worktree text can never split into
+  extra arguments. There is no shell to inject into. (Closes the obvious
+  regression of §5's "shell/argv injection is well-defended".)
+- **Binary pinned.** `command[0]` is resolved via `shutil.which` at load and
+  used as an absolute path thereafter — the same F2 fix, now generalized to
+  every backend, so a later `PATH` prepend cannot substitute it. A relative path
+  that doesn't resolve is rejected.
+- **Least privilege + verify (T1 fix).** Whatever backend runs, it never pushes;
+  gitbulk verifies and pushes. A malicious/confused backend's blast radius is
+  "garbage in a throwaway worktree," caught before any remote mutation.
+- **Env allowlist + sandbox.** A backend gets only the env vars its profile
+  names (no ambient `GH_TOKEN`/SSH/cloud creds by default) and can be confined
+  to an unprivileged bwrap namespace; an unavailable sandbox **refuses** by
+  default rather than silently running unconfined.
+
+**Residual risks (named, not eliminated):**
+
+- **Config is now security-critical in one more way.** Whoever can write
+  `gitbulk.yaml` can point `command` at any binary and choose `env`/`sandbox`.
+  This is the same trust level as `policy.bots`/`--approve-author` (§3.1b) and
+  the dispatch prompt (§3.2.1): keep `~/.config/gitbulk/` mode `0700`,
+  operator-owned. The effective agent argv (prompt elided) should be logged per
+  run so the granted authority is auditable.
+- **The auto-approve flag is still the enabler.** Each preset bakes in the
+  backend's `--dangerously-skip-permissions` / `--yolo` / `--allow-all-tools`
+  equivalent — mandatory for unattended runs, and the thing that makes the
+  sandbox (not the prompt) the real boundary.
+- **Less-trusted backends honor prose constraints less reliably than Claude.**
+  This is precisely why the sandbox/least-privilege controls, not the prompt,
+  are load-bearing for non-Claude agents — and why `claude` remains the trusted
+  default served by the native client.
+
+**Post-review correction (2026-06-04, this.i `agsecr5n`).** An adversarial
+security review of this very feature found the sandbox was initially
+**non-functional** — it bound a linked worktree whose `.git` points into the
+operator clone, so git couldn't run, and it was tested only by argv-shape
+assertions (never e2e). Fixed: sandboxed agents now run in a self-contained
+clone (this.i `agecln4k`), validated by a real-`bwrap` e2e test with a
+regression control (`agtste9k`). The review also found least privilege was
+opt-in (now secure-by-default presets) and there was no foreign-author gate (now
+added). See `agsecr5n` for the full disposition of all five findings.
+
+**Threat → control → test matrix** (each row has an adversarial test in
+`tests/test_agent_security.py` / `tests/test_rebase.py` / `tests/test_dispatch.py`,
+this.i `agatk5n`):
+
+| Threat | Control | Test |
+|---|---|---|
+| Prompt-content command injection | argv-lists, one-token sub, no shell | `test_prompt_metacharacters_stay_one_argv_token`, `test_scalar_command_string_is_rejected` |
+| Binary PATH-hijack (T6) | `shutil.which` pin; relative-path reject | `test_binary_pinned_via_which`, `test_relative_command_path_that_is_missing_is_rejected` |
+| Credential exfil via inherited env (T1) | per-profile env allowlist | `test_scoped_env_excludes_ambient_secrets` |
+| Read `~/.ssh` / other clones (T1) | bwrap fs scoping | `test_wrap_does_not_bind_credentials_or_home`, `test_fs_no_net_sandbox_cuts_network_and_hides_creds` |
+| Network exfil (T1/§3.2.2) | `--unshare-net` | `test_wrap_fs_no_net_unshares_network` |
+| Silent sandbox downgrade | refuse-if-unavailable | `test_sandbox_refuses_when_host_cannot_provide_it`, `test_dispatch_default_agent_sandbox_unavailable_refuses` |
+| Agent pushes arbitrary refs (T1/§3.2.1) | agent never pushes; gitbulk owns push | `test_dispatch_resolved_ready_gitbulk_pushes` |
+| Verdict spoofing (`RESOLVED` w/o work) | independent verify-before-push | `test_dispatch_resolved_blocked_pushes_nothing_and_flags_attention`, `test_verify_*` |
+
 ## 4. Prioritized findings
 
 Ranked by my pragmatic read of *likelihood × impact × cheapness-to-fix*. "Fix
@@ -516,7 +612,7 @@ cost" is rough engineering effort.
 
 | ID | Finding | Likelihood | Impact | Fix cost | Priority |
 |---|---|---|---|---|---|
-| **T1** | `dispatch` agent runs `--dangerously-skip-permissions` with full ambient authority on untrusted PR content, confined only by a prompt (§3.1a/§3.2.2/§3.3) | Med–High | **Critical** | Med–High | **P0** |
+| **T1** | `dispatch` agent runs `--dangerously-skip-permissions` with full ambient authority on untrusted PR content, confined only by a prompt (§3.1a/§3.2.2/§3.3) | Med–High | **Critical** | Med–High | **P0 — largely mitigated 2026-06-04 (§3.5): agent never pushes, env-scoped, bwrap-sandboxable; foreign-author gating still open** |
 | **T2** | No invisible-Unicode / Trojan-Source CI gate; guardrails are reviewable Python (§3.4-1) | High *(if OSS)* | High | **Low** | **P0** |
 | **T3** | gitbulk is a turnkey fleet-spread engine post-compromise; mitigated only by server-side branch protection that isn't gitbulk's to enforce (§3.2.1) | Med | **Critical** | Low *(config the fleet)* | **P0** |
 | **T4** | CI/release actions pinned to mutable tags (`@v6/@v7`, third-party `setup-uv`), unchecksummed actionlint download; poisons the binary all users run (§3.2.4) | Low–Med | Critical (all users) | **Low** | **P1** |

@@ -7,13 +7,23 @@ current working directory **is** that worktree. You are one of a small bounded
 pool (default 2) of agents, each handling a different PR; you know about and
 touch **only this one**.
 
+**gitbulk owns the network. You do not.** Before launching you, gitbulk already
+fetched the base branch, so `origin/<base>` is current in this worktree. You
+have **no credentials and may have no network access** — do **not** run
+`git fetch`, `git push`, or any `gh`/network command. Your job is purely
+**local**: rebase onto the already-fetched `origin/<base>` and resolve
+conflicts in the working tree. **When you finish, gitbulk independently
+re-checks the worktree and performs the push itself** — only if you report
+`RESOLVED` *and* the worktree verifies clean. Reporting `RESOLVED` is therefore
+a claim gitbulk will verify, not a push you perform.
+
 Your job: bring this single PR's branch back to a mergeable state by rebasing
 it onto its base branch, resolving conflicts **only** when they are clearly
-mechanical and low-risk. For anything else, **escalate cleanly** — stop, leave
-the branch untouched, and write a structured note. This is the second layer
-behind the deterministic `rebase-pr` tool: that tool already auto-handled the
-clean/behind cases and the trivial rebases; you only see PRs that are still
-genuinely conflicting. When in doubt, **escalate — never guess at intent.**
+mechanical and low-risk. For anything else, **escalate cleanly** — stop, abort
+the rebase, and write a structured note. This is the second layer behind the
+deterministic `rebase-pr` tool: that tool already auto-handled the clean/behind
+cases and the trivial rebases; you only see PRs that are still genuinely
+conflicting. When in doubt, **escalate — never guess at intent.**
 
 ---
 
@@ -30,30 +40,29 @@ genuinely conflicting. When in doubt, **escalate — never guess at intent.**
 
 ## Happy path
 
-1. **Identify the PR and its base.** From within the worktree:
-   ```
-   gh pr view --json number,headRefName,baseRefName
-   ```
-   This gives you the PR number, the head branch (already checked out here),
-   and the base branch (e.g. `main`).
-2. **Fetch the base.** `git fetch origin <baseRefName>` so `origin/<base>` is
-   current.
-3. **Rebase** the head onto the base: `git rebase origin/<baseRefName>`.
-4. **Resolve conflicts only if every conflict is mechanical/low-risk** (see the
+1. **Identify the base branch.** The base ref is already fetched as
+   `origin/<base>`. You can read the branch names locally without the network,
+   e.g. `git rev-parse --abbrev-ref HEAD` for the head and inspecting
+   `git branch -r` / the worktree's config for the base; gitbulk dispatched you
+   against a specific PR whose base it already fetched (commonly `main`).
+2. **Rebase** the head onto the already-fetched base:
+   `git rebase origin/<base>`. (No `git fetch` — gitbulk did that.)
+3. **Resolve conflicts only if every conflict is mechanical/low-risk** (see the
    next section for the exact definition). If any conflict falls outside that
-   set — even one — **escalate** (see below). Do not partially resolve and push.
+   set — even one — **escalate** (see below). Do not partially resolve.
+4. **Finish the rebase** with `git rebase --continue` until it completes
+   cleanly, so the worktree is left with **no conflict markers and no rebase in
+   progress**. gitbulk verifies exactly this before it pushes.
 5. **Sanity-check, if cheap.** Detect whether an obvious, fast test/build/lint
    exists (e.g. `pytest -q`, `npm test`, `make check`, a linter the repo
    configures) and run it to confirm the resolution holds. Do **not** invent a
    command; if nothing obvious exists, skip this step. If a check you run
-   **fails**, do **not** push — escalate.
-6. **Push the rebased head branch only**, using a lease so a concurrent push
-   aborts instead of clobbering:
-   ```
-   git push --force-with-lease origin HEAD:<headRefName>
-   ```
-   Push **nothing else**. Never push any other branch.
-7. **Report** the outcome as your final line (see Output).
+   **fails**, **escalate** (abort the rebase) rather than leaving a broken
+   resolution for gitbulk to push.
+6. **Do NOT push.** Leave the rebased, conflict-free worktree as-is and
+   **report** `RESOLVED` as your final line (see Output). gitbulk re-checks the
+   worktree and force-pushes the head branch (with a lease) on your behalf.
+   You never run `git push`.
 
 ---
 
@@ -112,17 +121,17 @@ mechanical — escalate.
 
 ---
 
-## Push safety (hard rules)
+## Network safety (hard rules)
 
-- Push **only** this PR's own head branch, and only with
-  `git push --force-with-lease`.
-- **Never** push to or modify `main`, `master`, `dev`, or any
-  protected/default branch.
-- **Never** run `gh pr merge`. Never close, reopen, or comment-to-merge a PR.
-  Never delete any branch.
-- If `--force-with-lease` is **rejected** (the head moved since gitbulk
-  observed it), **stop** — do not retry with a plain force. Treat it as an
-  escalation and report that the branch advanced underneath you.
+- **Never push.** gitbulk performs the force-push-with-lease itself, after
+  re-checking your work. You leaving the worktree clean and reporting
+  `RESOLVED` is the entire handoff.
+- **Never** run `git push`, `git fetch`, `gh pr merge`, or any other network /
+  `gh` command. You have no credentials and may have no network; such a command
+  will simply fail and waste the run.
+- **Never** modify `main`, `master`, `dev`, or any protected/default branch;
+  never close, reopen, comment-to-merge, or delete any branch.
+- Operate only on the local working tree of this one worktree.
 
 ---
 
@@ -135,7 +144,9 @@ When you decide to escalate at any point after starting the rebase:
    git rebase --abort
    ```
    (If you had not yet started the rebase, there is nothing to abort.)
-2. **Push nothing.**
+   Aborting leaves the head branch untouched, so gitbulk — which only pushes a
+   worktree whose HEAD advanced past the SHA it observed — will push nothing.
+2. **Push nothing.** (You never push regardless; gitbulk owns the push.)
 3. **Write `ESCALATION.md` in the worktree root** (this mirrors the
    `CONFLICT.md` convention gitbulk's own `rebase-pr` leaves in preserved
    worktrees; gitbulk preserves a worktree that still shows conflict state, so
@@ -154,8 +165,8 @@ When you decide to escalate at any point after starting the rebase:
 ## Determinism / idempotence
 
 - Assume you may be one of several agents and that the world can move under you.
-  The `--force-with-lease` guard is your protection — if it aborts, report and
-  stop rather than forcing.
+  gitbulk pushes with `--force-with-lease` against the head SHA it observed, so
+  a concurrent push aborts safely on its side — you do not need to guard for it.
 - Do not amend or rewrite history beyond the single rebase-onto-base you were
   asked to perform.
 
@@ -166,7 +177,7 @@ When you decide to escalate at any point after starting the rebase:
 End with **exactly one** final line stating the outcome, one of:
 
 - `RESOLVED: <one-line description of what was reconciled>` — e.g.
-  `RESOLVED: union-merged poetry.lock and CHANGELOG.md, rebased onto origin/main, force-pushed with lease`
+  `RESOLVED: union-merged poetry.lock and CHANGELOG.md, rebased onto origin/main` (gitbulk will push)
 - `ESCALATED: <one-line reason>` — e.g.
   `ESCALATED: overlapping edits to auth middleware in src/auth/session.py; see ESCALATION.md`
 

@@ -30,9 +30,11 @@ from gitbulk.commands.dispatch import (
     EXIT_OK,
     EXIT_OVERRIDES_APPLIED,
     EXIT_STRUCTURAL_FAILURE,
+    _apply_foreign_author_gate,
     _build_summary_md,
     _key_for_pr,
     _parse_agent_outcome,
+    _stdout_isatty,
     _runid_from_run_dir,
     _salvage_escalation,
     _validate_prompt,
@@ -135,12 +137,14 @@ def fake_clones(code_root):
 
 @pytest.fixture
 def write_config(isolated_xdg, code_root):
-    def _write(*, repos_slugs, with_org="provenant-dev"):
+    def _write(*, repos_slugs, with_org="provenant-dev", extra=None):
         cfg_dir = paths.config_dir()
         cfg_dir.mkdir(parents=True, exist_ok=True)
         policy_yaml = {"defaults": {"retain_runs": 5}}
         if with_org:
             policy_yaml["humans"] = {"org": with_org, "cache_ttl_hours": 24}
+        if extra:
+            policy_yaml.update(extra)
         (cfg_dir / "gitbulk.yaml").write_text(yaml.safe_dump(policy_yaml))
         repos_txt = "\n".join(repos_slugs) + ("\n" if repos_slugs else "")
         (cfg_dir / "repos.txt").write_text(repos_txt)
@@ -169,6 +173,32 @@ def prompt_file(tmp_path):
     p = tmp_path / "prompt.md"
     p.write_text("Triage this PR and report.\n")
     return p
+
+
+@pytest.fixture(autouse=True)
+def _neutralize_prefetch_and_push(monkeypatch):
+    """Keep existing dispatch tests hermetic after Phase 3 (this.i agpriv8n).
+
+    gitbulk now performs a networked base-fetch before the agent and a
+    force-push after a verified RESOLVED. Default these to no-ops so tests
+    that stub worktrees/execute_targets don't hit real git: fetch succeeds,
+    the worktree verifies as NO_CHANGE (so nothing is pushed), and push is a
+    no-op. The dedicated Phase-3 push tests below override these.
+    """
+    from gitbulk.rebase import PushReadiness, RebaseResult, RebaseStatus
+
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.fetch_base",
+        lambda *a, **k: RebaseResult(RebaseStatus.CLEAN, "fetched"),
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.verify_resolved_for_push",
+        lambda *a, **k: (PushReadiness.NO_CHANGE, "stub: no change"),
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.force_push_with_lease",
+        lambda *a, **k: None,
+    )
 
 
 def _make_pr(
@@ -211,6 +241,7 @@ def _make_args(
     timeout=1800.0,
     filter=None,
     refresh_org_members=False,
+    allow_foreign_authors=False,
 ):
     return argparse.Namespace(
         subcommand="dispatch",
@@ -222,6 +253,7 @@ def _make_args(
         timeout=timeout,
         filter=filter,
         refresh_org_members=refresh_org_members,
+        allow_foreign_authors=allow_foreign_authors,
     )
 
 
@@ -493,7 +525,16 @@ def _stub_is_conflict(monkeypatch, *, conflicts_for_paths):
 def _stub_execute_targets(monkeypatch, *, results_by_key):
     """Patch execute_targets to return canned ExecResult per key."""
 
-    def _impl(targets, *, claude, log_dir, concurrency, timeout_per_target):
+    def _impl(
+        targets,
+        *,
+        claude,
+        log_dir,
+        concurrency,
+        timeout_per_target,
+        model=None,
+        backends=None,
+    ):
         log_dir.mkdir(parents=True, exist_ok=True)
         out: list[ExecResult] = []
         now = datetime.now(timezone.utc)
@@ -556,8 +597,8 @@ def test_dispatch_apply_happy_path_two_prs(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient",
-        lambda: object(),  # never called because execute_targets is stubbed
+        "gitbulk.commands.dispatch.backend_for",
+        lambda *a, **k: object(),  # never used because execute_targets is stubbed
     )
 
     paths_seen: list[Path] = []
@@ -592,6 +633,362 @@ def test_dispatch_apply_happy_path_two_prs(
         assert prs[0]["worktree_preserved"] is False
 
 
+def test_dispatch_apply_per_repo_agent_builds_per_target_backend(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """A per-repo ``agent:`` override yields a per-target backend in the map
+    passed to execute_targets; repos on the run default are absent from it
+    (this.i agprof4k; dispatch per-repo backend loop)."""
+    # Both repos override to the SAME non-default agent, so the second one
+    # exercises the backend-cache-hit branch (build once, reuse).
+    write_config(
+        repos_slugs=["dhh1128/alpha", "dhh1128/beta"],
+        extra={
+            "repos": {
+                "dhh1128/alpha": {"agent": "gemini"},
+                "dhh1128/beta": {"agent": "gemini"},
+            }
+        },
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake_clones("dhh1128/alpha")
+    fake_clones("dhh1128/beta")
+    pr1 = _make_pr(slug="dhh1128/alpha", number=1)
+    pr2 = _make_pr(slug="dhh1128/beta", number=2)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main", "dhh1128/beta": "main"},
+        my_open_prs={"dhh1128/alpha": [pr1], "dhh1128/beta": [pr2]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
+    )
+    # Distinguish backends by the resolved name so we can assert the map.
+    build_calls: list = []
+
+    def _fake_backend_for(policy, requested, slug=None):
+        build_calls.append(slug)
+        name = "gemini" if slug in ("dhh1128/alpha", "dhh1128/beta") else "claude"
+        return f"backend:{name}"
+
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.backend_for", _fake_backend_for
+    )
+
+    captured: dict = {}
+
+    def _capture_exec(targets, *, claude, log_dir, concurrency,
+                      timeout_per_target, model=None, backends=None):
+        captured["backends"] = backends
+        captured["default"] = claude
+        log_dir.mkdir(parents=True, exist_ok=True)
+        out = []
+        now = datetime.now(timezone.utc)
+        for t in targets:
+            (log_dir / f"{t.key}.stdout.log").write_text("")
+            (log_dir / f"{t.key}.stderr.log").write_text("")
+            out.append(
+                ExecResult(
+                    key=t.key, status="completed", exit_code=0,
+                    stdout_path=log_dir / f"{t.key}.stdout.log",
+                    stderr_path=log_dir / f"{t.key}.stderr.log",
+                    started_at=now, finished_at=now, duration_seconds=0.0,
+                )
+            )
+        return out
+
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.execute_targets", _capture_exec
+    )
+    _stub_worktree_create(monkeypatch, paths_seen=[])
+    _stub_worktree_remove(monkeypatch, removed=[])
+    _stub_is_conflict(monkeypatch, conflicts_for_paths=[])
+
+    rc = dispatch_handler(
+        _make_args(
+            prompt=prompt_file, apply=True, code_root=code_root,
+            skip_check=_LOCAL_SKIPS,
+        )
+    )
+    assert rc == EXIT_OVERRIDES_APPLIED
+    alpha_key = _key_for_pr("dhh1128/alpha", 1)
+    beta_key = _key_for_pr("dhh1128/beta", 2)
+    # Both targets get the gemini backend...
+    assert captured["backends"] == {
+        alpha_key: "backend:gemini",
+        beta_key: "backend:gemini",
+    }
+    assert captured["default"] == "backend:claude"
+    # ...but the gemini backend was built only ONCE (cache hit on the second),
+    # plus the one build for the run default. slug=None is the default build.
+    assert build_calls == [None, "dhh1128/alpha"]
+
+
+def test_dispatch_default_agent_sandbox_unavailable_refuses(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """If the run's default agent requires a sandbox the host can't provide
+    (refuse fallback), dispatch aborts structurally before touching worktrees
+    (this.i agsbx3k — no silent unsandboxed downgrade)."""
+    monkeypatch.setattr("gitbulk.agent.bwrap_available", lambda: False)
+    write_config(
+        repos_slugs=["dhh1128/alpha"],
+        extra={
+            "default_agent": "gemini",
+            "agents": {"gemini": {"sandbox": "fs-only"}},
+        },
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake_clones("dhh1128/alpha")
+    pr = _make_pr(slug="dhh1128/alpha", number=1)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
+    )
+    created: list = []
+    _stub_worktree_create(monkeypatch, paths_seen=created)
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.execute_targets",
+        lambda *a, **k: pytest.fail("must not run the pool when refusing"),
+    )
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, apply=True, code_root=code_root,
+                   skip_check=_LOCAL_SKIPS)
+    )
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    assert created == []  # aborted before any worktree
+
+
+def _sandboxed_gemini_setup(monkeypatch, write_config, fresh_org_cache,
+                            fake_clones):
+    """A run whose agent (gemini) requests a working sandbox → isolated clone."""
+    monkeypatch.setattr("gitbulk.agent.bwrap_available", lambda: True)
+    write_config(
+        repos_slugs=["dhh1128/alpha"],
+        extra={
+            "default_agent": "gemini",
+            "agents": {"gemini": {"sandbox": "fs-only"}},
+        },
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake_clones("dhh1128/alpha")
+    pr = _make_pr(slug="dhh1128/alpha", number=1, author="dhh1128")
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
+    )
+
+
+def test_dispatch_sandboxed_agent_uses_isolated_clone(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones, tmp_path,
+):
+    """A sandboxed agent gets a self-contained clone (not a linked worktree),
+    torn down via remove_isolated_clone (SEC-F1 / agecln4k)."""
+    _sandboxed_gemini_setup(monkeypatch, write_config, fresh_org_cache, fake_clones)
+    created: list = []
+    removed: list = []
+
+    def _fake_create(repo_path, slug, num, head_ref, head_sha, *,
+                     worktree_root, runid):
+        p = tmp_path / f"clone-{num}"
+        p.mkdir()
+        created.append(p)
+        return p
+
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.create_isolated_clone", _fake_create
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.remove_isolated_clone",
+        lambda p, *, worktree_root: removed.append(p),
+    )
+    _stub_is_conflict(monkeypatch, conflicts_for_paths=[])
+    _stub_execute_targets(
+        monkeypatch,
+        results_by_key={_key_for_pr("dhh1128/alpha", 1): {
+            "status": "completed", "exit_code": 0}},
+    )
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, apply=True, code_root=code_root,
+                   skip_check=_LOCAL_SKIPS)
+    )
+    assert len(created) == 1  # isolated clone, not a worktree
+    assert removed == created  # torn down via remove_isolated_clone
+
+
+def test_dispatch_sandboxed_prefetch_failure_removes_clone(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones, tmp_path,
+):
+    """Fetch failure on a sandboxed target removes the clone and skips the PR."""
+    from gitbulk.rebase import RebaseResult, RebaseStatus
+
+    _sandboxed_gemini_setup(monkeypatch, write_config, fresh_org_cache, fake_clones)
+    created: list = []
+    removed: list = []
+
+    def _fake_create(*a, **k):
+        p = tmp_path / "c"
+        p.mkdir(exist_ok=True)
+        created.append(p)
+        return p
+
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.create_isolated_clone", _fake_create
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.remove_isolated_clone",
+        lambda p, *, worktree_root: removed.append(p),
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.fetch_base",
+        lambda wt, base: RebaseResult(RebaseStatus.ERROR, "offline"),
+    )
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, apply=True, code_root=code_root,
+                   skip_check=_LOCAL_SKIPS)
+    )
+    assert len(removed) == 1  # the clone was cleaned up on fetch failure
+    latest = paths.latest_run_symlink("dispatch").resolve()
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    assert "dhh1128/alpha" not in state.get("repos", {})
+
+
+def test_dispatch_sandbox_warn_run_runs_but_flags_attention(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """SEC-F4: with sandbox_fallback=warn-run and bwrap unavailable, the run
+    proceeds UNSANDBOXED but records a durable WARNING and raises ATTENTION —
+    not just a logging.warning cron would swallow."""
+    monkeypatch.setattr("gitbulk.agent.bwrap_available", lambda: False)
+    write_config(
+        repos_slugs=["dhh1128/alpha"],
+        extra={
+            "default_agent": "gemini",
+            "agents": {"gemini": {"sandbox": "fs-only"}},
+            "sandbox_fallback": "warn-run",
+        },
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake_clones("dhh1128/alpha")
+    pr = _make_pr(slug="dhh1128/alpha", number=1)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
+    )
+    _stub_worktree_create(monkeypatch, paths_seen=[])
+    _stub_worktree_remove(monkeypatch, removed=[])
+    _stub_is_conflict(monkeypatch, conflicts_for_paths=[])
+    ran = {"called": False}
+
+    def _exec_wrapper(targets, *, claude, log_dir, concurrency,
+                      timeout_per_target, model=None, backends=None):
+        ran["called"] = True
+        log_dir.mkdir(parents=True, exist_ok=True)
+        now = datetime.now(timezone.utc)
+        out = []
+        for t in targets:
+            (log_dir / f"{t.key}.stdout.log").write_text("")
+            (log_dir / f"{t.key}.stderr.log").write_text("")
+            out.append(ExecResult(
+                key=t.key, status="completed", exit_code=0,
+                stdout_path=log_dir / f"{t.key}.stdout.log",
+                stderr_path=log_dir / f"{t.key}.stderr.log",
+                started_at=now, finished_at=now, duration_seconds=0.0,
+            ))
+        return out
+
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.execute_targets", _exec_wrapper
+    )
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, apply=True, code_root=code_root,
+                   skip_check=_LOCAL_SKIPS)
+    )
+    assert ran["called"] is True  # it ran (did not refuse)
+    assert rc == EXIT_ATTENTION_NEEDED  # but flagged for attention
+    latest = paths.latest_run_symlink("dispatch").resolve()
+    errors = [
+        json.loads(line)
+        for line in (latest / "errors.log").read_text().splitlines()
+        if line.strip()
+    ]
+    assert any("ran UNSANDBOXED" in e["message"] for e in errors)
+
+
+def test_dispatch_per_repo_sandbox_refusal_skips_only_that_pr(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """A per-repo agent that refuses (sandbox unavailable) skips just that PR;
+    the default-agent PR still runs."""
+    monkeypatch.setattr("gitbulk.agent.bwrap_available", lambda: False)
+    write_config(
+        repos_slugs=["dhh1128/alpha", "dhh1128/beta"],
+        extra={
+            "agents": {"gemini": {"sandbox": "fs-only"}},
+            "repos": {"dhh1128/alpha": {"agent": "gemini"}},
+        },
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake_clones("dhh1128/alpha")
+    fake_clones("dhh1128/beta")
+    pr1 = _make_pr(slug="dhh1128/alpha", number=1)
+    pr2 = _make_pr(slug="dhh1128/beta", number=2)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main", "dhh1128/beta": "main"},
+        my_open_prs={"dhh1128/alpha": [pr1], "dhh1128/beta": [pr2]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
+    )
+    _stub_worktree_create(monkeypatch, paths_seen=[])
+    _stub_worktree_remove(monkeypatch, removed=[])
+    _stub_is_conflict(monkeypatch, conflicts_for_paths=[])
+    _stub_execute_targets(
+        monkeypatch,
+        results_by_key={_key_for_pr("dhh1128/beta", 2): {
+            "status": "completed", "exit_code": 0}},
+    )
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, apply=True, code_root=code_root,
+                   skip_check=_LOCAL_SKIPS)
+    )
+    latest = paths.latest_run_symlink("dispatch").resolve()
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    # alpha (gemini, refused) skipped; beta (default claude) ran.
+    assert "dhh1128/beta" in state["repos"]
+    assert "dhh1128/alpha" not in state["repos"]
+    errors = [
+        json.loads(line)
+        for line in (latest / "errors.log").read_text().splitlines()
+        if line.strip()
+    ]
+    assert any("agent unavailable for dhh1128/alpha" in e["message"] for e in errors)
+
+
 # ─── --apply: 1 PR claude-fails → exit 2 ───────────────────────────────────
 
 
@@ -613,7 +1010,7 @@ def test_dispatch_apply_one_failure_attention(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
 
     paths_seen: list[Path] = []
@@ -669,7 +1066,7 @@ def test_dispatch_apply_timeout_no_conflict_tears_down(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
 
     paths_seen: list[Path] = []
@@ -720,7 +1117,7 @@ def test_dispatch_apply_conflict_preserved_with_marker(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
 
     paths_seen: list[Path] = []
@@ -799,7 +1196,7 @@ def test_dispatch_apply_teardown_error_preserves(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
 
     paths_seen: list[Path] = []
@@ -875,7 +1272,7 @@ def test_dispatch_apply_worktree_create_error_skips_pr(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
 
     paths_seen: list[Path] = []
@@ -914,7 +1311,7 @@ def test_dispatch_apply_worktree_create_error_skips_pr(
         for line in (latest / "errors.log").read_text().splitlines()
         if line.strip()
     ]
-    assert any("worktree creation failed" in e["message"] for e in errors)
+    assert any("workspace creation failed" in e["message"] for e in errors)
 
 
 # ─── Universal invariant Fail (gh.authenticated) → exit 1 ──────────────────
@@ -1271,7 +1668,7 @@ def _one_pr_apply_run(monkeypatch, code_root, write_config, fresh_org_cache,
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
     paths_seen: list = []
     removed: list = []
@@ -1349,6 +1746,314 @@ def test_dispatch_apply_surfaces_resolved_no_escalation_file(
     assert pr_state["outcome"] == "RESOLVED"
     assert pr_state["escalation_file"] is None
     assert not (latest / "escalations").exists()
+
+
+# ─── Phase 3: gitbulk owns the push (this.i agpriv8n; threat-model T1/§5) ───
+
+
+def _resolved_cfg():
+    return {
+        "status": "completed",
+        "exit_code": 0,
+        "stdout": "rebased clean\nRESOLVED: union-merged lockfiles\n",
+    }
+
+
+def test_dispatch_resolved_ready_gitbulk_pushes(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """RESOLVED + verification READY → gitbulk force-pushes itself, with the
+    lease against the head SHA it first observed."""
+    from gitbulk.rebase import PushReadiness
+
+    pushes: list = []
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.verify_resolved_for_push",
+        lambda wt, sha: (PushReadiness.READY, "advanced"),
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.force_push_with_lease",
+        lambda wt, head_ref, expected_sha: pushes.append(
+            (head_ref, expected_sha)
+        ),
+    )
+    rc, latest, _removed = _one_pr_apply_run(
+        monkeypatch, code_root, write_config, fresh_org_cache, prompt_file,
+        fake_clones, cfg=_resolved_cfg(), conflict=False,
+    )
+    assert rc == EXIT_OVERRIDES_APPLIED  # skip-check applied; no problems
+    assert pushes == [("feature/7", "a" * 40)]
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    pr_state = state["repos"]["dhh1128/alpha"]["prs"][0]
+    assert pr_state["push_status"] == "pushed"
+
+
+def test_dispatch_resolved_blocked_pushes_nothing_and_flags_attention(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """A spoofed/garbled RESOLVED whose worktree fails verification → gitbulk
+    pushes NOTHING and the PR is surfaced for attention (verdict is advisory)."""
+    from gitbulk.rebase import PushReadiness
+
+    pushes: list = []
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.verify_resolved_for_push",
+        lambda wt, sha: (PushReadiness.BLOCKED, "unresolved conflict markers"),
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.force_push_with_lease",
+        lambda *a, **k: pushes.append(a),
+    )
+    rc, latest, _removed = _one_pr_apply_run(
+        monkeypatch, code_root, write_config, fresh_org_cache, prompt_file,
+        fake_clones, cfg=_resolved_cfg(), conflict=False,
+    )
+    assert pushes == []  # nothing pushed
+    assert rc == EXIT_ATTENTION_NEEDED  # push problem beats skip-check
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    pr_state = state["repos"]["dhh1128/alpha"]["prs"][0]
+    assert pr_state["push_status"] == "blocked"
+
+
+def test_dispatch_resolved_push_failure_flags_attention(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """READY but the force-push itself fails (e.g. lease violation) → attention."""
+    from gitbulk.rebase import PushReadiness, RebaseError
+
+    def _boom(*a, **k):
+        raise RebaseError("push rejected", stderr="stale info: ref moved")
+
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.verify_resolved_for_push",
+        lambda wt, sha: (PushReadiness.READY, "advanced"),
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.force_push_with_lease", _boom
+    )
+    rc, latest, _removed = _one_pr_apply_run(
+        monkeypatch, code_root, write_config, fresh_org_cache, prompt_file,
+        fake_clones, cfg=_resolved_cfg(), conflict=False,
+    )
+    assert rc == EXIT_ATTENTION_NEEDED
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    pr_state = state["repos"]["dhh1128/alpha"]["prs"][0]
+    assert pr_state["push_status"] == "push-failed"
+
+
+def test_dispatch_resolved_no_change_pushes_nothing(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """RESOLVED but HEAD never advanced → nothing to push, not an attention
+    condition."""
+    from gitbulk.rebase import PushReadiness
+
+    pushes: list = []
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.verify_resolved_for_push",
+        lambda wt, sha: (PushReadiness.NO_CHANGE, "unchanged"),
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.force_push_with_lease",
+        lambda *a, **k: pushes.append(a),
+    )
+    rc, latest, _removed = _one_pr_apply_run(
+        monkeypatch, code_root, write_config, fresh_org_cache, prompt_file,
+        fake_clones, cfg=_resolved_cfg(), conflict=False,
+    )
+    assert pushes == []
+    assert rc == EXIT_OVERRIDES_APPLIED  # benign; no attention
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    assert state["repos"]["dhh1128/alpha"]["prs"][0]["push_status"] == "no-change"
+
+
+def test_dispatch_escalated_is_never_pushed(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """An ESCALATED verdict is never verified or pushed (the agent declined)."""
+    pushes: list = []
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.force_push_with_lease",
+        lambda *a, **k: pushes.append(a),
+    )
+    called = []
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.verify_resolved_for_push",
+        lambda *a, **k: called.append(a) or (None, "x"),
+    )
+    cfg = {"status": "completed", "exit_code": 0,
+           "stdout": "ESCALATED: not mechanical\n"}
+    rc, _latest, _removed = _one_pr_apply_run(
+        monkeypatch, code_root, write_config, fresh_org_cache, prompt_file,
+        fake_clones, cfg=cfg, conflict=False,
+    )
+    assert pushes == []
+    assert called == []  # verification not even attempted for ESCALATED
+    assert rc == EXIT_OVERRIDES_APPLIED
+
+
+def test_dispatch_prefetch_failure_skips_pr(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """If gitbulk cannot fetch the base, the PR is skipped (the agent could
+    not rebase offline anyway) and the worktree is removed."""
+    from gitbulk.rebase import RebaseResult, RebaseStatus
+
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.fetch_base",
+        lambda wt, base: RebaseResult(RebaseStatus.ERROR, "no route to host"),
+    )
+    rc, latest, removed = _one_pr_apply_run(
+        monkeypatch, code_root, write_config, fresh_org_cache, prompt_file,
+        fake_clones, cfg=_resolved_cfg(), conflict=False,
+    )
+    # PR skipped: no repo state recorded, worktree removed, error logged.
+    assert len(removed) == 1
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    assert state["repos"] == {} or "dhh1128/alpha" not in state.get("repos", {})
+    errors = [
+        json.loads(line)
+        for line in (latest / "errors.log").read_text().splitlines()
+        if line.strip()
+    ]
+    assert any("prefetch failed" in e["message"] for e in errors)
+
+
+# ─── SEC-F3: foreign-author / fork gate ────────────────────────────────────
+
+
+def _foreign_pr_setup(monkeypatch, write_config, fresh_org_cache, fake_clones):
+    """One eligible PR authored by someone OTHER than the operator (dhh1128)."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128", "stranger"])
+    fake_clones("dhh1128/alpha")
+    pr = _make_pr(slug="dhh1128/alpha", number=1, author="stranger")
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128", "stranger"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
+    )
+    return fake
+
+
+def _read_errors(latest):
+    return [
+        json.loads(line)
+        for line in (latest / "errors.log").read_text().splitlines()
+        if line.strip()
+    ]
+
+
+def test_dispatch_skips_foreign_authored_pr_by_default(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    _foreign_pr_setup(monkeypatch, write_config, fresh_org_cache, fake_clones)
+    # Dry-run is enough to exercise the gate (it runs before the apply path).
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, code_root=code_root, skip_check=_LOCAL_SKIPS)
+    )
+    latest = paths.latest_run_symlink("dispatch").resolve()
+    summary = (latest / "summary.md").read_text()
+    assert "no eligible PRs" in summary  # the stranger's PR was withheld
+    assert any(
+        "skipping foreign-authored PR dhh1128/alpha#1" in e["message"]
+        for e in _read_errors(latest)
+    )
+
+
+def test_dispatch_allow_foreign_refused_unattended(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    _foreign_pr_setup(monkeypatch, write_config, fresh_org_cache, fake_clones)
+    # pytest captures stdout → not a TTY → unattended. The flag must be refused.
+    monkeypatch.setattr("gitbulk.commands.dispatch._stdout_isatty", lambda: False)
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, code_root=code_root,
+                   skip_check=_LOCAL_SKIPS, allow_foreign_authors=True)
+    )
+    assert rc == EXIT_STRUCTURAL_FAILURE
+
+
+def test_dispatch_allow_foreign_interactive_keeps_pr(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    _foreign_pr_setup(monkeypatch, write_config, fresh_org_cache, fake_clones)
+    monkeypatch.setattr("gitbulk.commands.dispatch._stdout_isatty", lambda: True)
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, code_root=code_root,
+                   skip_check=_LOCAL_SKIPS, allow_foreign_authors=True)
+    )
+    latest = paths.latest_run_symlink("dispatch").resolve()
+    summary = (latest / "summary.md").read_text()
+    # The stranger's PR is now listed as a would-dispatch target...
+    assert "dhh1128/alpha` #1" in summary
+    # ...with an audit WARNING that it is foreign.
+    assert any(
+        "FOREIGN-authored PR dhh1128/alpha#1" in e["message"]
+        for e in _read_errors(latest)
+    )
+
+
+def test_stdout_isatty_returns_bool():
+    # Executes the real helper body (deterministic regardless of capture).
+    assert isinstance(_stdout_isatty(), bool)
+
+
+def test_foreign_gate_fails_closed_on_auth_error():
+    """Direct unit test of the gate: if the operator login can't be fetched,
+    it returns an error (fail closed), independent of the preflight."""
+    from gitbulk.gh import GHError
+
+    class _Gh:
+        def authenticated_user(self, **k):
+            raise GHError("auth probe failed")
+
+    kept, err = _apply_foreign_author_gate(
+        [("o/r", _make_pr(slug="o/r", number=1, author="stranger"))],
+        _Gh(),
+        rs=None,  # not reached on the error path
+        allow_foreign=False,
+    )
+    assert kept == []
+    assert err is not None and "authenticated user" in err
+
+
+def test_dispatch_operator_authored_pr_not_gated(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    prompt_file, fake_clones,
+):
+    """Sanity: a PR authored by the operator is never gated."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake_clones("dhh1128/alpha")
+    pr = _make_pr(slug="dhh1128/alpha", number=1, author="dhh1128")
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": [pr]},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
+    )
+    rc = dispatch_handler(
+        _make_args(prompt=prompt_file, code_root=code_root, skip_check=_LOCAL_SKIPS)
+    )
+    latest = paths.latest_run_symlink("dispatch").resolve()
+    assert "dhh1128/alpha` #1" in (latest / "summary.md").read_text()
 
 
 def test_key_for_pr_shape():
@@ -1445,7 +2150,7 @@ def test_dispatch_apply_attention_beats_skip(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
 
     paths_seen: list[Path] = []
@@ -1523,7 +2228,7 @@ def test_dispatch_apply_no_skip_check_clean_exit_ok(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
 
     paths_seen: list[Path] = []
@@ -1563,7 +2268,7 @@ def test_dispatch_apply_with_skipped_repo_no_failures_exit_3(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
 
     paths_seen: list[Path] = []
@@ -1659,7 +2364,7 @@ def test_dispatch_apply_no_eligible_and_skip_check_exit_4(
         "gitbulk.commands.dispatch.ProductionGHClient", lambda: fake
     )
     monkeypatch.setattr(
-        "gitbulk.commands.dispatch.ProductionClaudeClient", lambda: object()
+        "gitbulk.commands.dispatch.backend_for", lambda *a, **k: object()
     )
     _stub_worktree_create(monkeypatch, paths_seen=[])
     _stub_worktree_remove(monkeypatch, removed=[])

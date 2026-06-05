@@ -70,7 +70,7 @@ from pathlib import Path
 from typing import Iterable
 
 from gitbulk import paths, sentinel
-from gitbulk.claude import ProductionClaudeClient
+from gitbulk.agent import AgentConfigError, backend_for, resolve_agent_name
 from gitbulk.config.policy import Policy, load_policy
 from gitbulk.config.repos import RepoEntry, load_repos
 from gitbulk.default_branch_cache import prime_default_branches
@@ -87,6 +87,7 @@ from gitbulk.org_members_cache import (
     ensure_org_members_fresh,
 )
 from gitbulk.invariants import InvariantContext, get, run_chain
+from gitbulk.isolated_clone import create_isolated_clone, remove_isolated_clone
 from gitbulk.invariants.base import Invariant, InvariantKind
 from gitbulk.locks import (
     LockTimeoutError,
@@ -95,6 +96,14 @@ from gitbulk.locks import (
     sentinel_lock,
 )
 from gitbulk.pr_info import PRInfo
+from gitbulk.rebase import (
+    PushReadiness,
+    RebaseError,
+    RebaseStatus,
+    fetch_base,
+    force_push_with_lease,
+    verify_resolved_for_push,
+)
 from gitbulk.runstate import RunState
 from gitbulk.util.progress import Progress
 from gitbulk.util.style import error_line
@@ -233,6 +242,66 @@ def _validate_prompt(args: argparse.Namespace) -> tuple[Path | None, str | None]
     if prompt_path.stat().st_size == 0:
         return None, f"prompt file is empty: {prompt_path}"
     return prompt_path, None
+
+
+def _stdout_isatty() -> bool:
+    """True if stdout is an interactive terminal. Cron / pipes are not TTYs,
+    which is how we detect unattended mode (SEC-F3). Wrapped for monkeypatching
+    and to swallow odd stream objects."""
+    try:
+        return bool(sys.stdout.isatty())
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
+def _apply_foreign_author_gate(
+    eligible_prs: list[tuple[str, "PRInfo"]],
+    gh,
+    rs: RunState,
+    *,
+    allow_foreign: bool,
+) -> tuple[list[tuple[str, "PRInfo"]], str | None]:
+    """Drop PRs not authored by the operator unless explicitly allowed (SEC-F3).
+
+    Returns ``(filtered_prs, error)``. ``error`` is non-None (and the run
+    should abort structurally) when ``--allow-foreign-authors`` is passed in
+    unattended/cron mode — the flag is interactive-only. When allowed and
+    interactive, foreign PRs are kept (a WARNING is still recorded for the
+    audit trail).
+    """
+    if allow_foreign and not _stdout_isatty():
+        return (
+            [],
+            "--allow-foreign-authors is refused in unattended/cron mode "
+            "(no TTY); run it interactively to dispatch agents on PRs you "
+            "did not author.",
+        )
+    try:
+        operator_login = (gh.authenticated_user() or {}).get("login")
+    except GHError as e:
+        return ([], f"could not determine the authenticated user: {e}")
+
+    kept: list[tuple[str, PRInfo]] = []
+    for slug, pr in eligible_prs:
+        is_foreign = operator_login is None or pr.author != operator_login
+        if is_foreign and not allow_foreign:
+            rs.record_error(
+                f"skipping foreign-authored PR {slug}#{pr.number}: author "
+                f"{pr.author!r} != operator {operator_login!r}. Pass "
+                f"--allow-foreign-authors (interactively) to dispatch on it.",
+                level="WARNING",
+                context={"slug": slug, "pr": pr.number, "author": pr.author},
+            )
+            continue
+        if is_foreign:
+            rs.record_error(
+                f"dispatching on FOREIGN-authored PR {slug}#{pr.number} "
+                f"(author {pr.author!r}) under --allow-foreign-authors",
+                level="WARNING",
+                context={"slug": slug, "pr": pr.number, "author": pr.author},
+            )
+        kept.append((slug, pr))
+    return (kept, None)
 
 
 def _key_for_pr(slug: str, pr_number: int) -> str:
@@ -619,6 +688,30 @@ def _run_under_lock(
             if pr_result.passed and not intrinsic_pr_skips:
                 eligible_prs.append((repo.slug, pr))
 
+    # 7b. FOREIGN-AUTHOR GATE (SEC-F3). The dispatched agent reads and operates
+    # on the PR's content at its head SHA — which is attacker-controllable for a
+    # PR you did not author. By default, skip PRs not authored by you. The
+    # opt-in flag is interactive-only: refuse it under cron/no-TTY so a
+    # misconfigured schedule can't quietly run agents on strangers' code.
+    eligible_prs, foreign_gate_error = _apply_foreign_author_gate(
+        eligible_prs, gh, rs, allow_foreign=bool(getattr(args, "allow_foreign_authors", False))
+    )
+    if foreign_gate_error is not None:
+        return _finish(
+            rs,
+            EXIT_STRUCTURAL_FAILURE,
+            summary=foreign_gate_error,
+            policy=policy,
+            attention=False,
+            all_repos=repos,
+            passing_repos=passing_repos,
+            skipped_repos=skipped_repos,
+            eligible_prs=[],
+            results=None,
+            apply=bool(args.apply),
+            prompt_path=prompt_path,
+        )
+
     # 8. DRY-RUN GATE.
     if not args.apply:
         summary_md = _build_summary_md(
@@ -667,36 +760,103 @@ def _run_under_lock(
     prompt_text = prompt_path.read_text()
     runid = _runid_from_run_dir(rs.run_dir)
     targets: list[ExecTarget] = []
-    # Map ExecTarget.key → (slug, pr, worktree_path) so the post-pass
-    # cleanup can find the worktree without re-deriving the path.
-    target_meta: dict[str, tuple[str, PRInfo, Path]] = {}
+    # Map ExecTarget.key → (slug, pr, workspace_path, is_clone) so the post-pass
+    # cleanup can find the workspace and tear it down correctly. ``is_clone`` is
+    # True for a sandboxed agent's self-contained clone (agecln4k), False for a
+    # linked worktree.
+    target_meta: dict[str, tuple[str, PRInfo, Path, bool]] = {}
+
+    # Resolve the agent backend(s) up front: --agent → per-repo agent: →
+    # default_agent → claude (this.i agprof4k). The run default is resolved
+    # FIRST — if it requires a sandbox the host can't provide (agsbx3k), refuse
+    # the whole run cheaply before any worktree exists. Per-repo overrides are
+    # resolved inside the loop so a refusing one skips just that PR. Backends
+    # are cached by resolved name (build each distinct one once).
+    requested_agent = getattr(args, "agent", None)
+    default_name = resolve_agent_name(policy, requested_agent)
+    try:
+        default_backend = backend_for(policy, requested_agent)
+    except AgentConfigError as e:
+        return _finish(
+            rs,
+            EXIT_STRUCTURAL_FAILURE,
+            summary=f"agent unavailable: {e}",
+            policy=policy,
+            attention=False,
+            all_repos=repos,
+            passing_repos=passing_repos,
+            skipped_repos=skipped_repos,
+            eligible_prs=eligible_prs,
+            results=None,
+            apply=True,
+            prompt_path=prompt_path,
+        )
+    backend_by_name: dict = {default_name: default_backend}
+    backends: dict = {}
 
     for slug, pr in eligible_prs:
         repo = repo_by_slug[slug]
+        # Resolve this PR's backend before creating its worktree, so a per-repo
+        # agent that refuses (sandbox unavailable) skips the PR with nothing to
+        # clean up.
+        name = resolve_agent_name(policy, requested_agent, slug=slug)
+        if name not in backend_by_name:
+            try:
+                backend_by_name[name] = backend_for(
+                    policy, requested_agent, slug=slug
+                )
+            except AgentConfigError as e:
+                rs.record_error(
+                    f"agent unavailable for {slug}#{pr.number}: {e}",
+                    level="ERROR",
+                    context={"slug": slug, "pr": pr.number},
+                )
+                continue
+        # A sandboxed agent (agsbx3k) gets a self-contained CLONE instead of a
+        # linked worktree (SEC-F1 / agecln4k): a worktree's .git points into the
+        # operator clone, which the sandbox cannot bind. claude/unsandboxed
+        # agents keep the cheaper linked worktree.
+        is_clone = getattr(backend_by_name[name], "_sandbox", "none") != "none"
         try:
-            # repo_lock(slug): worktree creation mutates the clone's
-            # .git/worktrees admin — serialize it against another gitbulk run
-            # on the SAME repo (node rsclk7nq #6). NOT held across the agent
-            # pool below (that would serialize the whole long-running run).
+            # repo_lock(slug): workspace creation reads/mutates the clone's
+            # .git admin — serialize it against another gitbulk run on the SAME
+            # repo (node rsclk7nq #6). NOT held across the agent pool below.
             with repo_lock(
                 slug, "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
                 subcommand="dispatch",
             ):
-                worktree_path = create_worktree(
-                    repo.local_path,
-                    slug,
-                    pr.number,
-                    pr.head_ref,
-                    pr.head_sha,
-                    worktree_root=policy.worktree_root,
-                    runid=runid,
-                )
+                if is_clone:
+                    workspace_path = create_isolated_clone(
+                        repo.local_path, slug, pr.number, pr.head_ref,
+                        pr.head_sha, worktree_root=policy.worktree_root,
+                        runid=runid,
+                    )
+                else:
+                    workspace_path = create_worktree(
+                        repo.local_path, slug, pr.number, pr.head_ref,
+                        pr.head_sha, worktree_root=policy.worktree_root,
+                        runid=runid,
+                    )
+                # Least privilege (this.i agpriv8n): gitbulk performs the
+                # networked base fetch itself, BEFORE the agent runs, so the
+                # agent can rebase against origin/<base> with no network and no
+                # credentials of its own. On fetch failure the workspace is
+                # removed and the PR skipped (the agent could not rebase
+                # offline anyway).
+                fetched = fetch_base(workspace_path, pr.base_ref)
+                if fetched.status is not RebaseStatus.CLEAN:
+                    if is_clone:
+                        remove_isolated_clone(
+                            workspace_path, worktree_root=policy.worktree_root
+                        )
+                    else:
+                        remove_worktree(repo.local_path, workspace_path)
         except WorktreeError as e:
-            # Worktree creation failed; record and skip this PR.
+            # Workspace creation/teardown failed; record and skip this PR.
             # We DO NOT abort the whole run — the user's other 149
             # repos still deserve a shot.
             rs.record_error(
-                f"worktree creation failed for {slug}#{pr.number}: {e}",
+                f"workspace creation failed for {slug}#{pr.number}: {e}",
                 level="ERROR",
                 context={
                     "slug": slug,
@@ -706,20 +866,47 @@ def _run_under_lock(
             )
             continue
 
+        if fetched.status is not RebaseStatus.CLEAN:
+            rs.record_error(
+                f"base prefetch failed for {slug}#{pr.number}: {fetched.detail}",
+                level="ERROR",
+                context={"slug": slug, "pr": pr.number},
+            )
+            continue
+
         key = _key_for_pr(slug, pr.number)
         targets.append(
             ExecTarget(
                 key=key,
-                working_directory=worktree_path,
+                working_directory=workspace_path,
                 prompt=prompt_text,
                 input_text=None,
             )
         )
-        target_meta[key] = (slug, pr, worktree_path)
+        target_meta[key] = (slug, pr, workspace_path, is_clone)
+        # Only non-default backends need a per-target entry; absent keys fall
+        # back to ``default_backend`` in the kernel.
+        if name != default_name:
+            backends[key] = backend_by_name[name]
+
+    # SEC-F4: a profile that requested a sandbox but ran UNSANDBOXED under
+    # `sandbox_fallback: warn-run` must leave a durable signal, not just a
+    # logging.warning that cron swallows. Record a WARNING per downgraded agent
+    # and force ATTENTION so the operator actually sees it.
+    sandbox_downgraded = False
+    for agent_name, backend in backend_by_name.items():
+        if getattr(backend, "sandbox_downgraded", False):
+            sandbox_downgraded = True
+            rs.record_error(
+                f"agent {agent_name!r} ran UNSANDBOXED: requested sandbox "
+                f"{getattr(backend, 'requested_sandbox', '?')!r} but bubblewrap "
+                f"is unavailable (sandbox_fallback=warn-run)",
+                level="WARNING",
+                context={"agent": agent_name},
+            )
 
     # 10. Run the bounded pool.
     log_dir = rs.run_dir / "dispatch-logs"
-    claude = ProductionClaudeClient()
     concurrency = int(getattr(args, "concurrency", _DEFAULT_CONCURRENCY))
     timeout_per_target = float(
         getattr(args, "timeout", _DEFAULT_PER_TARGET_TIMEOUT)
@@ -727,25 +914,71 @@ def _run_under_lock(
 
     results = execute_targets(
         targets,
-        claude=claude,
+        claude=default_backend,
         log_dir=log_dir,
         concurrency=concurrency,
         timeout_per_target=timeout_per_target,
+        model=getattr(args, "model", None),
+        backends=backends or None,
     )
 
     # 11. Worktree cleanup vs preservation per node vp7n2krq.
     per_pr_states: dict[str, list[dict]] = {}
     # key -> normalized "VERDICT: detail" line, for the summary (Gap 1).
     outcomes: dict[str, str] = {}
+    # Keys whose RESOLVED verdict could not be safely pushed (blocked /
+    # push-failed) → these warrant ATTENTION just like a failed process.
+    push_problem_keys: list[str] = []
     escalations_dir = rs.run_dir / "escalations"
     for r in results:
-        slug, pr, worktree_path = target_meta[r.key]
+        slug, pr, worktree_path, is_clone = target_meta[r.key]
         repo = repo_by_slug[slug]
         # Gap 1: the agent's RESOLVED:/ESCALATED: verdict lives only in its
         # stdout log; lift it so summary.md/state.yaml tell the true story.
         verdict, outcome_line = _parse_agent_outcome(r.stdout_path)
         if outcome_line is not None:
             outcomes[r.key] = outcome_line
+
+        # Least privilege (this.i agpriv8n): gitbulk — never the agent —
+        # performs the push, and only on a RESOLVED verdict AND only after
+        # independently re-checking the worktree is genuinely safe (the verdict
+        # is advisory; a spoofed RESOLVED that left conflict markers or a
+        # half-finished rebase is caught here and pushed NOTHING — threat-model
+        # §5). The lease is against the head SHA gitbulk first observed, so a
+        # concurrent push aborts rather than clobbers.
+        push_status: str | None = None
+        push_detail: str | None = None
+        if verdict == "RESOLVED":
+            readiness, detail = verify_resolved_for_push(
+                worktree_path, pr.head_sha
+            )
+            if readiness is PushReadiness.READY:
+                try:
+                    force_push_with_lease(
+                        worktree_path, pr.head_ref, pr.head_sha
+                    )
+                    push_status, push_detail = "pushed", detail
+                except RebaseError as e:
+                    push_status = "push-failed"
+                    push_detail = e.stderr or str(e)
+                    push_problem_keys.append(r.key)
+                    rs.record_error(
+                        f"push failed for {slug}#{pr.number}: {push_detail}",
+                        level="ERROR",
+                        context={"slug": slug, "pr": pr.number},
+                    )
+            elif readiness is PushReadiness.NO_CHANGE:
+                push_status, push_detail = "no-change", detail
+            else:  # BLOCKED — RESOLVED claimed but worktree says otherwise
+                push_status, push_detail = "blocked", detail
+                push_problem_keys.append(r.key)
+                rs.record_error(
+                    f"agent reported RESOLVED but worktree is not pushable "
+                    f"for {slug}#{pr.number}: {detail}",
+                    level="WARNING",
+                    context={"slug": slug, "pr": pr.number},
+                )
+
         # Gap 2: salvage any ESCALATION.md into the run dir BEFORE teardown
         # (a clean escalation aborts the rebase, so the worktree is not
         # in-conflict and would otherwise be removed with the note inside).
@@ -763,12 +996,17 @@ def _run_under_lock(
                     slug, "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
                     subcommand="dispatch",
                 ):
-                    remove_worktree(repo.local_path, worktree_path)
+                    if is_clone:
+                        remove_isolated_clone(
+                            worktree_path, worktree_root=policy.worktree_root
+                        )
+                    else:
+                        remove_worktree(repo.local_path, worktree_path)
             except WorktreeError as e:
                 # Best-effort: record and leave on disk for the operator.
                 preserved = True
                 rs.record_error(
-                    f"worktree teardown failed for {slug}#{pr.number}: {e}",
+                    f"workspace teardown failed for {slug}#{pr.number}: {e}",
                     level="WARNING",
                     context={
                         "slug": slug,
@@ -787,6 +1025,8 @@ def _run_under_lock(
                 "exit_code": r.exit_code,
                 "outcome": verdict,
                 "outcome_detail": outcome_line,
+                "push_status": push_status,
+                "push_detail": push_detail,
                 "escalation_file": escalation_file,
                 "duration_seconds": r.duration_seconds,
                 "worktree_path": str(worktree_path),
@@ -800,9 +1040,12 @@ def _run_under_lock(
     for slug, states in per_pr_states.items():
         rs.record_repo_state(slug, {"pr_count": len(states), "prs": states})
 
-    # 12. Compute exit code.
+    # 12. Compute exit code. A RESOLVED verdict that could not be safely
+    # pushed (blocked / push-failed) is an attention condition too — gitbulk
+    # owns the push, so a push it refused or that failed is something the
+    # operator must see (this.i agpriv8n).
     attention_results = _attention_results(results)
-    if attention_results:
+    if attention_results or push_problem_keys or sandbox_downgraded:
         exit_code = EXIT_ATTENTION_NEEDED
     elif skipped_repos:
         exit_code = EXIT_INVARIANT_SKIPPED
@@ -826,10 +1069,17 @@ def _run_under_lock(
 
     n_resolved = sum(1 for v in outcomes.values() if v.startswith("RESOLVED"))
     n_escalated = sum(1 for v in outcomes.values() if v.startswith("ESCALATED"))
+    n_pushed = sum(
+        1
+        for states in per_pr_states.values()
+        for s in states
+        if s.get("push_status") == "pushed"
+    )
     summary_text = (
         f"dispatched {len(results)} PRs; "
         f"{n_resolved} resolved, {n_escalated} escalated; "
-        f"{len(attention_results)} need attention; "
+        f"{n_pushed} pushed; "
+        f"{len(attention_results) + len(push_problem_keys)} need attention; "
         f"{len(skipped_repos)} repos skipped"
     )
     return _finish(

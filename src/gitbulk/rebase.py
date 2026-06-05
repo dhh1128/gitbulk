@@ -28,13 +28,27 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from gitbulk.worktree import is_worktree_in_conflict
+from gitbulk.worktree import is_worktree_in_conflict, worktree_in_progress_op
 
 
 class RebaseStatus(Enum):
     CLEAN = "clean"
     CONFLICT = "conflict"
     ERROR = "error"
+
+
+class PushReadiness(Enum):
+    """Whether a dispatch agent left a worktree safe for gitbulk to push.
+
+    gitbulk — not the agent — performs every networked git op (this.i
+    ``agpriv8n``). After the agent resolves a conflict locally and reports
+    ``RESOLVED``, gitbulk independently re-checks the worktree before pushing;
+    the agent's word is never trusted on its own (threat-model T1 / §5).
+    """
+
+    READY = "ready"  # clean, HEAD advanced → safe to force-push-with-lease
+    NO_CHANGE = "no-change"  # clean but HEAD unchanged → nothing to push (benign)
+    BLOCKED = "blocked"  # conflict markers / rebase still in progress → do NOT push
 
 
 @dataclass(frozen=True)
@@ -124,6 +138,58 @@ def rebase_onto_base(worktree_path: Path, base_ref: str) -> RebaseResult:
     )
 
 
+def fetch_base(worktree_path: Path, base_ref: str) -> RebaseResult:
+    """Fetch ``origin/<base_ref>`` into the worktree (the networked step).
+
+    Called by gitbulk *before* launching a dispatch agent so the agent can
+    rebase against the already-fetched ``origin/<base_ref>`` with **no network
+    and no credentials of its own** (this.i ``agpriv8n``; what makes the
+    ``fs+no-net`` sandbox viable, ``agsbx3k``). Returns CLEAN on success or
+    ERROR with the git stderr; never raises (the caller decides whether a
+    fetch failure skips the target).
+    """
+    fetched = _git(worktree_path, "fetch", "origin", base_ref)
+    if fetched.returncode != 0:
+        return RebaseResult(
+            RebaseStatus.ERROR,
+            f"fetch origin {base_ref} failed: {fetched.stderr.strip()}",
+        )
+    return RebaseResult(RebaseStatus.CLEAN, f"fetched origin/{base_ref}")
+
+
+def verify_resolved_for_push(
+    worktree_path: Path, original_head_sha: str
+) -> tuple[PushReadiness, str]:
+    """Independently verify a worktree is safe to push after an agent ran.
+
+    gitbulk does NOT trust the agent's ``RESOLVED`` verdict as proof that work
+    happened (threat-model §5). Before pushing it confirms, from git state
+    alone:
+
+      - no unresolved conflict markers (``is_worktree_in_conflict``),
+      - no rebase/merge/cherry-pick still in progress
+        (``worktree_in_progress_op``),
+      - HEAD actually advanced past the SHA gitbulk observed when it created
+        the worktree (otherwise there is nothing to push).
+
+    Returns ``(PushReadiness, human-readable detail)``. ``BLOCKED`` means a
+    spoofed/garbled ``RESOLVED`` (or a half-finished rebase) — gitbulk pushes
+    nothing and the target is surfaced for attention.
+    """
+    if is_worktree_in_conflict(worktree_path):
+        return (PushReadiness.BLOCKED, "unresolved conflict markers present")
+    op = worktree_in_progress_op(worktree_path)
+    if op is not None:
+        return (PushReadiness.BLOCKED, f"{op} still in progress")
+    head = _git(worktree_path, "rev-parse", "HEAD")
+    if head.returncode != 0:
+        return (PushReadiness.BLOCKED, f"cannot read HEAD: {head.stderr.strip()}")
+    current = head.stdout.strip()
+    if current == original_head_sha:
+        return (PushReadiness.NO_CHANGE, "HEAD unchanged; nothing to push")
+    return (PushReadiness.READY, f"HEAD advanced to {current[:7]}")
+
+
 def force_push_with_lease(
     worktree_path: Path,
     head_ref: str,
@@ -157,9 +223,12 @@ def force_push_with_lease(
 
 
 __all__ = [
+    "PushReadiness",
     "RebaseError",
     "RebaseResult",
     "RebaseStatus",
+    "fetch_base",
     "force_push_with_lease",
     "rebase_onto_base",
+    "verify_resolved_for_push",
 ]

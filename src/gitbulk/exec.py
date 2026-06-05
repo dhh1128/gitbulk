@@ -252,6 +252,21 @@ def _log_paths(log_dir: Path, key: str) -> tuple[Path, Path, Path]:
     )
 
 
+def _redact_argv(argv: list[str], prompt: str) -> list[str]:
+    """Return ``argv`` with the (possibly large/sensitive) prompt replaced by a
+    length placeholder, for the audit record (SEC-F5).
+
+    Redacts the prompt as a SUBSTRING of each token, not just whole-token
+    matches: a custom template may embed ``{prompt}`` inside a larger token
+    (e.g. ``--prompt={prompt}``), and the full prompt must not survive there
+    either. An empty prompt is a no-op (``str.replace("")`` would otherwise
+    splice the placeholder between every character)."""
+    if not prompt:
+        return list(argv)
+    placeholder = f"<prompt:{len(prompt)} chars>"
+    return [a.replace(prompt, placeholder) for a in argv]
+
+
 def _write_meta(
     meta_path: Path,
     *,
@@ -262,6 +277,8 @@ def _write_meta(
     finished_at: datetime,
     duration_seconds: float,
     timed_out: bool,
+    agent_argv: list[str] | None = None,
+    agent_env_keys: list[str] | None = None,
 ) -> None:
     payload = {
         "key": key,
@@ -271,6 +288,13 @@ def _write_meta(
         "finished_at": finished_at.isoformat(),
         "duration_seconds": round(duration_seconds, 6),
         "timed_out": timed_out,
+        # SEC-F5: persist the EFFECTIVE agent invocation (prompt elided) so the
+        # granted authority — which binary, sandbox wrapper, and which env vars
+        # — is auditable after the fact. ``agent_env_keys`` is the sorted list
+        # of env-var NAMES (never values); ``null`` means the full parent
+        # environment was inherited.
+        "agent_argv": agent_argv,
+        "agent_env_keys": agent_env_keys,
     }
     meta_path.write_text(yaml.safe_dump(payload, sort_keys=False))
 
@@ -333,21 +357,54 @@ def _run_one(
     if on_progress is not None:
         on_progress(target.key, "running")
 
-    argv = _claude_argv(claude, target.prompt, model)
+    # Source the argv (and stdin/env) from the backend's launch plan when it
+    # exposes one (both built-in clients do). A minimal backend with only
+    # ``run_prompt`` falls back to the legacy claude-shaped argv builder so a
+    # user-supplied implementation still works (see this.i ``agbknd7q`` /
+    # ``execk7nm``). The plan also carries the exact stdin bytes (so
+    # ``prompt_via: stdin`` agents work) and the scoped ``env`` (agenv6q).
+    plan = getattr(claude, "plan", None)
+    if callable(plan):
+        inv = plan(
+            target.prompt,
+            input_text=target.input_text,
+            model=model,
+            working_directory=target.working_directory,
+            timeout=timeout_per_target,
+        )
+        argv = inv.argv
+        stdin_payload = inv.stdin_data
+        use_stdin = inv.use_stdin
+        env = inv.env
+    else:
+        argv = _claude_argv(claude, target.prompt, model)
+        stdin_payload = target.input_text
+        use_stdin = target.input_text is not None
+        env = None
+    # SEC-F5 audit record: the effective argv (prompt elided) + env-var names.
+    audit_argv = _redact_argv(argv, target.prompt)
+    audit_env_keys = sorted(env.keys()) if env is not None else None
+
     # Children write directly to the log files; we never buffer
     # gigabytes of triage output in memory.
     stdout_fh = stdout_path.open("w")
     stderr_fh = stderr_path.open("w")
+
+    # Pass ``env`` only when scoped (not None) so the legacy/inherit path and
+    # the existing test popen-factories — whose signatures omit ``env`` — are
+    # unaffected; a scoped env is opt-in per profile (agenv6q).
+    extra_kw: dict[str, Any] = {} if env is None else {"env": env}
 
     proc: _PopenLike | None = None
     try:
         proc = popen_factory(
             argv,
             cwd=str(target.working_directory),
-            stdin=subprocess.PIPE if target.input_text is not None else None,
+            stdin=subprocess.PIPE if use_stdin else None,
             stdout=stdout_fh,
             stderr=stderr_fh,
             text=True,
+            **extra_kw,
         )
     except Exception as exc:
         # popen_factory raised — record as failed without ever
@@ -367,6 +424,8 @@ def _run_one(
             finished_at=finished_at,
             duration_seconds=duration,
             timed_out=False,
+            agent_argv=audit_argv,
+            agent_env_keys=audit_env_keys,
         )
         if on_progress is not None:
             on_progress(target.key, "failed")
@@ -386,11 +445,11 @@ def _run_one(
 
     timed_out = False
     try:
-        if target.input_text is not None:
+        if use_stdin:
             # Feed stdin without blocking on a deadlocked child: use a
             # background thread to write, then poll for completion.
             stdin_thread = threading.Thread(
-                target=_feed_stdin, args=(proc, target.input_text), daemon=True
+                target=_feed_stdin, args=(proc, stdin_payload or ""), daemon=True
             )
             stdin_thread.start()
 
@@ -450,6 +509,8 @@ def _run_one(
         finished_at=finished_at,
         duration_seconds=duration,
         timed_out=timed_out,
+        agent_argv=audit_argv,
+        agent_env_keys=audit_env_keys,
     )
     if on_progress is not None:
         on_progress(target.key, status)
@@ -489,6 +550,7 @@ def execute_targets(
     concurrency: int = 2,
     timeout_per_target: float = 600.0,
     model: str | None = None,
+    backends: dict[str, ClaudeClient] | None = None,
     on_progress: Callable[[str, str], None] | None = None,
     _popen_factory: PopenFactory | None = None,
 ) -> list[ExecResult]:
@@ -513,6 +575,10 @@ def execute_targets(
             SIGTERM → wait → SIGKILL escalation.
         model: claude model override; ``None`` uses the client's
             default.
+        backends: optional per-target backend map keyed by ``ExecTarget.key``.
+            When a target's key is present, that backend is used instead of
+            ``claude`` — this is how dispatch honors a per-repo ``agent:``
+            override (this.i ``agprof4k``). Absent keys fall back to ``claude``.
         on_progress: optional ``(key, status)`` callback. Statuses
             observed: ``running`` (when work starts) and one of
             ``completed`` / ``failed`` / ``timed-out`` / ``interrupted``
@@ -544,7 +610,11 @@ def execute_targets(
                 pool.submit(
                     _run_one,
                     target,
-                    claude=claude,
+                    claude=(
+                        backends.get(target.key, claude)
+                        if backends
+                        else claude
+                    ),
                     log_dir=log_dir,
                     timeout_per_target=timeout_per_target,
                     model=model,

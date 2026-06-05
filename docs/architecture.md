@@ -66,9 +66,18 @@ gitbulk sits between the user's cron table and the GitHub REST/GraphQL API
 - **External boundaries:**
   - `gh` (constraint `hp4nck2v`) — exclusive channel for GitHub network,
     fronted by the `GHClient` Protocol (node `ghclmp7n`).
-  - `claude` CLI (`smprmpt4n`, `execk7nm`) — text-producing boundary used
-    by `summarize` (one-shot) and `dispatch` (parallel kernel), fronted by
-    the `ClaudeClient` Protocol.
+  - **Coding-agent CLI** (`smprmpt4n`, `execk7nm`, `agbknd7q`) — text-producing
+    boundary used by `summarize` (one-shot) and `dispatch` (parallel kernel),
+    fronted by the `AgentBackend` Protocol (generalized from `ClaudeClient`). A
+    single `plan()` yields one `AgentInvocation` (argv + stdin + env + timeout)
+    that both call paths agree on. `gitbulk.agent` adds config-driven backends —
+    built-in presets (claude/gemini/copilot/cursor) plus a custom argv-template
+    — selected by `default_agent` / per-repo `agent:` / `--agent`
+    (`agprof4k`). For `dispatch`, **gitbulk owns every networked git op**: it
+    pre-fetches the base and force-pushes itself after verifying the agent's
+    result (`agpriv8n`); the agent can therefore run env-scoped (`agenv6q`) and
+    inside an unprivileged bubblewrap sandbox (`agsbx3k`). See
+    [`pluggable-agents.md`](pluggable-agents.md).
   - `git worktree` (subprocess) — used only by `dispatch` to create
     disposable per-PR checkouts. The main clone is never `git checkout`-ed.
 

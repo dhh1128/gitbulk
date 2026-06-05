@@ -43,7 +43,8 @@ import sys
 from pathlib import Path
 
 from gitbulk import paths, sentinel
-from gitbulk.claude import ClaudeError, ProductionClaudeClient
+from gitbulk.agent import backend_for
+from gitbulk.claude import ClaudeError
 from gitbulk.config.policy import Policy, load_policy
 from gitbulk.locks import LockTimeoutError, run_state_lock, sentinel_lock
 from gitbulk.runstate import RunState
@@ -232,7 +233,10 @@ def _run(
     prompt_text = prompt_path.read_text()
     # state_text was read under run_state_lock("report") in the handler.
 
-    claude = ProductionClaudeClient()
+    # Resolve the agent backend: --agent → default_agent → claude (this.i
+    # agprof4k). The no-config path returns a ProductionClaudeClient, so
+    # behavior is unchanged for existing users.
+    claude = backend_for(policy, getattr(args, "agent", None))
     try:
         output = claude.run_prompt(
             prompt_text,

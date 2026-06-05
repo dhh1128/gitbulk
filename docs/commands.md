@@ -33,8 +33,10 @@ when a PR needs a look.
 
 ### `summarize`
 
-Feeds a recent `report` run through Claude with a triage prompt to prioritize
-what needs your attention first, writing a prioritized `summary.md`.
+Feeds a recent `report` run through a coding agent (Claude by default) with a
+triage prompt to prioritize what needs your attention first, writing a
+prioritized `summary.md`. `--model NAME` overrides the model; `--agent NAME`
+selects a different agent (see [pluggable agents](configuration.md#agents--default_agent--which-coding-agent-to-drive)).
 
 ### `show`
 
@@ -71,10 +73,22 @@ All default to dry-run; add `--apply` to act.
 
 ### `dispatch`
 
-Spawns headless Claude Code agents inside disposable worktrees against PRs
-matching a filter, to fix common problems. Per-PR worktrees live under
-`~/.cache/gitbulk/worktrees/<runid>/` and are cleaned up automatically. You
-supply the instructions with `--prompt <file>`.
+Spawns headless coding agents (Claude Code by default) inside disposable
+worktrees against PRs matching a filter, to fix common problems. Per-PR
+worktrees live under `~/.cache/gitbulk/worktrees/<runid>/` and are cleaned up
+automatically. You supply the instructions with `--prompt <file>`.
+
+`--agent NAME` selects which coding agent to drive (a preset — `claude`,
+`gemini`, `copilot`, `cursor` — or a profile from `gitbulk.yaml`), `--model
+NAME` overrides its model. See [pluggable agents](configuration.md#agents--default_agent--which-coding-agent-to-drive).
+For conflict-resolution work **gitbulk owns the network**: it fetches the base
+and performs the `force-push-with-lease` itself after verifying the agent's
+result, so the agent never pushes — which also lets it run sandboxed with no
+network or credentials.
+
+By default `dispatch` only acts on PRs **you authored** (a stranger's PR is
+attacker-controllable input to an auto-approve agent); `--allow-foreign-authors`
+opts in and is refused in unattended/cron mode.
 
 ### `merge`
 

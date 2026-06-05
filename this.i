@@ -2515,6 +2515,316 @@ Gitbulk Triage Tool = goal:
       approved-by: daniel, 2026-05-28
       # was: tension mp7kn4qz (Dispatch Execution Kernel, deferred at Phase 0)
 
+    Pluggable Coding-Agent Seam = decision:
+      id: agbknd7q
+      why: >
+        Formalize the boundary between gitbulk and the coding agent it
+        dispatches so backends other than Claude Code (Gemini CLI, GitHub
+        Copilot CLI, Cursor agent, or a fully custom tool) can be driven
+        through one small, config-driven interface — without weakening, and
+        ideally strengthening, the safety posture. Full design + the locked
+        forks live in docs/pluggable-agents.md.
+
+        Before this change the invocation was hardcoded in TWO places that
+        had drifted into near-duplicates: ``ProductionClaudeClient.run_prompt``
+        (used by summarize) and ``exec._claude_argv`` (used by dispatch's
+        parallel kernel), both emitting ``claude -p <prompt> --model <m>
+        --dangerously-skip-permissions``. Phase 1 unifies them: a single
+        ``AgentInvocation`` value (argv + use_stdin + env + timeout) is
+        produced by one ``plan()`` method on the backend; ``run_prompt`` is
+        reimplemented on top of ``plan()``, and the kernel sources its argv
+        from ``claude.plan(...)`` instead of building its own. The
+        ``ClaudeClient`` Protocol is retained; ``AgentBackend`` is the
+        generalized superset (adds ``plan``), with ``FakeAgentBackend`` /
+        ``ProductionAgentBackend`` aliases. A minimal backend exposing only
+        ``run_prompt`` still works via the legacy argv fallback in the kernel,
+        so user-supplied implementations are not forced to add ``plan``.
+
+        Deliberately behavior-preserving at Phase 1: argv shape, stdin,
+        timeout, and env (inherited; ``env=None``) are byte-identical to the
+        prior code, proven by the unchanged 1556-test baseline plus new
+        ``plan()`` tests. Config-driven profiles/presets (agprof4k), the
+        least-privilege push rework (agpriv8n), env scoping (agenv6q), and
+        the bwrap sandbox (agsbx3k) build on this seam in later phases. This
+        is also the substantive start on threat-model T1 (the dispatch agent
+        running with full ambient authority); see agatk5n for the adversarial
+        test discipline.
+
+        Subprocess-vs-plan judgment unchanged from execk7nm: the kernel still
+        owns its ``subprocess.Popen`` (needed for SIGTERM→SIGKILL and CTRL+C
+        drain); ``plan()`` only supplies the argv/env, it does not run.
+      approved-by: daniel, 2026-06-04
+
+    Agent Profiles: Presets Plus Custom Template = decision:
+      id: agprof4k
+      why: >
+        How a backend (agbknd7q) is selected and configured. A new optional
+        ``agents:`` mapping plus ``default_agent:`` in gitbulk.yaml, and a
+        per-repo ``agent:`` override reusing the existing repos.<slug> override
+        machinery. Built-in PRESETS (claude, gemini, copilot, cursor) cover the
+        common case in one line (``default_agent: gemini``); a custom
+        ``command`` template covers anything else. A user ``agents.<name>``
+        block deep-merges over the preset of the same name.
+
+        Resolution order (resolve_agent_name): ``--agent`` → per-repo ``agent:``
+        → ``default_agent`` → the ``claude`` preset. The ``claude`` default is
+        served by the native ProductionClaudeClient (not the generic
+        CommandAgentBackend) so the no-config path is byte-identical to
+        pre-feature behavior — the whole feature is opt-in and backward
+        compatible (proven: 1556→1628 tests, the original 1556 unchanged).
+
+        Per-repo override in dispatch: the parallel kernel takes a single
+        ``claude`` backend plus an optional per-target ``backends`` map keyed by
+        ExecTarget.key. dispatch builds that map from per-repo overrides,
+        caching each distinct backend by resolved name (build-once). summarize
+        is single-backend (run-level). Chosen over threading a backend through
+        every ExecTarget: the map is a smaller, well-bounded kernel addition and
+        leaves ExecTarget unchanged.
+
+    Agent Command Templates Are Argv-Lists, Never Shell = constraint:
+      id: agtmpl9k
+      why: >
+        The security spine of the pluggable layer (threat-model T6 / §3.4-4
+        warned that letting config choose the binary is a red flag; we accept
+        that surface deliberately and these are the compensating controls):
+
+        (1) ``command`` / ``model_args`` are argv LISTS. A scalar YAML string is
+            a hard config error — a string would imply a shell, which gitbulk
+            never uses. So attacker-influenceable prompt/worktree text only ever
+            lands as a single argv element and cannot break out: there is no
+            shell to break out of.
+        (2) ``{prompt}`` / ``{model}`` substitute WITHIN one token (whole token
+            or substring), so the substitution can never split into extra args.
+            Validated: exactly one ``{prompt}`` token for prompt_via=arg, zero
+            for stdin.
+        (3) ``command[0]`` is pinned via shutil.which at construction (the
+            gh/claude F2 fix, generalized), so a later PATH prepend cannot
+            substitute the binary. Absolute path trusted as-is; a relative
+            path that does not resolve is a config error; a bare name that
+            which() cannot find falls back to itself (a missing binary then
+            surfaces as a per-target launch failure, not a whole-run abort, and
+            an absent binary cannot be PATH-hijacked).
+
+        These are enforced by the test_agent_security.py adversarial suite
+        (agatk5n): shell-metachar prompts stay one token, scalar command/env
+        refused, which-pinning, relative-path rejection.
+
+    Agent Environment Is An Allowlist = decision:
+      id: agenv6q
+      why: >
+        A subprocess inherits the WHOLE environment, so a backend would
+        otherwise get GH_TOKEN, the SSH agent socket, AWS/cloud creds, and every
+        API token (threat-model T1). Each profile gets an optional ``env``
+        allowlist: only the named vars plus a minimal safe base (PATH, HOME,
+        locale, TERM, TMPDIR — deliberately NO credential-bearing vars) reach
+        the child. ``env: null`` (the default) inherits the full environment for
+        backward compatibility; presets/custom profiles opt into a scoped set.
+        The launch plan (agbknd7q) carries the exact ``env`` dict; the kernel
+        passes it to Popen only when scoped (so the inherit path and the
+        existing test popen-factories are unaffected). With the least-privilege
+        push rework (agpriv8n) the resolve-conflicts agent needs no credentials
+        at all, so its env can be scrubbed to the bare toolchain.
+      approved-by: daniel, 2026-06-04
+
+    Least Privilege: gitbulk Owns Every Networked Git Op = decision:
+      id: agpriv8n
+      why: >
+        The pivotal security change of the pluggable-agent work and the
+        substantive fix for threat-model T1 (P0): the dispatched agent must
+        never perform a networked, credentialed, or irreversible git operation.
+        Before this, prompts/resolve-conflicts.md had the AGENT run
+        ``git fetch`` and ``git push --force-with-lease`` — so a prompt-injected
+        or buggy/less-trusted backend could push arbitrary refs to any of the
+        ~150 fleet repos.
+
+        New division of labor for PR-centric dispatch (execk7nm):
+          1. gitbulk creates the worktree (unchanged) and then PRE-FETCHES the
+             PR's base into it (rebase.fetch_base) — the networked step, run
+             with gitbulk's own creds, BEFORE the agent launches. A fetch
+             failure removes the worktree and skips the PR (the agent could not
+             rebase offline anyway).
+          2. the AGENT rebases onto the already-fetched ``origin/<base>``,
+             resolves conflicts, runs ``git rebase --continue`` — purely LOCAL,
+             needing no network and no credentials (which is exactly what makes
+             the fs+no-net sandbox viable, agsbx3k). It NEVER fetches or pushes;
+             the rewritten prompt says so explicitly.
+          3. gitbulk INDEPENDENTLY VERIFIES the worktree
+             (rebase.verify_resolved_for_push): no conflict markers, no rebase
+             in progress, HEAD advanced past the SHA gitbulk first observed.
+             Only on READY + a RESOLVED verdict does gitbulk itself call
+             force_push_with_lease (lease against the observed SHA). The
+             verdict is ADVISORY — a spoofed ``RESOLVED`` that left markers or a
+             half-finished rebase yields BLOCKED → gitbulk pushes NOTHING and
+             the PR is surfaced for attention (exit 2). NO_CHANGE (HEAD
+             unmoved) is benign.
+
+        This establishes the cross-backend invariant: **the agent never touches
+        a remote; gitbulk performs every networked mutation.** codeowners.md /
+        migrate-*.md already followed "commit locally, gitbulk pushes"; this
+        makes it uniform. Blast radius of a hostile/confused agent collapses to
+        "garbage in a throwaway worktree," caught by verification before any
+        push. Reuses the existing, tested rebase.py machinery
+        (force_push_with_lease, the ``_git`` seam) rather than inventing new
+        push code. Enforced by tests/test_rebase.py (fetch/verify gate) and
+        tests/test_dispatch.py (READY→push, BLOCKED→no-push+attention,
+        push-failed→attention, NO_CHANGE→benign, ESCALATED→never verified,
+        prefetch-failure→skip). Builds toward agsbx3k (sandbox) and agtok2n
+        (scoped tokens).
+      approved-by: daniel, 2026-06-04
+
+    Per-Profile Bubblewrap Sandbox = decision:
+      id: agsbx3k
+      why: >
+        Defense-in-depth on top of least-privilege (agpriv8n) and env scoping
+        (agenv6q) — NOT the primary control. A non-claude backend can be run in
+        an unprivileged ``bwrap`` user namespace (gitbulk.sandbox) so a hostile
+        or prompt-injected agent cannot read the operator's credentials or other
+        clones, and (fs+no-net) cannot reach the network at all.
+
+        Profile ``sandbox:`` ∈ {none, fs-only, fs+no-net}. ``wrap_argv`` binds
+        only a read-only system toolchain (the system dirs that exist) plus the
+        worktree (rw, cwd), shadows ``$HOME`` with a tmpfs, unshares
+        user/pid/ipc/uts/cgroup, and for ``fs+no-net`` also ``--unshare-net``.
+        Credential locations (~/.ssh, ~/.aws, ~/.config/gh) and the other ~149
+        clones are simply never mounted. ``--die-with-parent`` preserves the
+        execk7nm SIGTERM→SIGKILL timeout semantics.
+
+        ``fs+no-net`` is viable for resolve-conflicts precisely BECAUSE agpriv8n
+        removed the agent's need for network/credentials — the two controls
+        compose. claude (the trusted native path, ProductionClaudeClient) is
+        intentionally not put through the generic sandbox; sandboxing targets
+        the less-trusted pluggable backends.
+
+        Availability is capability-probed (``bwrap_available``: bwrap installed
+        AND unprivileged userns actually works, since many hosts have bwrap but
+        disable userns). REFUSE-IF-UNAVAILABLE is the default
+        (``sandbox_fallback: refuse``): if a profile requests a sandbox the host
+        can't provide, gitbulk refuses to run rather than silently downgrade to
+        unsandboxed (a silent downgrade defeats the purpose). ``warn-run`` opts
+        into running unsandboxed with a loud warning. Refusal is raised at
+        backend construction: dispatch resolves the run default before creating
+        any worktree (refuse → structural abort, cheap) and per-repo overrides
+        inside the loop (refuse → skip just that PR). Linux-only; containers /
+        firejail were rejected (heavier / setuid attack surface) for a one-box
+        cron tool. Enforced by tests/test_sandbox.py + the adversarial
+        fs+no-net / refuse tests (agatk5n).
+
+    Scoped-Token Injection Seam = decision:
+      id: agtok2n
+      why: >
+        Even with agpriv8n, some future tasks (e.g. a codeowners-style agent
+        that must read remote state) need a token. Rather than hand the agent
+        the full ambient ``gh`` auth, the design leaves a seam to inject a
+        short-lived, single-repo credential: ``CommandAgentBackend(extra_env=)``
+        and ``backend_for(token_env=)`` merge caller-supplied env vars into the
+        child on top of the ``env`` allowlist (agenv6q). Blast radius on leak =
+        one repo, expires fast. Phase 4 lands the plumbing + tests; the actual
+        minting (fine-grained PAT / GitHub App installation token) is follow-on
+        — the seam exists so it can be added without reworking the backend.
+      approved-by: daniel, 2026-06-04
+
+    Security Review Remediation 2026-06-04 = decision:
+      id: agsecr5n
+      why: >
+        An adversarial security-hawk review (review-panel, security persona,
+        reviewedSha c8508a0) of the pluggable-agents work confirmed 5 findings,
+        all dispositioned recommend-fix. Their resolutions:
+
+        SEC-F1 (HIGH) — the bwrap sandbox was NON-FUNCTIONAL for dispatch: a
+        linked worktree's .git points into the operator clone's
+        .git/worktrees/<name> (commondir → objects/refs/config/hooks), which
+        wrap_argv never bound and --tmpfs $HOME shadowed; a live bwrap probe
+        showed git failing 'not a git repository'. It was tested only by
+        argv-shape assertions, never e2e. Fix: sandboxed agents now run in a
+        SELF-CONTAINED ``git clone --no-hardlinks`` (own .git, no shared
+        objects/hooks/config with the operator clone), origin reset to the real
+        remote; gitbulk fetches base + checks out head OUTSIDE the sandbox, the
+        agent rebases offline, gitbulk verifies + pushes. core.hooksPath is
+        neutralized. Validated by a REAL bwrap e2e test (auto-skips when
+        bwrap/userns absent) — the test that would have caught the original
+        defect. See agsbx3k (updated) and agecln4k (the isolated-clone model).
+
+        SEC-F2 (HIGH) — least privilege was opt-in: presets defaulted env=None
+        (full inherit) + sandbox=none, so default_agent:gemini ran --yolo with
+        GH_TOKEN/SSH/AWS. Fix: non-claude presets ship a scoped ``env``
+        allowlist by default (agenv6q updated). Env scoping stops env-borne
+        leakage only; filesystem isolation needs the sandbox (F1).
+
+        SEC-F3 (HIGH) — no foreign-author gate: the auto-approve agent ran on
+        attacker-controllable PR content at head_sha. Fix: dispatch skips PRs
+        not authored by the operator unless --allow-foreign-authors, which is
+        REFUSED in unattended/cron (no TTY). Closes the open part of
+        threat-model T1 / §3.3-fix item 1. (Author-based gate; PRInfo carries
+        no fork/head-repo field, and author!=me already covers foreign PRs.)
+
+        SEC-F4 (MED) — sandbox_fallback:warn-run silently downgraded under cron
+        with only a logging.warning. Fix: a downgrade now records a durable
+        WARNING into run state AND raises ATTENTION (exit 2); the backend
+        exposes ``sandbox_downgraded`` for dispatch to surface.
+
+        SEC-F5 (LOW) — the threat model claimed the effective agent argv was
+        logged; it wasn't. Fix: exec persists agent_argv (prompt elided) +
+        agent_env_keys (NAMES only) per target in <key>.meta.yaml.
+
+        Lesson recorded: argv-shape unit tests gave false confidence in a
+        control (the sandbox) that did not actually work; security-relevant
+        OS-confinement code needs an e2e test exercising the real binary
+        (agtste9k).
+      approved-by: daniel, 2026-06-04
+
+    Sandboxed Agents Use A Self-Contained Clone = decision:
+      id: agecln4k
+      why: >
+        The SEC-F1 fix (see agsecr5n). A bwrap sandbox can only bind whole
+        directories; a linked ``git worktree`` (worktree.create_worktree) has a
+        ``.git`` FILE pointing into the operator clone's
+        ``.git/worktrees/<name>`` whose commondir is the clone's
+        objects/refs/config/hooks — none of which the sandbox binds, and
+        ``--tmpfs $HOME`` shadows the clone outright. So inside the sandbox git
+        fails 'not a git repository'. Binding the clone's ``.git`` to fix that
+        would re-expose its hooks/ to the auto-approve agent (plant a
+        post-checkout hook that fires on the operator's next real git op).
+
+        Therefore a SANDBOXED agent (sandbox != none) gets a self-contained
+        repo via gitbulk.isolated_clone.create_isolated_clone:
+        ``git clone --no-hardlinks --no-checkout`` of the operator clone (own
+        .git, objects copied — not shared, default hooks), origin reset to the
+        REAL remote, ``core.hooksPath`` pointed at an empty dir (so nothing in
+        hooks/ runs), the PR head fetched from the real remote and checked out
+        detached. All networked/credentialed steps run OUTSIDE the sandbox
+        (gitbulk's job); the agent then runs bound to that dir ALONE — git works
+        and there is no filesystem path to the operator clone, other repos, or
+        creds. Teardown is rmtree (no worktree admin entry to unregister; guarded
+        to stay under worktree_root). claude / unsandboxed agents keep the
+        cheaper linked worktree. fetch_base / verify_resolved_for_push /
+        force_push_with_lease operate on either workspace identically, so the
+        agpriv8n flow is unchanged. Cost: a clone per sandboxed PR — acceptable
+        for a personal tool dispatching a handful of conflicting PRs.
+
+    E2E Tests For Real-Binary Security Controls = decision:
+      id: agtste9k
+      why: >
+        SEC-F1 shipped a sandbox that never worked because it was tested only by
+        argv-SHAPE assertions (asserting the bwrap argv looked right) and never
+        run end-to-end — false confidence in a load-bearing security control.
+        Rule going forward: OS-confinement / real-binary behavior gets an e2e
+        test that actually spawns the binary. gitbulk now has a tests/e2e/ tier
+        (pytest marker ``e2e``) that runs REAL git + REAL bwrap with NO network
+        (a local bare repo is the origin), proving git works inside the sandbox
+        over an isolated clone (agecln4k) AND — as a regression control — that
+        the old linked-worktree approach fails. The tier is:
+          - skipif(not bwrap_available()) so locked-down runners skip cleanly;
+          - EXCLUDED from the hermetic 100%-coverage gate (run with
+            ``-m "not e2e"``) — coverage of isolated_clone.py / sandbox.py comes
+            from hermetic unit tests; e2e is additive behavioral confidence, not
+            a coverage source;
+          - run in a DEDICATED ci.yml ``e2e`` job (installs bubblewrap, relaxes
+            the Ubuntu-24 AppArmor userns restriction, probes bwrap) so its
+            environment-specific result never blocks the core gate.
+        This honors AGENTS.md 'no network in tests' (local bare origin only)
+        while closing the gap that argv-shape testing left.
+      approved-by: daniel, 2026-06-04
+
     Repo-Level Dispatch Opens A PR = decision:
       id: dsprp7kq
       why: >
