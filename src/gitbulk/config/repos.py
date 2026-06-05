@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from gitbulk import paths
+from gitbulk.git import GIT
 from gitbulk.util.github_url import extract_slug_from_url
 
 _log = logging.getLogger("gitbulk.config")
@@ -149,7 +150,7 @@ def _resolve_path_to_slug(
         return f"{resolved} is not a git repository (no .git directory)."
     # ``git remote get-url origin`` is read-only and inexpensive.
     result = subprocess.run(
-        ["git", "-C", str(resolved), "remote", "get-url", "origin"],
+        [GIT, "-C", str(resolved), "remote", "get-url", "origin"],
         capture_output=True,
         text=True,
         check=False,

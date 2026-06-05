@@ -19,6 +19,7 @@ from unittest.mock import patch
 import pytest
 
 from gitbulk import worktree as worktree_mod
+from gitbulk.git import GIT
 from gitbulk.worktree import (
     WorktreeError,
     create_worktree,
@@ -66,7 +67,7 @@ def test_create_worktree_builds_correct_argv(tmp_path: Path):
     )
     assert result == expected
     assert captured["argv"] == [
-        "git",
+        GIT,
         "-C",
         str(repo_path),
         "worktree",
@@ -222,7 +223,7 @@ def test_remove_worktree_builds_correct_argv(tmp_path):
     with patch("gitbulk.worktree.subprocess.run", side_effect=fake_run):
         remove_worktree(repo_path, wt)
     assert captured["argv"] == [
-        "git",
+        GIT,
         "-C",
         str(repo_path),
         "worktree",

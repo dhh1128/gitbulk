@@ -63,9 +63,18 @@ def test_load_manifest_from_local_file(tmp_path):
     assert load_update_manifest(p)["latest_version"] == "2.0.0"
 
 
-def test_load_manifest_from_http_uses_fetcher():
+def test_load_manifest_from_https_uses_fetcher():
     data = load_update_manifest("https://x/u.json", fetcher=lambda url: b'{"latest_version":"3.0.0"}')
     assert data["latest_version"] == "3.0.0"
+
+
+def test_load_manifest_http_rejected():
+    # SEC-F5: an http:// manifest URL is refused before any (cleartext) fetch.
+    def _never(url):  # pragma: no cover - must not be invoked
+        raise AssertionError("fetcher must not be called for http://")
+
+    with pytest.raises(UpdateError, match="non-https"):
+        load_update_manifest("http://x/u.json", fetcher=_never)
 
 
 def test_load_manifest_fetcher_only():
@@ -108,8 +117,18 @@ def test_read_payload_file_url(tmp_path):
     assert read_payload(f"file://{f}") == b"data"
 
 
-def test_read_payload_http_uses_fetcher():
+def test_read_payload_https_uses_fetcher():
     assert read_payload("https://x/a", fetcher=lambda url: b"net") == b"net"
+
+
+def test_read_payload_http_rejected():
+    # SEC-F5: an http:// payload URL is refused before any (cleartext) fetch,
+    # even when a custom fetcher is supplied — the fetcher is never called.
+    def _never(url):  # pragma: no cover - must not be invoked
+        raise AssertionError("fetcher must not be called for http://")
+
+    with pytest.raises(UpdateError, match="non-https"):
+        read_payload("http://x/a", fetcher=_never)
 
 
 def test_read_payload_plain_path(tmp_path):
@@ -196,6 +215,21 @@ def test_fetch_bytes_falls_back_to_urlopen(monkeypatch):
 
     monkeypatch.setattr(update, "urlopen", lambda url, timeout: _Resp())
     assert fetch_bytes("https://example.com/a") == b"url-bytes"
+
+
+def test_fetch_bytes_rejects_http(monkeypatch):
+    # SEC-F5: a non-release http:// URL falls past _gh_fetch and must be
+    # refused before urlopen is ever called (making the S310 claim true).
+    monkeypatch.setattr(update, "_gh_fetch", lambda url: None)
+    monkeypatch.setattr(
+        update,
+        "urlopen",
+        lambda url, timeout: (_ for _ in ()).throw(
+            AssertionError("urlopen must not be called for http://")
+        ),
+    )
+    with pytest.raises(UpdateError, match="non-https"):
+        fetch_bytes("http://example.com/a")
 
 
 # ── atomic_replace_bytes ──────────────────────────────────────────────────────

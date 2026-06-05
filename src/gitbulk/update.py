@@ -60,7 +60,14 @@ def parse_version(value: str) -> tuple[int, ...]:
 def load_update_manifest(manifest_path: Path | str | None = None, fetcher=None) -> dict:
     if manifest_path is not None:
         source = str(manifest_path)
-        if source.startswith("http://") or source.startswith("https://"):
+        if source.startswith("http://"):
+            # https-only at the network boundary (SEC-F5): never fetch a
+            # manifest over cleartext http.
+            raise UpdateError(
+                f"refusing to fetch update manifest over a non-https URL: "
+                f"{source!r} (only https:// is allowed for network downloads)"
+            )
+        if source.startswith("https://"):
             raw = (fetcher or fetch_bytes)(source)
             return json.loads(raw.decode("utf-8") if isinstance(raw, bytes) else raw)
         return json.loads(Path(source).read_text(encoding="utf-8"))
@@ -130,6 +137,17 @@ def fetch_bytes(url: str, timeout: float = 10.0) -> bytes:
     payload = _gh_fetch(url)
     if payload is not None:
         return payload
+    # https-only at the network boundary (SEC-F5): an http:// script_url /
+    # manifest URL would otherwise be fetched in cleartext, with only the
+    # sha256 gate protecting integrity. Reject it here so the urlopen below
+    # genuinely only ever sees https — making the S310 claim true rather than
+    # aspirational. (_gh_fetch above only matches https GitHub release URLs, so
+    # anything reaching this point is a raw urlopen target.)
+    if not url.startswith("https://"):
+        raise UpdateError(
+            f"refusing to fetch update over a non-https URL: {url!r} "
+            "(only https:// is allowed for network downloads)"
+        )
     with urlopen(url, timeout=timeout) as response:  # noqa: S310 (https only by construction)
         return response.read()
 
@@ -137,7 +155,14 @@ def fetch_bytes(url: str, timeout: float = 10.0) -> bytes:
 def read_payload(source: str, fetcher=None) -> bytes:
     if source.startswith("file://"):
         return Path(source[7:]).read_bytes()
-    if source.startswith("http://") or source.startswith("https://"):
+    if source.startswith("http://"):
+        # https-only at the network boundary (SEC-F5): an http:// script_url
+        # would be fetched in cleartext (integrity is only sha256-gated).
+        raise UpdateError(
+            f"refusing to fetch update payload over a non-https URL: "
+            f"{source!r} (only https:// is allowed for network downloads)"
+        )
+    if source.startswith("https://"):
         return (fetcher or fetch_bytes)(source)
     return Path(source).read_bytes()
 

@@ -43,6 +43,7 @@ import subprocess
 from datetime import datetime, timezone
 
 from gitbulk.classifier import Classification, classify_login
+from gitbulk.git import GIT
 from gitbulk.config.policy import policy_for
 from gitbulk.gh import GHError
 from gitbulk.invariants.base import (
@@ -185,7 +186,7 @@ class LocalExistsInvariant(Invariant):
         if not path.exists():
             return Skip(f"local clone missing at {path}")
         result = subprocess.run(
-            ["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],
+            [GIT, "-C", str(path), "rev-parse", "--is-inside-work-tree"],
             capture_output=True,
             text=True,
             check=False,
@@ -207,7 +208,7 @@ class LocalRemoteMatchesInvariant(Invariant):
         if ctx.repo is None:
             return Fail("per-repo invariant called without ctx.repo")
         result = subprocess.run(
-            ["git", "-C", str(ctx.repo.local_path), "remote", "get-url", "origin"],
+            [GIT, "-C", str(ctx.repo.local_path), "remote", "get-url", "origin"],
             capture_output=True,
             text=True,
             check=False,
@@ -257,7 +258,7 @@ class LocalDefaultBranchInSyncInvariant(Invariant):
             )
         result = subprocess.run(
             [
-                "git",
+                GIT,
                 "-C",
                 str(ctx.repo.local_path),
                 "symbolic-ref",
