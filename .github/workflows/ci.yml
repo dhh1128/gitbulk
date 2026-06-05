@@ -154,3 +154,34 @@ jobs:
           echo "${sha256}  /tmp/actionlint.tgz" | sha256sum -c -
           tar -xzf /tmp/actionlint.tgz -C /tmp actionlint
           /tmp/actionlint -color
+
+  # Secret-scanning gate (SEC-F2). A committed credential is permanently
+  # compromised once it lands in git history, so block it at the door. Run
+  # gitleaks over the checked-out tree; any finding fails the build.
+  #
+  # The binary is fetched as a pinned release and verified by content hash —
+  # same download-and-checksum-and-run pattern as the actionlint job above —
+  # rather than a marketplace action, so a retargeted/republished asset can't
+  # slip a different binary into CI (supply-chain T4). Dependabot does not
+  # bump this curl, so the version/sha256 are updated by hand on upgrade; the
+  # authentic sha256 comes from the release's gitleaks_<ver>_checksums.txt.
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
+        with:
+          # Don't bake GITHUB_TOKEN into .git/config; this job never pushes.
+          persist-credentials: false
+
+      - name: Run gitleaks (secret scan)
+        run: |
+          set -euo pipefail
+          version=8.30.1
+          sha256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" -o /tmp/gitleaks.tgz
+          echo "${sha256}  /tmp/gitleaks.tgz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          # `dir` scans the working tree; default --exit-code 1 fails the
+          # build on any finding. --redact keeps any matched secret out of
+          # the public CI log.
+          /tmp/gitleaks dir . --no-banner --redact --exit-code 1
