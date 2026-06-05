@@ -33,6 +33,7 @@ from gitbulk.org_members_cache import (
     OrgMembersRefreshError,
     ensure_org_members_fresh,
 )
+from gitbulk.commands._common import dc_to_dict, read_repos_text
 from gitbulk.invariants import InvariantContext, get, run_chain
 from gitbulk.invariants.base import Invariant, InvariantKind
 from gitbulk.locks import (
@@ -72,7 +73,12 @@ def _partition_chain(
     chain_names: Iterable[str],
 ) -> tuple[list[type[Invariant]], list[type[Invariant]]]:
     """Split the chain into UNIVERSAL vs per-repo gates (no PER_PR bucket —
-    prune-worktrees operates on worktrees, not PRs)."""
+    prune-worktrees operates on worktrees, not PRs).
+
+    Kept local on purpose: this is a two-bucket variant, distinct from the
+    three-bucket :func:`gitbulk.commands._common.partition_chain` used by the
+    PR-oriented commands (MNT-F2). Do not collapse the two.
+    """
     universal: list[type[Invariant]] = []
     per_repo: list[type[Invariant]] = []
     for name in chain_names:
@@ -89,11 +95,11 @@ def _config_snapshot(
 ) -> dict:
     return {
         "policy": {
-            "defaults": _dc_to_dict(policy.defaults),
-            "humans": _dc_to_dict(policy.humans),
+            "defaults": dc_to_dict(policy.defaults),
+            "humans": dc_to_dict(policy.humans),
             "bots": list(policy.bots),
             "repos": {
-                slug: _dc_to_dict(ov) for slug, ov in policy.repos.items()
+                slug: dc_to_dict(ov) for slug, ov in policy.repos.items()
             },
             "worktree_root": str(policy.worktree_root),
         },
@@ -103,15 +109,6 @@ def _config_snapshot(
     }
 
 
-def _dc_to_dict(obj) -> dict:
-    from dataclasses import asdict
-
-    out: dict = {}
-    for k, v in asdict(obj).items():
-        out[k] = list(v) if isinstance(v, tuple) else v
-    return out
-
-
 def _runid_from_run_dir(run_dir: Path) -> str:
     name = run_dir.name
     suffix = "-prune-worktrees"
@@ -119,10 +116,6 @@ def _runid_from_run_dir(run_dir: Path) -> str:
         return name[: -len(suffix)]
     head, _, _ = name.rpartition("-")
     return head
-
-
-def _read_repos_text() -> str:
-    return paths.repos_file().read_text()
 
 
 # ─── per-worktree classification (the guardrails) ──────────────────────────
@@ -222,7 +215,7 @@ def prune_worktrees_handler(args: argparse.Namespace) -> int:
     policy = load_policy()
     code_root = Path(args.code_root).expanduser() if args.code_root else None
     repos, skipped_entries = load_repos(code_root=code_root)
-    repos_text = _read_repos_text()
+    repos_text = read_repos_text()
 
     spec = resolve_filter_spec(args, policy)
     repos, repos_excluded = select_repos(repos, spec)

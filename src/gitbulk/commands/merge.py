@@ -36,7 +36,6 @@ import argparse
 import sys
 from dataclasses import replace
 from pathlib import Path
-from typing import Iterable
 
 from gitbulk import paths, sentinel
 from gitbulk.config.policy import Policy, load_policy, policy_for
@@ -54,8 +53,12 @@ from gitbulk.org_members_cache import (
     OrgMembersRefreshError,
     ensure_org_members_fresh,
 )
-from gitbulk.invariants import InvariantContext, get, run_chain
-from gitbulk.invariants.base import Invariant, InvariantKind
+from gitbulk.commands._common import (
+    dc_to_dict,
+    partition_chain,
+    read_repos_text,
+)
+from gitbulk.invariants import InvariantContext, run_chain
 from gitbulk.locks import (
     LockTimeoutError,
     repo_lock,
@@ -83,29 +86,6 @@ _LOCK_TIMEOUT_SECONDS: float = 1800.0
 # ─── Internal helpers ─────────────────────────────────────────────────────
 
 
-def _partition_chain(
-    chain_names: Iterable[str],
-) -> tuple[list[type[Invariant]], list[type[Invariant]], list[type[Invariant]]]:
-    """Look up each registered name and split by ``InvariantKind``.
-
-    Identical to the helper in dispatch.py / report.py; kept local so
-    the merge handler stays standalone (see the parallel docstring in
-    dispatch._partition_chain for the rationale).
-    """
-    universal: list[type[Invariant]] = []
-    per_repo: list[type[Invariant]] = []
-    per_pr: list[type[Invariant]] = []
-    for n in chain_names:
-        cls = get(n)
-        if cls.kind == InvariantKind.UNIVERSAL:
-            universal.append(cls)
-        elif cls.kind == InvariantKind.PER_REPO:
-            per_repo.append(cls)
-        else:  # PER_PR
-            per_pr.append(cls)
-    return universal, per_repo, per_pr
-
-
 def _config_snapshot(
     policy: Policy, repos_text: str, args: argparse.Namespace
 ) -> dict:
@@ -114,11 +94,11 @@ def _config_snapshot(
     """
     return {
         "policy": {
-            "defaults": _dc_to_dict(policy.defaults),
-            "humans": _dc_to_dict(policy.humans),
+            "defaults": dc_to_dict(policy.defaults),
+            "humans": dc_to_dict(policy.humans),
             "bots": list(policy.bots),
             "repos": {
-                slug: _dc_to_dict(ov) for slug, ov in policy.repos.items()
+                slug: dc_to_dict(ov) for slug, ov in policy.repos.items()
             },
             "worktree_root": str(policy.worktree_root),
         },
@@ -126,19 +106,6 @@ def _config_snapshot(
         "apply": bool(getattr(args, "apply", False)),
         "merge_method_default": policy.defaults.merge_method,
     }
-
-
-def _dc_to_dict(obj) -> dict:
-    """Flatten a frozen dataclass into a YAML-friendly dict."""
-    from dataclasses import asdict
-
-    out: dict = {}
-    for k, v in asdict(obj).items():
-        if isinstance(v, tuple):
-            out[k] = list(v)
-        else:
-            out[k] = v
-    return out
 
 
 def _runid_from_run_dir(run_dir: Path) -> str:
@@ -149,10 +116,6 @@ def _runid_from_run_dir(run_dir: Path) -> str:
         return name[: -len(suffix)]
     head, _, _ = name.rpartition("-")
     return head
-
-
-def _read_repos_text() -> str:
-    return paths.repos_file().read_text()
 
 
 def _build_summary_md(
@@ -376,7 +339,7 @@ def merge_handler(args: argparse.Namespace) -> int:
         Path(args.code_root).expanduser() if args.code_root else None
     )
     repos, skipped_entries = load_repos(code_root=code_root)
-    repos_text = _read_repos_text()
+    repos_text = read_repos_text()
 
     # Fleet-subset filter (node flt7arg2): prune repos before the lock.
     spec = resolve_filter_spec(args, policy)
@@ -447,7 +410,7 @@ def _run_under_lock(
         )
 
     merge_sub = subcommands_mod.by_name("merge")
-    universal, per_repo, per_pr = _partition_chain(merge_sub.invariant_chain)
+    universal, per_repo, per_pr = partition_chain(merge_sub.invariant_chain)
 
     skip_list = list(args.skip_check or [])
     skip_set = frozenset(skip_list)

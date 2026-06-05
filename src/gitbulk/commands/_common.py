@@ -1,0 +1,63 @@
+"""Shared helpers for the command handler modules.
+
+Several command modules (``merge``, ``close_stale``, ``dispatch``,
+``rebase_pr``, ``report``, ``prune_branches``, ``prune_worktrees``) built
+their run-manifest snapshots the same way: flatten a frozen policy
+dataclass to a YAML-friendly dict, read ``repos.txt`` verbatim, and split a
+named invariant chain into kind buckets. Those helpers were copied verbatim
+across the modules with zero per-command variation, so they live here once
+and are imported where needed (MNT-F2 / TST-F5).
+
+Note on ``partition_chain``: this is the three-bucket form
+(UNIVERSAL / PER_REPO / PER_PR) used by every command whose unit of work is
+a PR. ``prune_branches`` and ``prune_worktrees`` deliberately keep a local
+two-bucket variant (no PER_PR) because their unit of work is a branch /
+worktree, not a PR — see the comments at those call sites.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict
+from typing import Iterable
+
+from gitbulk import paths
+from gitbulk.invariants import get
+from gitbulk.invariants.base import Invariant, InvariantKind
+
+
+def partition_chain(
+    chain_names: Iterable[str],
+) -> tuple[list[type[Invariant]], list[type[Invariant]], list[type[Invariant]]]:
+    """Look up each registered name and split by ``InvariantKind``.
+
+    Returns ``(universal, per_repo, per_pr)``. Used by the PR-oriented
+    commands; branch/worktree-oriented commands use a two-bucket variant.
+    """
+    universal: list[type[Invariant]] = []
+    per_repo: list[type[Invariant]] = []
+    per_pr: list[type[Invariant]] = []
+    for name in chain_names:
+        cls = get(name)
+        if cls.kind == InvariantKind.UNIVERSAL:
+            universal.append(cls)
+        elif cls.kind == InvariantKind.PER_REPO:
+            per_repo.append(cls)
+        else:  # PER_PR
+            per_pr.append(cls)
+    return universal, per_repo, per_pr
+
+
+def dc_to_dict(obj) -> dict:
+    """Flatten a frozen dataclass into a YAML-friendly dict.
+
+    Tuples become lists so the manifest serialises cleanly.
+    """
+    out: dict = {}
+    for k, v in asdict(obj).items():
+        out[k] = list(v) if isinstance(v, tuple) else v
+    return out
+
+
+def read_repos_text() -> str:
+    """Read the configured ``repos.txt`` verbatim for the run manifest."""
+    return paths.repos_file().read_text()

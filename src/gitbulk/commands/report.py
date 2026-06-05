@@ -37,7 +37,6 @@ import sys
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable
 
 import yaml
 
@@ -53,12 +52,15 @@ from gitbulk.filters import (
     select_repos,
 )
 from gitbulk.gh import GHClient, GHError, ProductionGHClient
+from gitbulk.commands._common import (
+    dc_to_dict,
+    partition_chain,
+    read_repos_text,
+)
 from gitbulk.invariants import (
     InvariantContext,
-    get,
     run_chain,
 )
-from gitbulk.invariants.base import Invariant, InvariantKind
 from gitbulk.locks import LockTimeoutError, run_state_lock, sentinel_lock
 from gitbulk.org_members_cache import (
     OrgMembersRefreshError,
@@ -113,24 +115,6 @@ _LOCK_TIMEOUT_SECONDS: float = 300.0
 # ─── Internal helpers ─────────────────────────────────────────────────────
 
 
-def _partition_chain(
-    chain_names: Iterable[str],
-) -> tuple[list[type[Invariant]], list[type[Invariant]], list[type[Invariant]]]:
-    """Look up each registered name and split by ``InvariantKind``."""
-    universal: list[type[Invariant]] = []
-    per_repo: list[type[Invariant]] = []
-    per_pr: list[type[Invariant]] = []
-    for n in chain_names:
-        cls = get(n)
-        if cls.kind == InvariantKind.UNIVERSAL:
-            universal.append(cls)
-        elif cls.kind == InvariantKind.PER_REPO:
-            per_repo.append(cls)
-        else:  # PER_PR
-            per_pr.append(cls)
-    return universal, per_repo, per_pr
-
-
 def _config_snapshot(policy: Policy, repos_text: str) -> dict:
     """Inline snapshot recorded into manifest.yaml.
 
@@ -143,35 +127,16 @@ def _config_snapshot(policy: Policy, repos_text: str) -> dict:
     # convert to plain dicts.
     return {
         "policy": {
-            "defaults": _dc_to_dict(policy.defaults),
-            "humans": _dc_to_dict(policy.humans),
+            "defaults": dc_to_dict(policy.defaults),
+            "humans": dc_to_dict(policy.humans),
             "bots": list(policy.bots),
             "repos": {
-                slug: _dc_to_dict(ov) for slug, ov in policy.repos.items()
+                slug: dc_to_dict(ov) for slug, ov in policy.repos.items()
             },
             "worktree_root": str(policy.worktree_root),
         },
         "repos_txt": repos_text,
     }
-
-
-def _dc_to_dict(obj) -> dict:
-    """Flatten a frozen dataclass into a YAML-friendly dict.
-
-    Tuples become lists (PyYAML emits ``!!python/tuple`` otherwise).
-    Other scalar types pass through; if a Path ever leaks into one of
-    the policy dataclasses, fix the caller — _config_snapshot already
-    str()-stringifies the top-level ``worktree_root``.
-    """
-    from dataclasses import asdict
-
-    out: dict = {}
-    for k, v in asdict(obj).items():
-        if isinstance(v, tuple):
-            out[k] = list(v)
-        else:
-            out[k] = v
-    return out
 
 
 def _runid_from_run_dir(run_dir: Path) -> str:
@@ -485,13 +450,6 @@ def _check_recent_merges(
     return records, any_failure
 
 
-def _read_repos_text() -> str:
-    """Return the raw text of repos.txt. Called after ``load_repos``
-    has already validated the file exists; a separate exists() check
-    here would be dead code."""
-    return paths.repos_file().read_text()
-
-
 # ─── Public handler ───────────────────────────────────────────────────────
 
 
@@ -510,7 +468,7 @@ def report_handler(args: argparse.Namespace) -> int:
     policy = load_policy()
     code_root = Path(args.code_root).expanduser() if args.code_root else None
     repos, skipped_entries = load_repos(code_root=code_root)
-    repos_text = _read_repos_text()
+    repos_text = read_repos_text()
 
     # Resolve the fleet-subset filter (CLI flags narrow a named config
     # set) and prune the repo list before the lock / invariant loop —
@@ -596,7 +554,7 @@ def _run_under_lock(
 
     # 5/6/8. Partition the report chain.
     report_sub = subcommands_mod.by_name("report")
-    universal, per_repo, per_pr = _partition_chain(report_sub.invariant_chain)
+    universal, per_repo, per_pr = partition_chain(report_sub.invariant_chain)
 
     # Effective skip set: cmdline --skip-check wins per r4nzp7kq.
     skip_list = list(args.skip_check or [])
