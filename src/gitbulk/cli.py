@@ -711,6 +711,37 @@ def _add_prune_branches_args(sp: argparse.ArgumentParser) -> None:
     _add_prune_common_args(
         sp, what="delete remote branches whose only PRs are merged/closed"
     )
+    sp.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Parallel workers for the branch scan (node prnpf8nq). Defaults "
+            "to the policy's prune_scan_concurrency (12). Lower it if GitHub "
+            "secondary-rate-limits you; 1 forces a sequential scan."
+        ),
+    )
+    sp.add_argument(
+        "--max-age",
+        metavar="DURATION",
+        default=None,
+        help=(
+            "Reuse plan entries analysed within this window instead of "
+            "re-scanning (node prnsh5kp); older entries are re-scanned. "
+            "Accepts e.g. 30m, 6h, 2d (bare number = minutes). Overrides the "
+            "policy's prune_plan_max_age_minutes (12h). 0 disables reuse."
+        ),
+    )
+    sp.add_argument(
+        "--force-scan",
+        action="store_true",
+        default=False,
+        help=(
+            "Ignore any existing plan and re-scan every repo in scope "
+            "(equivalent to --max-age 0)."
+        ),
+    )
 
 
 def _add_prune_worktrees_args(sp: argparse.ArgumentParser) -> None:

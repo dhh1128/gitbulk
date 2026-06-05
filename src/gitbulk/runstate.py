@@ -9,6 +9,7 @@ See this.i nodes ``tp4kq2nr`` (the 4-layer notification model),
 
 from __future__ import annotations
 
+import copy
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -167,6 +168,18 @@ class RunState:
 
     def record_repo_state(self, slug: str, payload: dict[str, Any]) -> None:
         self._per_repo[slug] = payload
+        self._rewrite_state()
+
+    def set_repos(self, repos: dict[str, dict[str, Any]]) -> None:
+        """Replace the entire per-repo map in a single state.yaml write.
+
+        Bulk alternative to N :meth:`record_repo_state` calls: a run that
+        records a whole carried-forward plan (node ``prnpl3kq``) would
+        otherwise rewrite the growing state file once per repo — O(n²).
+        ``record_extra`` values are preserved. The input is deep-copied so a
+        later caller mutation can't reach the persisted state (a subsequent
+        ``record_extra`` re-dumps ``_per_repo``)."""
+        self._per_repo = copy.deepcopy(repos)
         self._rewrite_state()
 
     def record_extra(self, key: str, value: Any) -> None:

@@ -720,6 +720,151 @@ Gitbulk Triage Tool = goal:
         uses an ALL-AUTHORS open-PR fetch, not my_open_prs (author:@me):
         someone else's open PR can depend on the branch just as easily.
       approved-by: daniel, 2026-06-03
+      children:
+
+        Prune Branches Incremental Plan = decision:
+          id: prnpl3kq
+          why: >
+            prune-branches on the user's ~150-repo fleet took 15-30 min per
+            run because its scan is sequential and per-branch: the dominant
+            cost is one ``closed_prs_for_head`` REST call (gh.py) for every
+            branch that clears the cheap guards — 1000-2000 serial
+            subprocess+network calls. Worse, the expensive ANALYSIS and the
+            cheap ACTION were fused into one non-reusable run: every
+            invocation (dry-run OR --apply) minted a new run dir and
+            repointed ``latest-prune-branches``, so a narrow ``--apply
+            --repo X`` re-scanned only X and shadowed the broad dry-run
+            report in ``show`` — forcing the user to re-run the 30-min scan
+            to see what remained.
+
+            Resolution (design doc docs/design/prune-branches-incremental.md,
+            approved 2026-06-04): separate the analysis from the action by
+            persisting a reusable PLAN in the run's existing state.yaml
+            (schema 1 -> 2, schv4nrm). A dry-run writes the full plan (every
+            delete-candidate as ``disposition: pending`` plus per-repo
+            ``analyzed_at`` and a top-level ``scope_slugs``). ``--apply``
+            reuses plan entries that are fresh and in scope, AUTO-RE-SCANS
+            anything missing or stale (so a stale/absent plan makes --apply
+            slow — accepted, chosen over refusing), deletes, then CARRIES
+            THE FULL PLAN FORWARD into its own new run with only its scope's
+            branches' dispositions updated. So multiple subset applies
+            ACCUMULATE in one report and ``show`` always shows the whole
+            plan with running dispositions. Subsetting is by repo/fleet
+            filter only (no per-branch selection UI). The state.yaml run-dir
+            home was chosen over a dedicated cache file: it reuses the
+            existing artifact, locking (rsclk7nq), and GC with no new
+            schema to version independently; retain_runs (default 30) keeps
+            plans around plenty long.
+          approved-by: daniel, 2026-06-04
+          children:
+
+            Prune Scope By Resolved Slug = decision:
+              id: prnsc7nr
+              why: >
+                prune-branches filters are repo-level only (orgs/repo_globs,
+                filters.py constrains_repos), so a run's "scope" is concretely
+                the sorted SET OF SLUGS surviving select_repos — recorded as
+                the plan's ``scope_slugs``. Reuse is therefore a per-repo
+                resolved-slug membership + freshness test, NOT FilterSpec
+                algebra: immune to glob-spelling differences (``*/origin-*``
+                and ``provenant-dev/origin-*`` resolve to the same slugs).
+                The "reuse iff the apply narrowed the focus, else re-scan
+                what's missing" rule the user asked for falls out for free:
+                a narrower apply hits only present+fresh slugs (full reuse,
+                zero analysis network); a broader apply finds slugs absent
+                from the plan and live-scans exactly those. No global subset
+                gate is needed.
+              approved-by: daniel, 2026-06-04
+
+            Prune Branch SHA Is The Change Key = decision:
+              id: prnsh5kp
+              why: >
+                state.yaml already records each branch's tip ``sha``, and
+                list_branches returns current shas in one cheap paginated
+                call, so no separate "last changed" date is needed — the tip
+                SHA IS the exact change detector. When a repo is re-analyzed,
+                a branch that clears the cheap guards AND whose sha equals its
+                cached entry reuses the cached decision/pr/reason and SKIPS
+                the expensive closed_prs_for_head + branch_ahead_by. Safe
+                because the only verdict-changing directions are covered: the
+                "used again" direction (a new open PR head/base) is caught by
+                the cheap guards, which always re-fetch my_open_prs fresh;
+                the "now deletable" direction (merged PR ages past prgrc3kp)
+                only makes a delete MORE valid. The one verdict NOT cached as
+                final is a grace-pending skip (prgrc3kp not yet met) — it is
+                re-classified each run (cheap; the PR is already known) rather
+                than reused, so it flips to delete exactly when grace elapses.
+                Freshness is a per-repo ``analyzed_at`` vs ``--max-age``
+                (policy default prune_plan_max_age_minutes = 720 / 12h);
+                ``--force-scan`` ignores the plan. Both dry-run and apply
+                honor the threshold.
+              approved-by: daniel, 2026-06-04
+
+            Prune Parallel Fetch = decision:
+              id: prnpf8nq
+              why: >
+                The scan is read-only (deletes happen later, individually,
+                under repo_lock per rsclk7nq res #7), so fan-out is safe
+                against the locking model. Reuses the existing
+                ThreadPoolExecutor fan-out (exec.py) — ordered result slots,
+                progress callback, SIGINT handling — in two passes that keep
+                the pool saturated: Pass A over repos (list_branches +
+                my_open_prs + cheap guards + sha-cache reuse, yielding each
+                repo's needs-classification branches), Pass B FLATTENED over
+                all those branches (closed_prs_for_head + branch_ahead_by) so
+                the dominant cost runs at full width regardless of how
+                branches distribute across repos. Knob ``--concurrency N``
+                (policy default prune_scan_concurrency = 12). The one real
+                external risk is GitHub REST SECONDARY rate limits
+                (concurrent-request + points/min); _run's retry/backoff
+                already covers 5xx, and this work ADDS 403/429 + Retry-After
+                handling so a wide pool degrades gracefully. Expected cold
+                scan ~25min -> ~2-3min; warm/incremental -> low seconds.
+                Cron-path-adjacent: warrants a live one-shot fleet shakedown
+                (shkd5crn) before the default concurrency is trusted.
+              approved-by: daniel, 2026-06-04
+
+            Prune Safe Re-Validation On Apply = decision:
+              id: prnrv6kq
+              why: >
+                Reusing an hours-old plan on --apply reintroduces a TOCTOU
+                the always-fresh scan avoided, so each delete is re-validated
+                against the governing facts IMMEDIATELY before acting,
+                upholding prdls2nq. delete_branch_ref deletes by ref NAME not
+                sha (the ref API has no compare-and-swap), so apply re-GETs
+                the tip (new cheap branch_ref_sha) right before the DELETE and
+                classifies the drift: branch already gone (someone else
+                pruned it) is SAFE -> tolerate as ``already-gone`` success
+                (idempotent); tip SHA moved (a push after the merge) is
+                UNSAFE -> ``refused`` ("would lose work"); branch is now an
+                open-PR head/base (reopened/new PR) is UNSAFE -> ``refused``
+                ("used again"). Candidates are few by construction so the
+                per-candidate GET is cheap; the residual sub-second GET->DELETE
+                window is the inherent limit of the ref-delete API and no
+                worse than today's final window. ``refused`` is
+                attention-worthy (exit ladder -> EXIT_ATTENTION_NEEDED) because
+                reality diverged from the plan unsafely; ``already-gone`` is
+                quiet. This re-validation is the safety gate that any
+                plan-reuse on apply (prnpl3kq) depends on and MUST land before
+                or with reuse — never after.
+              approved-by: daniel, 2026-06-04
+
+            Prune Plan Reuse Versus Fresh Truth = tension:
+              id: prntn9kp
+              why: >
+                The prune commands were designed (prnbr4kq, prdls2nq) on an
+                always-fresh scan: every guardrail saw live state at decision
+                time. Plan reuse (prnpl3kq) trades that freshness for speed,
+                which is in direct tension with the data-loss guard's "never
+                delete a ref whose deletion loses commits." The tension is
+                RESOLVED, not merely accepted, by prnrv6kq: analysis may be
+                reused (it only ever gets safer or is re-validated), but the
+                DESTRUCTIVE act re-checks the two unsafe drift directions live
+                before every delete. The residual is a sub-second TOCTOU
+                inherent to the ref-delete API, identical to the pre-existing
+                command. Binding consequence: no code path may delete a branch
+                from a cached plan WITHOUT the prnrv6kq pre-delete re-GET.
+              approved-by: daniel, 2026-06-04
 
     Prune Worktrees Subcommand = decision:
       id: prnwt5nq

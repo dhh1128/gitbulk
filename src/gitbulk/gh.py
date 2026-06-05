@@ -25,6 +25,7 @@ and the feedback memory ``feedback-gh-cli-deprecation-verification``).
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import time
 from datetime import datetime
@@ -358,6 +359,15 @@ class GHClient(Protocol):
         (prdls2nq) uses this."""
         ...
 
+    def branch_ref_sha(
+        self, slug: str, branch: str, *, timeout: float | None = None
+    ) -> str | None:
+        """Return the current tip SHA of ``branch`` on ``slug``, or ``None``
+        if the ref does not exist (404). Read-only — the pre-delete
+        re-validation (node prnrv6kq) uses this to catch a moved/deleted tip
+        right before acting on a (possibly cached) plan."""
+        ...
+
     def delete_branch_ref(
         self, slug: str, branch: str, *, timeout: float | None = None
     ) -> None:
@@ -442,6 +452,9 @@ class FakeGHClient:
         branch_ahead_by: Mapping[
             tuple[str, str, str], "int | Exception"
         ] | None = None,
+        branch_ref_shas: Mapping[
+            tuple[str, str], "str | None | Exception"
+        ] | None = None,
         delete_branch_responses: Mapping[
             tuple[str, str], "None | Exception"
         ] | None = None,
@@ -504,6 +517,9 @@ class FakeGHClient:
         self._branch_ahead_by = (
             dict(branch_ahead_by) if branch_ahead_by is not None else None
         )
+        self._branch_ref_shas = (
+            dict(branch_ref_shas) if branch_ref_shas is not None else None
+        )
         self._delete_branch_responses = (
             dict(delete_branch_responses)
             if delete_branch_responses is not None
@@ -537,6 +553,7 @@ class FakeGHClient:
             "list_branches": 0,
             "closed_prs_for_head": 0,
             "branch_ahead_by": 0,
+            "branch_ref_sha": 0,
             "delete_branch_ref": 0,
         }
 
@@ -857,6 +874,27 @@ class FakeGHClient:
             raise value
         return value
 
+    def branch_ref_sha(
+        self, slug: str, branch: str, *, timeout: float | None = None
+    ) -> str | None:
+        self.call_count["branch_ref_sha"] += 1
+        key = (slug, branch)
+        if self._branch_ref_shas is not None and key in self._branch_ref_shas:
+            value = self._branch_ref_shas[key]
+            if isinstance(value, Exception):
+                raise value
+            return value
+        # Default: the live tip is whatever the branches map reports for this
+        # branch (so an unconfigured apply re-validates to the same SHA and
+        # proceeds); a branch absent from the map reads as deleted (None).
+        entry = (self._branches or {}).get(slug)
+        if isinstance(entry, Exception) or entry is None:
+            return None
+        for ref in entry:
+            if ref.name == branch:
+                return ref.sha
+        return None
+
     def delete_branch_ref(
         self, slug: str, branch: str, *, timeout: float | None = None
     ) -> None:
@@ -891,16 +929,43 @@ _RETRYABLE_STDERR_MARKERS: tuple[str, ...] = (
     # lookups: ~25% of chunks were silently failing on HTTP 502 without
     # ever retrying because none of the other markers matched.
     "http 50",
+    # HTTP 429 (Too Many Requests) is GitHub's secondary-rate-limit answer.
+    # The textual "secondary rate limit" message is already caught by the
+    # "rate limit" marker; the bare status line needs its own (node prnpf8nq,
+    # added when the parallel scan made tripping the concurrent-request
+    # limiter plausible).
+    "http 429",
     "timeout",
     "could not resolve",
     "eof",
 )
+
+#: Upper bound (seconds) on a single inter-attempt sleep. A malformed or
+#: hostile ``Retry-After`` must not be able to stall a run unbounded.
+_MAX_BACKOFF_SECONDS: float = 60.0
+
+#: ``Retry-After: <n>`` header echoed by ``gh`` on a 429/secondary-limit.
+_RETRY_AFTER_RE = re.compile(r"retry-after:\s*(\d+)", re.IGNORECASE)
 
 
 def _is_retryable_stderr(stderr: str) -> bool:
     """True if ``stderr`` matches one of the retryable patterns."""
     low = stderr.lower()
     return any(marker in low for marker in _RETRYABLE_STDERR_MARKERS)
+
+
+def _retry_after_seconds(stderr: str) -> float | None:
+    """Parse a ``Retry-After: <seconds>`` value out of gh stderr, if present.
+
+    GitHub returns this on a secondary-rate-limit (HTTP 429) to say how long
+    to wait. Honouring it lets the parallel scan (node prnpf8nq) back off for
+    exactly the requested cooldown instead of a blind exponential guess.
+    Returns ``None`` when no such header is present.
+    """
+    match = _RETRY_AFTER_RE.search(stderr or "")
+    if match is None:
+        return None
+    return float(match.group(1))
 
 
 #: GraphQL document used by ``my_open_prs``. Lives at module scope so the
@@ -1095,9 +1160,15 @@ class ProductionGHClient:
                     )
 
             # Retryable path: sleep with exponential backoff before next
-            # attempt, but not after the final attempt.
+            # attempt, but not after the final attempt. A Retry-After header
+            # (secondary rate limit) overrides the exponential delay when it
+            # asks for longer, clamped to _MAX_BACKOFF_SECONDS (node prnpf8nq).
             if attempt < self._max_retries - 1:
-                time.sleep(2 ** attempt)
+                delay: float = 2 ** attempt
+                retry_after = _retry_after_seconds(last_stderr)
+                if retry_after is not None:
+                    delay = min(max(delay, retry_after), _MAX_BACKOFF_SECONDS)
+                time.sleep(delay)
 
         # Exhausted all attempts on retryable / timeout failures.
         message = (
@@ -1778,6 +1849,31 @@ class ProductionGHClient:
                 f"branch_ahead_by({slug!r}, {base!r}, {branch!r}): "
                 f"unexpected ahead_by value {stripped!r}"
             ) from exc
+
+    def branch_ref_sha(
+        self, slug: str, branch: str, *, timeout: float | None = None
+    ) -> str | None:
+        # verified non-deprecated against gh CLI 2026-06-04
+        # (REST GET /repos/<slug>/git/ref/heads/<branch> — the read sibling
+        # of the delete endpoint above; returns object.sha. A missing ref is
+        # HTTP 404 → we map it to None, the "already gone" signal node
+        # prnrv6kq relies on. Any other gh error propagates.)
+        try:
+            stdout = self._run(
+                (
+                    "api",
+                    f"repos/{slug}/git/ref/heads/{branch}",
+                    "--jq",
+                    ".object.sha",
+                ),
+                timeout=timeout,
+            )
+        except GHError as e:
+            low = str(e).lower()
+            if "404" in low or "not found" in low:
+                return None
+            raise
+        return stdout.strip() or None
 
     def delete_branch_ref(
         self, slug: str, branch: str, *, timeout: float | None = None

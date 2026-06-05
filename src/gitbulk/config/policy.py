@@ -61,9 +61,16 @@ _DEFAULTS_KEYS = {
     "stale_policy",
     "retain_runs",
     "prune_min_age_days",
+    "prune_plan_max_age_minutes",
     "skip_checks",
     "extra_checks",
 }
+
+#: Defaults-only keys: valid under ``defaults:`` but NOT as a per-repo
+#: override, because they configure a process-global resource (e.g. the
+#: prune scan thread pool, node prnpf8nq). Kept out of _DEFAULTS_KEYS so a
+#: per-repo use is a loud ConfigError rather than a silent no-op.
+_DEFAULTS_ONLY_KEYS = {"prune_scan_concurrency"}
 
 _HUMANS_KEYS = {"org", "cache_ttl_hours", "exceptions", "always_human"}
 
@@ -94,6 +101,17 @@ class Defaults:
     #: worktree whose PR was merged/closed fewer than this many days ago is
     #: left alone, so just-merged work (hotfixes, deploy refs) is not swept.
     prune_min_age_days: int = 7
+    #: Worker count for the prune-branches parallel scan (node prnpf8nq).
+    #: Defaults-only (the pool is global, so a per-repo value is meaningless);
+    #: 12 stays comfortably under GitHub's REST secondary-rate limits while
+    #: turning a ~25-min sequential fleet scan into ~2-3 min.
+    prune_scan_concurrency: int = 12
+    #: How long a prune-branches plan entry stays reusable before a re-run
+    #: re-scans the repo (node prnsh5kp). 720 min = 12 h balances cache savings
+    #: against missing a branch that became deletable; per-repo overridable
+    #: (a volatile repo can carry a shorter window). ``--max-age``/``--force-scan``
+    #: override at the CLI.
+    prune_plan_max_age_minutes: int = 720
     skip_checks: tuple[str, ...] = ()
     extra_checks: tuple[str, ...] = ()
 
@@ -123,6 +141,7 @@ class RepoOverride:
     stale_policy: str | None = None
     retain_runs: int | None = None
     prune_min_age_days: int | None = None
+    prune_plan_max_age_minutes: int | None = None
     skip_checks: tuple[str, ...] = ()  # appended to defaults
     extra_checks: tuple[str, ...] = ()  # appended to defaults
     #: Per-repo coding-agent selection (this.i agprof4k); names a profile
@@ -205,7 +224,7 @@ def _ensure_str_list(value: Any, where: str) -> tuple[str, ...]:
 
 
 def _parse_defaults(raw: dict[str, Any], where: str) -> Defaults:
-    _validate_keys(set(raw.keys()), _DEFAULTS_KEYS, where)
+    _validate_keys(set(raw.keys()), _DEFAULTS_KEYS | _DEFAULTS_ONLY_KEYS, where)
     kwargs: dict[str, Any] = {}
     if "merge_policy" in raw:
         kwargs["merge_policy"] = _ensure_str(
@@ -248,6 +267,18 @@ def _parse_defaults(raw: dict[str, Any], where: str) -> Defaults:
     if "prune_min_age_days" in raw:
         kwargs["prune_min_age_days"] = _ensure_int(
             raw["prune_min_age_days"], f"{where}.prune_min_age_days", minimum=0
+        )
+    if "prune_scan_concurrency" in raw:
+        kwargs["prune_scan_concurrency"] = _ensure_int(
+            raw["prune_scan_concurrency"],
+            f"{where}.prune_scan_concurrency",
+            minimum=1,
+        )
+    if "prune_plan_max_age_minutes" in raw:
+        kwargs["prune_plan_max_age_minutes"] = _ensure_int(
+            raw["prune_plan_max_age_minutes"],
+            f"{where}.prune_plan_max_age_minutes",
+            minimum=0,
         )
     if "skip_checks" in raw:
         kwargs["skip_checks"] = _ensure_str_list(
@@ -329,6 +360,12 @@ def _parse_repo_override(raw: dict[str, Any], where: str) -> RepoOverride:
     if "prune_min_age_days" in raw:
         kwargs["prune_min_age_days"] = _ensure_int(
             raw["prune_min_age_days"], f"{where}.prune_min_age_days", minimum=0
+        )
+    if "prune_plan_max_age_minutes" in raw:
+        kwargs["prune_plan_max_age_minutes"] = _ensure_int(
+            raw["prune_plan_max_age_minutes"],
+            f"{where}.prune_plan_max_age_minutes",
+            minimum=0,
         )
     if "skip_checks" in raw:
         kwargs["skip_checks"] = _ensure_str_list(
@@ -471,6 +508,7 @@ def policy_for(policy: Policy, slug: str) -> Defaults:
         "stale_policy",
         "retain_runs",
         "prune_min_age_days",
+        "prune_plan_max_age_minutes",
     ):
         v = getattr(override, key)
         if v is not None:
