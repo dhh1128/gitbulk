@@ -61,6 +61,7 @@ _DEFAULTS_KEYS = {
     "stale_policy",
     "retain_runs",
     "prune_min_age_days",
+    "prune_plan_max_age_minutes",
     "skip_checks",
     "extra_checks",
 }
@@ -105,6 +106,12 @@ class Defaults:
     #: 12 stays comfortably under GitHub's REST secondary-rate limits while
     #: turning a ~25-min sequential fleet scan into ~2-3 min.
     prune_scan_concurrency: int = 12
+    #: How long a prune-branches plan entry stays reusable before a re-run
+    #: re-scans the repo (node prnsh5kp). 720 min = 12 h balances cache savings
+    #: against missing a branch that became deletable; per-repo overridable
+    #: (a volatile repo can carry a shorter window). ``--max-age``/``--force-scan``
+    #: override at the CLI.
+    prune_plan_max_age_minutes: int = 720
     skip_checks: tuple[str, ...] = ()
     extra_checks: tuple[str, ...] = ()
 
@@ -134,6 +141,7 @@ class RepoOverride:
     stale_policy: str | None = None
     retain_runs: int | None = None
     prune_min_age_days: int | None = None
+    prune_plan_max_age_minutes: int | None = None
     skip_checks: tuple[str, ...] = ()  # appended to defaults
     extra_checks: tuple[str, ...] = ()  # appended to defaults
     #: Per-repo coding-agent selection (this.i agprof4k); names a profile
@@ -266,6 +274,12 @@ def _parse_defaults(raw: dict[str, Any], where: str) -> Defaults:
             f"{where}.prune_scan_concurrency",
             minimum=1,
         )
+    if "prune_plan_max_age_minutes" in raw:
+        kwargs["prune_plan_max_age_minutes"] = _ensure_int(
+            raw["prune_plan_max_age_minutes"],
+            f"{where}.prune_plan_max_age_minutes",
+            minimum=0,
+        )
     if "skip_checks" in raw:
         kwargs["skip_checks"] = _ensure_str_list(
             raw["skip_checks"], f"{where}.skip_checks"
@@ -346,6 +360,12 @@ def _parse_repo_override(raw: dict[str, Any], where: str) -> RepoOverride:
     if "prune_min_age_days" in raw:
         kwargs["prune_min_age_days"] = _ensure_int(
             raw["prune_min_age_days"], f"{where}.prune_min_age_days", minimum=0
+        )
+    if "prune_plan_max_age_minutes" in raw:
+        kwargs["prune_plan_max_age_minutes"] = _ensure_int(
+            raw["prune_plan_max_age_minutes"],
+            f"{where}.prune_plan_max_age_minutes",
+            minimum=0,
         )
     if "skip_checks" in raw:
         kwargs["skip_checks"] = _ensure_str_list(
@@ -488,6 +508,7 @@ def policy_for(policy: Policy, slug: str) -> Defaults:
         "stale_policy",
         "retain_runs",
         "prune_min_age_days",
+        "prune_plan_max_age_minutes",
     ):
         v = getattr(override, key)
         if v is not None:

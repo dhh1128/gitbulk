@@ -23,6 +23,7 @@ ambiguity or gh error). See :func:`_classify_branch` for the full list.
 from __future__ import annotations
 
 import argparse
+import copy
 import sys
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -293,13 +294,17 @@ def _resolve_concurrency(args: argparse.Namespace, policy: Policy) -> int:
     return max(1, int(val))
 
 
-def _scan_repo_cheap(gh, slug: str) -> dict:
+def _scan_repo_cheap(gh, slug: str, prior_entry: dict | None) -> dict:
     """Pass A for one repo: read-only fetch + network-free cheap triage.
 
     Returns a dict with ``error`` set (the fetch failed) OR ``default_branch``
-    plus ``needs_deep`` — the branches that cleared the cheap guards and so
-    need Pass B's deep classification. Runs in a worker thread and touches
-    only the gh network boundary (read-only), never the run state.
+    plus ``cached_rows`` (SHA cache hits, no deep calls) and ``needs_deep``
+    (branches needing Pass B). Runs in a worker thread and touches only the gh
+    network boundary (read-only), never the run state.
+
+    Stores ALL deep-classified branches (surfaced + the "no closed PR" skips)
+    so an unchanged tip SHA can be served from cache on a later re-scan
+    (node prnsh5kp). Cheap-skipped branches are dropped (re-evaluated free).
     """
     try:
         default_branch = gh.default_branch(slug)
@@ -309,16 +314,31 @@ def _scan_repo_cheap(gh, slug: str) -> dict:
         return {"slug": slug, "error": str(e)}
     open_heads = {pr.head_ref for pr in open_prs}
     open_bases = {pr.base_ref for pr in open_prs}
-    needs_deep = [
-        branch
-        for branch in branches
-        if _classify_cheap(slug, default_branch, branch, open_heads, open_bases)
-        is None
-    ]
+    prior_by_name = {
+        b.get("branch"): b for b in (prior_entry or {}).get("branches", [])
+    }
+    cached_rows: list[dict] = []
+    needs_deep = []
+    for branch in branches:
+        if _classify_cheap(
+            slug, default_branch, branch, open_heads, open_bases
+        ) is not None:
+            continue  # cheap skip — dropped, never stored
+        prior_row = prior_by_name.get(branch.name)
+        if (
+            prior_row is not None
+            and prior_row.get("sha") == branch.sha
+            and _is_cacheable(prior_row)
+        ):
+            # Unchanged SHA + reusable verdict → skip the expensive deep calls.
+            cached_rows.append(_reuse_classification(slug, branch, prior_row))
+        else:
+            needs_deep.append(branch)
     return {
         "slug": slug,
         "error": None,
         "default_branch": default_branch,
+        "cached_rows": cached_rows,
         "needs_deep": needs_deep,
     }
 
@@ -330,20 +350,46 @@ def _scan_branches(
     passing_repos: list[RepoEntry],
     now: datetime,
     concurrency: int,
-) -> list[dict]:
-    """Two-pass parallel scan (node prnpf8nq) returning surfaced decisions.
+    *,
+    prior_repos: dict,
+    cli_max_age_minutes: int | None,
+) -> tuple[list[dict], dict]:
+    """Plan-aware two-pass parallel scan (nodes prnpf8nq, prnsh5kp).
 
-    Pass A fans out the per-repo read-only fetch + cheap triage; Pass B fans
-    out the dominant per-branch deep classification *flattened across all
-    repos* so the pool stays saturated regardless of branch skew. Results are
-    assembled in ``passing_repos`` order (then branch order within a repo) so
-    the report is byte-for-byte stable with the old sequential scan.
+    Partitions repos into *reuse* (a plan entry fresh enough per ``--max-age``
+    / policy) and *scan*; reused repos contribute their cached rows verbatim
+    (no network). Scanned repos go through Pass A (fetch + cheap triage +
+    per-branch SHA cache hit) and the flattened Pass B (deep classification of
+    the rest). Returns ``(results, materialized_meta)`` where ``results`` holds
+    EVERY deep row (incl. the unsurfaced "no closed PR" skips, kept so the next
+    run can cache-hit them) and ``materialized_meta`` maps each reused/scanned
+    slug → ``{analyzed_at, default_branch}`` for the plan write.
     """
-    # Pass A — over repos.
-    prog_a = Progress(len(passing_repos), prefix="scanning repos: ")
+    now_iso = now.isoformat()
+    reuse: list[tuple[RepoEntry, dict]] = []
+    # to_scan carries (repo, sha_cache_entry): the prior entry to consult for
+    # per-branch SHA reuse, or None when the user forced a full re-verify
+    # (max_age 0 / --force-scan) — then even unchanged branches are re-classified.
+    to_scan: list[tuple[RepoEntry, dict | None]] = []
+    for repo in passing_repos:
+        prior = prior_repos.get(repo.slug)
+        max_age = (
+            cli_max_age_minutes
+            if cli_max_age_minutes is not None
+            else policy_for(policy, repo.slug).prune_plan_max_age_minutes
+        )
+        if max_age <= 0:
+            to_scan.append((repo, None))            # forced full re-verify
+        elif prior is not None and _is_fresh(prior, max_age, now):
+            reuse.append((repo, prior))             # fresh: skip the repo
+        else:
+            to_scan.append((repo, prior))           # stale: rescan, SHA-reuse
+
+    # Pass A — over the repos that actually need scanning.
+    prog_a = Progress(len(to_scan), prefix="scanning repos: ")
     repo_scans = parallel_map(
-        lambda repo: _scan_repo_cheap(gh, repo.slug),
-        passing_repos,
+        lambda item: _scan_repo_cheap(gh, item[0].slug, item[1]),
+        to_scan,
         concurrency=concurrency,
         on_progress=lambda done, total: prog_a.update(done),
     )
@@ -371,7 +417,16 @@ def _scan_branches(
         deep_by_slug.setdefault(slug, []).append(res)
 
     results: list[dict] = []
-    for repo, scan in zip(passing_repos, repo_scans):
+    materialized: dict[str, dict] = {}
+    # Reused repos: prior rows verbatim, prior analyzed_at preserved.
+    for repo, prior in reuse:
+        results.extend(_reuse_rows(repo.slug, prior))
+        materialized[repo.slug] = {
+            "analyzed_at": prior.get("analyzed_at"),
+            "default_branch": prior.get("default_branch"),
+        }
+    # Scanned repos: cache hits (Pass A) + freshly classified (Pass B).
+    for (repo, _sha_entry), scan in zip(to_scan, repo_scans):
         slug = repo.slug
         if scan["error"] is not None:
             rs.record_error(
@@ -384,23 +439,13 @@ def _scan_branches(
                  "reason": f"scan failed: {scan['error']}"}
             )
             continue
-        # Only surface branches that are delete candidates OR that had a
-        # closed/merged PR but were skipped for a safety reason. A branch
-        # with simply no PR is not interesting to report.
-        for res in deep_by_slug.get(slug, []):
-            if res["decision"] == "delete" or "pr_number" in res:
-                results.append(res)
-
-    # scanned: slug → default_branch for every repo that fetched cleanly.
-    # Drives which plan entries this run REFRESHES (overwrites); a repo whose
-    # scan errored is absent, so its prior plan entry is carried forward
-    # untouched rather than clobbered with a transient failure (node prnpl3kq).
-    scanned = {
-        scan["slug"]: scan["default_branch"]
-        for scan in repo_scans
-        if scan["error"] is None
-    }
-    return results, scanned
+        results.extend(scan["cached_rows"])
+        results.extend(deep_by_slug.get(slug, []))
+        materialized[slug] = {
+            "analyzed_at": now_iso,
+            "default_branch": scan["default_branch"],
+        }
+    return results, materialized
 
 
 # ─── plan persistence + dispositions (nodes prnpl3kq, prnrv6kq) ────────────
@@ -410,6 +455,99 @@ def _scan_branches(
 #: independently of runstate's envelope SCHEMA_VERSION because only this
 #: subcommand's payload changed; readers tolerate its absence (old plans).
 _PLAN_VERSION = 2
+
+
+#: Branch verdicts that are safe to reuse for an unchanged tip SHA
+#: (node prnsh5kp): a ``delete`` only gets more valid with age, and a
+#: ``skip`` with NO associated PR ("no merged/closed PR") is stable. A skip
+#: that DOES cite a PR (grace-pending, or data-loss "would lose work") is
+#: time/state dependent and is re-classified instead.
+_DURATION_UNITS = {"m": 1, "h": 60, "d": 60 * 24}
+
+
+def _parse_duration_minutes(text: str) -> int:
+    """Parse ``30m`` / ``6h`` / ``2d`` / bare-minutes (``90``) → minutes.
+
+    Raises :class:`ValueError` on anything else so the CLI can report it."""
+    s = text.strip().lower()
+    if not s:
+        raise ValueError("empty duration")
+    unit = 1
+    if s[-1] in _DURATION_UNITS:
+        unit = _DURATION_UNITS[s[-1]]
+        s = s[:-1]
+    if not s.isdigit():
+        raise ValueError(
+            f"invalid --max-age {text!r}; use e.g. 30m, 6h, 2d, or a number "
+            "of minutes"
+        )
+    return int(s) * unit
+
+
+def _cli_max_age_minutes(args: argparse.Namespace) -> int | None:
+    """The CLI freshness override: 0 for ``--force-scan``, the parsed
+    ``--max-age``, or ``None`` to fall back to the per-repo policy value."""
+    if getattr(args, "force_scan", False):
+        return 0
+    raw = getattr(args, "max_age", None)
+    if raw is None:
+        return None
+    return _parse_duration_minutes(raw)
+
+
+def _is_fresh(entry: dict, max_age_minutes: int, now: datetime) -> bool:
+    """True if ``entry`` was analysed within ``max_age_minutes`` of ``now``.
+
+    A non-positive window, a missing/unparseable ``analyzed_at``, or a
+    future stamp all read as NOT fresh (re-scan) — the conservative default."""
+    if max_age_minutes <= 0:
+        return False
+    stamp = entry.get("analyzed_at")
+    if not isinstance(stamp, str):
+        return False
+    try:
+        analyzed = datetime.fromisoformat(stamp)
+    except ValueError:
+        return False
+    age_minutes = (now - analyzed).total_seconds() / 60.0
+    return 0 <= age_minutes <= max_age_minutes
+
+
+def _is_cacheable(row: dict) -> bool:
+    """Whether a prior branch verdict can be reused for an unchanged SHA
+    (node prnsh5kp)."""
+    decision = row.get("decision")
+    if decision == "delete":
+        return True
+    if decision == "skip" and "pr_number" not in row:
+        return True
+    return False
+
+
+def _reuse_classification(slug: str, branch, prior_row: dict) -> dict:
+    """A fresh result row built from a cached verdict (unchanged SHA) — the
+    classification only, with disposition left to re-finalize for this run."""
+    out = {
+        "slug": slug,
+        "branch": branch.name,
+        "sha": branch.sha,
+        "decision": prior_row["decision"],
+        "reason": prior_row.get("reason", ""),
+    }
+    if "pr_number" in prior_row:
+        out["pr_number"] = prior_row["pr_number"]
+    if "pr_state" in prior_row:
+        out["pr_state"] = prior_row["pr_state"]
+    return out
+
+
+def _reuse_rows(slug: str, prior_entry: dict) -> list[dict]:
+    """Whole-repo reuse (per-repo freshness): the prior branch rows verbatim,
+    PRESERVING their dispositions (a deleted branch stays deleted)."""
+    rows: list[dict] = []
+    for branch in prior_entry.get("branches", []):
+        rows.append({"slug": slug, **copy.deepcopy(branch)})
+    return rows
 
 
 def _disposition_of(row: dict) -> str:
@@ -470,23 +608,25 @@ def _plan_branch(row: dict) -> dict:
 
 
 def _merge_plan(
-    prior_repos: dict, scanned: dict, results: list[dict], now_iso: str | None
+    prior_repos: dict, materialized: dict, results: list[dict]
 ) -> dict:
     """Carry the prior plan forward, overwriting only the repos THIS run
-    scanned cleanly (node prnpl3kq). Repos out of scope, or whose scan
-    errored, keep their prior entry — so subset applies accumulate and a
-    transient failure never wipes good data."""
+    materialized — i.e. reused-fresh OR scanned cleanly (nodes prnpl3kq,
+    prnsh5kp). Repos out of scope, or whose scan errored, keep their prior
+    entry — so subset applies accumulate and a transient failure never wipes
+    good data. Each materialized entry's ``analyzed_at`` comes from
+    ``materialized`` (preserved for a reused repo, ``now`` for a scanned one)."""
     merged = dict(prior_repos)
     by_slug: dict[str, list[dict]] = {}
     for row in results:
         if row["decision"] == "error":
             continue
         by_slug.setdefault(row["slug"], []).append(row)
-    for slug, default_branch in scanned.items():
+    for slug, meta in materialized.items():
         rows = by_slug.get(slug, [])
         merged[slug] = {
-            "analyzed_at": now_iso,
-            "default_branch": default_branch,
+            "analyzed_at": meta["analyzed_at"],
+            "default_branch": meta["default_branch"],
             "branch_count": len(rows),
             "branches": [_plan_branch(r) for r in rows],
         }
@@ -507,6 +647,15 @@ def _flatten_plan(merged: dict) -> list[dict]:
 
 
 def prune_branches_handler(args: argparse.Namespace) -> int:
+    # Validate --max-age up front so a typo fails cleanly before any run state
+    # is created (node prnsh5kp).
+    try:
+        _cli_max_age_minutes(args)
+    except ValueError as e:
+        print(
+            error_line(f"gitbulk prune-branches: {e}"), file=sys.stderr
+        )
+        return EXIT_STRUCTURAL_FAILURE
     policy = load_policy()
     code_root = Path(args.code_root).expanduser() if args.code_root else None
     repos, skipped_entries = load_repos(code_root=code_root)
@@ -624,20 +773,29 @@ def _run_under_lock(
     now_iso = now.isoformat()
     filter_line = filter_summary_line(spec, repos_excluded, 0)
     concurrency = _resolve_concurrency(args, policy)
-    # results: one record per branch we evaluated to a delete/skip decision.
-    # (Branches with no closed PR are recorded as skips so the run is auditable.)
-    # scanned: slug → default_branch for the repos this run refreshed.
-    results, scanned = _scan_branches(
-        gh, policy, rs, passing_repos, now, concurrency
+    # Reuse fresh in-scope plan entries; scan the rest (nodes prnsh5kp, prnpl3kq).
+    # This read is a pre-scan heuristic; _finish reloads under lock for the merge.
+    cli_max_age = _cli_max_age_minutes(args)
+    prior_repos = _load_latest_plan_repos()
+    # results: every deep row (incl. unsurfaced "no closed PR" skips, kept for
+    # the next run's SHA cache). materialized: slug → {analyzed_at, default_branch}.
+    results, materialized = _scan_branches(
+        gh, policy, rs, passing_repos, now, concurrency,
+        prior_repos=prior_repos, cli_max_age_minutes=cli_max_age,
     )
 
-    delete_candidates = [r for r in results if r["decision"] == "delete"]
+    # Only PENDING deletes are candidates — a reused row already deleted in a
+    # prior apply must not be re-deleted (node prnpl3kq).
+    delete_candidates = [
+        r for r in results
+        if r["decision"] == "delete" and _disposition_of(r) == "pending"
+    ]
 
     if not args.apply:
         _finalize_dispositions(results)
         return _finish_dry_run(
-            rs, policy, repos, passing_repos, skipped_repos, results, scanned,
-            now_iso, delete_candidates, skip_list, skipped_entries, filter_line,
+            rs, policy, repos, passing_repos, skipped_repos, results, materialized,
+            delete_candidates, skip_list, skipped_entries, filter_line,
         )
 
     # ── --apply: delete each candidate ──
@@ -701,14 +859,14 @@ def _run_under_lock(
     return _finish(
         rs, exit_code, summary=summary_text, policy=policy, attention=attention,
         all_repos=repos, passing_repos=passing_repos, skipped_repos=skipped_repos,
-        results=results, scanned=scanned, now_iso=now_iso, apply=True,
+        results=results, materialized=materialized, apply=True,
         skipped_entries=skipped_entries, filter_line=filter_line,
     )
 
 
 def _finish_dry_run(
-    rs, policy, repos, passing_repos, skipped_repos, results, scanned,
-    now_iso, delete_candidates, skip_list, skipped_entries, filter_line,
+    rs, policy, repos, passing_repos, skipped_repos, results, materialized,
+    delete_candidates, skip_list, skipped_entries, filter_line,
 ) -> int:
     if skipped_repos or skipped_entries:
         exit_code, attention = EXIT_INVARIANT_SKIPPED, True
@@ -727,7 +885,7 @@ def _finish_dry_run(
     return _finish(
         rs, exit_code, summary=summary_text, policy=policy, attention=attention,
         all_repos=repos, passing_repos=passing_repos, skipped_repos=skipped_repos,
-        results=results, scanned=scanned, now_iso=now_iso, apply=False,
+        results=results, materialized=materialized, apply=False,
         skipped_entries=skipped_entries, filter_line=filter_line,
     )
 
@@ -755,7 +913,12 @@ def _build_summary_md(
     deleted = [r for r in delete_rows if _disposition_of(r) == "deleted"]
     failed = [r for r in delete_rows if _disposition_of(r) == "failed"]
     pending = [r for r in delete_rows if _disposition_of(r) == "pending"]
-    skips = [r for r in rows if r["decision"] == "skip"]
+    # Only skips that cite a PR are interesting ("kept despite a closed PR").
+    # The "no closed PR" skips are stored for the SHA cache (prnsh5kp) but are
+    # noise in the report — exactly the branches the old scan never surfaced.
+    skips = [
+        r for r in rows if r["decision"] == "skip" and "pr_number" in r
+    ]
     errors = [r for r in rows if r["decision"] == "error"]
 
     lines.append(
@@ -819,13 +982,12 @@ def _finish(
     skipped_repos: list[tuple[str, str]],
     results: list[dict],
     apply: bool,
-    scanned: dict | None = None,
-    now_iso: str | None = None,
+    materialized: dict | None = None,
     failed: bool = False,
     skipped_entries: list[SkippedEntry] | None = None,
     filter_line: str | None = None,
 ) -> int:
-    scanned = scanned or {}
+    materialized = materialized or {}
     if attention:
         runid = _runid_from_run_dir(rs.run_dir)
         with sentinel_lock(timeout=_LOCK_TIMEOUT_SECONDS, subcommand="prune-branches"):
@@ -837,7 +999,7 @@ def _finish(
         "prune-branches", "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
         subcommand="prune-branches",
     ):
-        merged = _merge_plan(_load_latest_plan_repos(), scanned, results, now_iso)
+        merged = _merge_plan(_load_latest_plan_repos(), materialized, results)
         rs.set_repos(merged)
         rs.record_extra(
             "prune_plan",

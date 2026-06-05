@@ -195,6 +195,45 @@ def test_prune_scan_concurrency_is_defaults_only_not_per_repo(tmp_path):
         load_policy(_write_policy(tmp_path, content))
 
 
+# ─── prune_plan_max_age_minutes (node prnsh5kp) ────────────────────────────
+
+
+def test_prune_plan_max_age_default():
+    from gitbulk.config.policy import Defaults
+    assert Defaults().prune_plan_max_age_minutes == 720
+
+
+def test_prune_plan_max_age_explicit(tmp_path):
+    content = "defaults:\n  prune_plan_max_age_minutes: 60\n"
+    policy = load_policy(_write_policy(tmp_path, content))
+    assert policy.defaults.prune_plan_max_age_minutes == 60
+
+
+def test_prune_plan_max_age_zero_allowed(tmp_path):
+    content = "defaults:\n  prune_plan_max_age_minutes: 0\n"
+    policy = load_policy(_write_policy(tmp_path, content))
+    assert policy.defaults.prune_plan_max_age_minutes == 0
+
+
+def test_prune_plan_max_age_rejects_negative(tmp_path):
+    content = "defaults:\n  prune_plan_max_age_minutes: -1\n"
+    with pytest.raises(ConfigError, match="prune_plan_max_age_minutes"):
+        load_policy(_write_policy(tmp_path, content))
+
+
+def test_prune_plan_max_age_per_repo_override(tmp_path):
+    content = """
+defaults:
+  prune_plan_max_age_minutes: 720
+repos:
+  owner/volatile:
+    prune_plan_max_age_minutes: 30
+"""
+    policy = load_policy(_write_policy(tmp_path, content))
+    assert policy_for(policy, "owner/volatile").prune_plan_max_age_minutes == 30
+    assert policy_for(policy, "owner/other").prune_plan_max_age_minutes == 720
+
+
 # ─── merge_method ─────────────────────────────────────────────────────────
 
 

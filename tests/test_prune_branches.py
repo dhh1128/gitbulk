@@ -85,7 +85,8 @@ def fresh_org_cache():
 
 def _args(*, apply=False, code_root=None, skip_check=None,
           refresh_org_members=False, org=None, repo=None, base=None,
-          mergeable_state=None, author=None, filter=None, concurrency=1):
+          mergeable_state=None, author=None, filter=None, concurrency=1,
+          max_age=None, force_scan=False):
     # concurrency defaults to 1 here so handler tests run the deterministic
     # inline scan path; parallel-path tests pass concurrency>1 explicitly.
     return argparse.Namespace(
@@ -95,6 +96,7 @@ def _args(*, apply=False, code_root=None, skip_check=None,
         refresh_org_members=refresh_org_members,
         org=org, repo=repo, base=base, mergeable_state=mergeable_state,
         author=author, filter=filter, concurrency=concurrency,
+        max_age=max_age, force_scan=force_scan,
     )
 
 
@@ -698,6 +700,170 @@ def test_failed_preflight_preserves_prior_plan(
     # Plan survived: alpha still present and pending.
     br = _latest_state()["repos"]["dhh1128/alpha"]["branches"][0]
     assert br["disposition"] == "pending"
+
+
+# ─── freshness + SHA reuse (nodes prnsh5kp, prnpf8nq) ──────────────────────
+
+
+@pytest.mark.parametrize(
+    "text,minutes",
+    [("30m", 30), ("6h", 360), ("2d", 2880), ("90", 90), ("0", 0), (" 4H ", 240)],
+)
+def test_parse_duration_minutes(text, minutes):
+    assert pb._parse_duration_minutes(text) == minutes
+
+
+@pytest.mark.parametrize("bad", ["", "abc", "5x", "1.5h", "h"])
+def test_parse_duration_minutes_rejects_garbage(bad):
+    with pytest.raises(ValueError):
+        pb._parse_duration_minutes(bad)
+
+
+def test_cli_max_age_minutes_resolution():
+    assert pb._cli_max_age_minutes(_args(force_scan=True)) == 0
+    assert pb._cli_max_age_minutes(_args(max_age="6h")) == 360
+    assert pb._cli_max_age_minutes(_args()) is None
+
+
+def test_is_fresh_cases():
+    now = datetime(2026, 6, 4, 12, 0, tzinfo=timezone.utc)
+    recent = (now - timedelta(minutes=5)).isoformat()
+    old = (now - timedelta(minutes=600)).isoformat()
+    future = (now + timedelta(minutes=5)).isoformat()
+    assert pb._is_fresh({"analyzed_at": recent}, 60, now) is True
+    assert pb._is_fresh({"analyzed_at": old}, 60, now) is False
+    assert pb._is_fresh({"analyzed_at": recent}, 0, now) is False  # window off
+    assert pb._is_fresh({"analyzed_at": None}, 60, now) is False   # no stamp
+    assert pb._is_fresh({"analyzed_at": "not-a-date"}, 60, now) is False
+    assert pb._is_fresh({"analyzed_at": future}, 60, now) is False  # age < 0
+
+
+@pytest.mark.parametrize(
+    "row,cacheable",
+    [
+        ({"decision": "delete"}, True),
+        ({"decision": "skip"}, True),                       # no PR → stable
+        ({"decision": "skip", "pr_number": 1}, False),      # grace/data-loss
+        ({"decision": "error"}, False),
+    ],
+)
+def test_is_cacheable(row, cacheable):
+    assert pb._is_cacheable(row) is cacheable
+
+
+def test_second_dry_run_reuses_fresh_repo(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    fake = _seed_one_repo_plan(monkeypatch, code_root, write_config, fresh_org_cache)
+    assert fake.call_count["closed_prs_for_head"] == 1
+    # Second run within the default 12h window → whole repo reused, no rescan.
+    prune_branches_handler(_args(code_root=code_root))
+    assert fake.call_count["closed_prs_for_head"] == 1   # unchanged
+    assert fake.call_count["list_branches"] == 1         # repo not even fetched
+    # The plan still shows the candidate (carried/reused).
+    assert _latest_state()["repos"]["dhh1128/alpha"]["branches"][0][
+        "disposition"
+    ] == "pending"
+
+
+def test_force_scan_ignores_fresh_plan(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    fake = _seed_one_repo_plan(monkeypatch, code_root, write_config, fresh_org_cache)
+    prune_branches_handler(_args(code_root=code_root, force_scan=True))
+    # Forced full re-verify: closed_prs called again (no SHA reuse either).
+    assert fake.call_count["closed_prs_for_head"] == 2
+
+
+def test_max_age_zero_ignores_fresh_plan(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    fake = _seed_one_repo_plan(monkeypatch, code_root, write_config, fresh_org_cache)
+    prune_branches_handler(_args(code_root=code_root, max_age="0"))
+    assert fake.call_count["closed_prs_for_head"] == 2
+
+
+def test_stale_repo_rescans_but_reuses_unchanged_sha(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """A repo past its freshness window is re-scanned (cheap calls re-run),
+    but a branch whose tip SHA is unchanged reuses its cached verdict and
+    skips the expensive closed-PR lookup (node prnsh5kp)."""
+    clock = {"t": datetime(2026, 6, 4, 0, 0, tzinfo=timezone.utc)}
+    monkeypatch.setattr(pb, "_utc_now", lambda: clock["t"])
+    fake = _seed_one_repo_plan(monkeypatch, code_root, write_config, fresh_org_cache)
+    assert fake.call_count["closed_prs_for_head"] == 1
+    assert fake.call_count["list_branches"] == 1
+    # Jump 13h → past the 12h window.
+    clock["t"] = clock["t"] + timedelta(hours=13)
+    prune_branches_handler(_args(code_root=code_root))
+    # Repo re-fetched (cheap), but merged-feat SHA unchanged → verdict reused.
+    assert fake.call_count["list_branches"] == 2
+    assert fake.call_count["closed_prs_for_head"] == 1   # NOT re-looked-up
+
+
+def test_stale_repo_reclassifies_changed_sha(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    clock = {"t": datetime(2026, 6, 4, 0, 0, tzinfo=timezone.utc)}
+    monkeypatch.setattr(pb, "_utc_now", lambda: clock["t"])
+    fake = _seed_one_repo_plan(monkeypatch, code_root, write_config, fresh_org_cache)
+    # The branch tip moves; configure the new closed-PR lookup for the new tip.
+    fake._branches["dhh1128/alpha"] = [_br(name="merged-feat", sha="c" * 40)]
+    fake._closed_prs_for_head[("dhh1128/alpha", "merged-feat")] = [
+        _closed("dhh1128/alpha", 7, head_ref="merged-feat", head_sha="c" * 40,
+                days_ago=30)
+    ]
+    clock["t"] = clock["t"] + timedelta(hours=13)
+    prune_branches_handler(_args(code_root=code_root))
+    # Changed SHA → re-classified → closed-PR looked up again.
+    assert fake.call_count["closed_prs_for_head"] == 2
+
+
+def test_no_pr_branch_is_cached_in_plan_but_not_surfaced(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """A branch with no closed PR is stored in the plan (so the SHA cache can
+    hit it next run) yet stays out of the summary; a stale rescan reuses its
+    cached verdict instead of re-looking-up the (absent) PR."""
+    clock = {"t": datetime(2026, 6, 4, 0, 0, tzinfo=timezone.utc)}
+    monkeypatch.setattr(pb, "_utc_now", lambda: clock["t"])
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+        branches={"dhh1128/alpha": [_br(name="orphan", sha="a" * 40)]},
+        closed_prs_for_head={("dhh1128/alpha", "orphan"): []},
+    )
+    _install(monkeypatch, fake)
+    prune_branches_handler(_args(code_root=code_root))
+    # Stored in the plan...
+    branches = _latest_state()["repos"]["dhh1128/alpha"]["branches"]
+    assert [b["branch"] for b in branches] == ["orphan"]
+    assert branches[0]["decision"] == "skip"
+    assert "pr_number" not in branches[0]
+    # ...but not in the summary.
+    assert "orphan" not in _latest_summary()
+    # Stale rescan → SHA cache-hits the no-PR skip (no new closed-PR lookup).
+    clock["t"] = clock["t"] + timedelta(hours=13)
+    prune_branches_handler(_args(code_root=code_root))
+    assert fake.call_count["closed_prs_for_head"] == 1
+    # force_scan, by contrast, re-verifies even no-PR branches.
+    prune_branches_handler(_args(code_root=code_root, force_scan=True))
+    assert fake.call_count["closed_prs_for_head"] == 2
+
+
+def test_bad_max_age_raises(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    _install(monkeypatch, _base_fake())
+    rc = prune_branches_handler(_args(code_root=code_root, max_age="bogus"))
+    assert rc == EXIT_STRUCTURAL_FAILURE
 
 
 def test_org_refresh_failure_aborts(
