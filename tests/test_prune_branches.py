@@ -25,28 +25,15 @@ from gitbulk.commands.prune_branches import (
     prune_branches_handler,
 )
 from gitbulk.gh import FakeGHClient, GHError
-from gitbulk.org_members_cache import CachedMembers, save_cache
 from gitbulk.pr_info import BranchRef, ClosedPRRef, PRInfo
 
 
 # ─── fixtures (mirror test_merge) ──────────────────────────────────────────
 
 
-@pytest.fixture
-def isolated_xdg(monkeypatch, tmp_path):
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    paths.ensure_directories()
-    return tmp_path
-
-
-@pytest.fixture
-def code_root(tmp_path):
-    root = tmp_path / "code"
-    root.mkdir()
-    return root
-
-
+# isolated_xdg, code_root, and fresh_org_cache live in tests/conftest.py
+# (shared across the command tests). write_config stays local because its
+# policy defaults are prune-branches-specific.
 @pytest.fixture
 def write_config(isolated_xdg, code_root):
     def _write(*, repos_slugs, defaults_extra=None, repo_overrides=None):
@@ -67,20 +54,6 @@ def write_config(isolated_xdg, code_root):
         return cfg_dir
 
     return _write
-
-
-@pytest.fixture
-def fresh_org_cache():
-    def _save(org, members):
-        save_cache(
-            CachedMembers(
-                org=org,
-                fetched_at=datetime.now(timezone.utc),
-                members=frozenset(members),
-            )
-        )
-
-    return _save
 
 
 def _args(*, apply=False, code_root=None, skip_check=None,

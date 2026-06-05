@@ -36,30 +36,15 @@ from gitbulk.commands.merge import (
 from gitbulk.gh import FakeGHClient, GHError
 from gitbulk.invariants import catalog as _catalog
 from gitbulk.locks import LockTimeoutError
-from gitbulk.org_members_cache import CachedMembers, save_cache
 from gitbulk.pr_info import PRInfo
 
 
 # ─── Fixtures ──────────────────────────────────────────────────────────────
 
 
-@pytest.fixture
-def isolated_xdg(monkeypatch, tmp_path):
-    cfg = tmp_path / "config"
-    cache = tmp_path / "cache"
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(cfg))
-    monkeypatch.setenv("XDG_CACHE_HOME", str(cache))
-    paths.ensure_directories()
-    return tmp_path
-
-
-@pytest.fixture
-def code_root(tmp_path):
-    root = tmp_path / "code"
-    root.mkdir()
-    return root
-
-
+# isolated_xdg, code_root, and fresh_org_cache live in tests/conftest.py
+# (shared across the command tests). write_config stays local because its
+# policy defaults (min_business_days) and bots= param are merge-specific.
 @pytest.fixture
 def write_config(isolated_xdg, code_root):
     """Write gitbulk.yaml + repos.txt. min_business_days=0 by default so
@@ -93,20 +78,6 @@ def write_config(isolated_xdg, code_root):
         return cfg_dir
 
     return _write
-
-
-@pytest.fixture
-def fresh_org_cache():
-    def _save(org, members):
-        save_cache(
-            CachedMembers(
-                org=org,
-                fetched_at=datetime.now(timezone.utc),
-                members=frozenset(members),
-            )
-        )
-
-    return _save
 
 
 def _make_pr(
