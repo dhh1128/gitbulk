@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from gitbulk import paths
+from gitbulk.git import GIT
 
 #: Two-character ``git status --porcelain`` codes that mark a merge
 #: conflict (per git-status(1)). Shared by :func:`is_worktree_in_conflict`
@@ -63,7 +64,7 @@ def _git_run(
     raises :class:`WorktreeError` on non-zero exit; ``check=False``
     returns the CompletedProcess for the caller to inspect.
     """
-    argv = ("git", "-C", str(repo_path), *args)
+    argv = (GIT, "-C", str(repo_path), *args)
     completed = subprocess.run(
         list(argv),
         capture_output=True,
@@ -199,7 +200,7 @@ def is_worktree_in_conflict(worktree_path: Path) -> bool:
     codes) is "clean".
     """
     completed = subprocess.run(
-        ["git", "-C", str(worktree_path), "status", "--porcelain"],
+        [GIT, "-C", str(worktree_path), "status", "--porcelain"],
         capture_output=True,
         text=True,
         check=False,
@@ -302,7 +303,7 @@ def worktree_change_summary(worktree_path: Path) -> tuple[bool, bool, bool]:
     caller refuses to remove a worktree whose state it cannot read.
     """
     completed = subprocess.run(
-        ["git", "-C", str(worktree_path), "status", "--porcelain"],
+        [GIT, "-C", str(worktree_path), "status", "--porcelain"],
         capture_output=True,
         text=True,
         check=False,
@@ -346,7 +347,7 @@ def worktree_in_progress_op(worktree_path: Path) -> str | None:
     """
     for rel, name in _IN_PROGRESS_PATHS:
         completed = subprocess.run(
-            ["git", "-C", str(worktree_path), "rev-parse", "--git-path", rel],
+            [GIT, "-C", str(worktree_path), "rev-parse", "--git-path", rel],
             capture_output=True,
             text=True,
             check=False,

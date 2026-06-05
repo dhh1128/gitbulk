@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import pytest
 
+from gitbulk.git import GIT
 from gitbulk.rebase import (
     PushReadiness,
     RebaseError,
@@ -57,8 +58,8 @@ def test_rebase_clean():
     # argv: fetch origin dev, then rebase origin/dev
     fetch_argv = run.call_args_list[0][0][0]
     rebase_argv = run.call_args_list[1][0][0]
-    assert fetch_argv == ["git", "-C", str(WT), "fetch", "origin", "dev"]
-    assert rebase_argv == ["git", "-C", str(WT), "rebase", "origin/dev"]
+    assert fetch_argv == [GIT, "-C", str(WT), "fetch", "origin", "dev"]
+    assert rebase_argv == [GIT, "-C", str(WT), "rebase", "origin/dev"]
 
 
 def test_rebase_fetch_failure_is_error():
@@ -86,7 +87,7 @@ def test_rebase_conflict_preserves():
     assert "src/bar.py" in result.detail
     # No `rebase --abort` was issued (worktree preserved).
     argvs = [c[0][0] for c in run.call_args_list]
-    assert ["git", "-C", str(WT), "rebase", "--abort"] not in argvs
+    assert [GIT, "-C", str(WT), "rebase", "--abort"] not in argvs
 
 
 def test_rebase_conflict_files_unknown():
@@ -116,7 +117,7 @@ def test_rebase_nonconflict_failure_aborts():
     assert result.status is RebaseStatus.ERROR
     assert "bad revision" in result.detail
     argvs = [c[0][0] for c in run.call_args_list]
-    assert ["git", "-C", str(WT), "rebase", "--abort"] in argvs
+    assert [GIT, "-C", str(WT), "rebase", "--abort"] in argvs
 
 
 def test_rebase_nonconflict_failure_empty_stderr():
@@ -141,7 +142,7 @@ def test_force_push_with_lease_argv():
         force_push_with_lease(WT, "feat/x", "a" * 40)
     argv = run.call_args_list[0][0][0]
     assert argv == [
-        "git", "-C", str(WT), "push",
+        GIT, "-C", str(WT), "push",
         f"--force-with-lease=feat/x:{'a' * 40}",
         "origin", "HEAD:feat/x",
     ]
@@ -164,7 +165,7 @@ def test_fetch_base_clean():
         result = fetch_base(WT, "main")
     assert result.status is RebaseStatus.CLEAN
     assert run.call_args_list[0][0][0] == [
-        "git", "-C", str(WT), "fetch", "origin", "main",
+        GIT, "-C", str(WT), "fetch", "origin", "main",
     ]
 
 

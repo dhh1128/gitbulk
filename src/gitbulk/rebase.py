@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
+from gitbulk.git import GIT
 from gitbulk.worktree import is_worktree_in_conflict, worktree_in_progress_op
 
 
@@ -83,7 +84,7 @@ def _git(
     error we want to raise on).
     """
     return subprocess.run(
-        ["git", "-C", str(worktree_path), *args],
+        [GIT, "-C", str(worktree_path), *args],
         capture_output=True,
         text=True,
         check=False,

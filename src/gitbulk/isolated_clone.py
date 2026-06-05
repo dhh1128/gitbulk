@@ -31,6 +31,7 @@ import subprocess
 from pathlib import Path
 
 from gitbulk import paths
+from gitbulk.git import GIT
 from gitbulk.worktree import WorktreeError
 
 #: Directory name inside the clone's ``.git`` used as an empty hooks dir.
@@ -42,7 +43,7 @@ def _run(
 ) -> subprocess.CompletedProcess[str]:
     """Run ``git <args>`` (optionally with ``cwd``), list-form, no shell."""
     completed = subprocess.run(
-        ["git", *args],
+        [GIT, *args],
         cwd=str(cwd) if cwd is not None else None,
         capture_output=True,
         text=True,
