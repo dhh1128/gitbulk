@@ -633,6 +633,52 @@ def _merge_plan(
     return merged
 
 
+def _revalidate_delete(
+    gh, slug: str, branch: str, expected_sha: str, open_refs_cache: dict
+) -> tuple[str, str | None]:
+    """Re-check the governing facts immediately before deleting (node prnrv6kq).
+
+    Returns one of:
+      ``("delete", None)``           — safe to delete.
+      ``("already-gone", reason)``   — ref already deleted (tolerate as success).
+      ``("refused", reason)``        — UNSAFE drift; do not delete.
+
+    The tip is re-GET so a moved tip (post-merge push → would lose work) or a
+    deleted ref is caught even when the plan is hours old; a fresh open-PR
+    fetch catches a branch that has been reused. Any inability to re-verify
+    biases to ``refused`` (fail safe, prdls2nq)."""
+    try:
+        tip = gh.branch_ref_sha(slug, branch)
+    except GHError as e:
+        return ("refused", f"could not re-verify tip: {e}")
+    if tip is None:
+        return ("already-gone", "ref absent on the remote")
+    if tip != expected_sha:
+        return (
+            "refused",
+            f"tip moved to {tip[:7]} since analysis — would lose work",
+        )
+    # Tip unchanged → confirm the branch hasn't been reused by a fresh PR.
+    if slug not in open_refs_cache:
+        try:
+            prs = gh.my_open_prs([slug], author=None).get(slug, [])
+            open_refs_cache[slug] = (
+                {pr.head_ref for pr in prs},
+                {pr.base_ref for pr in prs},
+            )
+        except GHError as e:
+            open_refs_cache[slug] = e
+    refs = open_refs_cache[slug]
+    if isinstance(refs, GHError):
+        return ("refused", f"could not re-verify open PRs: {refs}")
+    open_heads, open_bases = refs
+    if branch in open_heads:
+        return ("refused", "now the head of an open PR — used again")
+    if branch in open_bases:
+        return ("refused", "now the base of an open PR — used again")
+    return ("delete", None)
+
+
 def _flatten_plan(merged: dict) -> list[dict]:
     """Plan repos → a flat, slug-stamped, slug-sorted row list for the
     summary builder."""
@@ -798,19 +844,53 @@ def _run_under_lock(
             delete_candidates, skip_list, skipped_entries, filter_line,
         )
 
-    # ── --apply: delete each candidate ──
+    # ── --apply: re-validate, then delete each candidate ──
     failure_count = 0
     deleted_count = 0
+    refused_count = 0
+    gone_count = 0
+    open_refs_cache: dict[str, tuple | GHError] = {}
     for cand in delete_candidates:
         slug = cand["slug"]
         branch = cand["branch"]
         try:
             # repo_lock(slug): serialize this remote mutation against any other
             # gitbulk run touching the SAME repo (node rsclk7nq resource #7).
+            # Re-validation runs INSIDE the lock, immediately before the
+            # destructive act, so the plan can be stale/reused yet still safe
+            # (node prnrv6kq).
             with repo_lock(
                 slug, "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
                 subcommand="prune-branches",
             ):
+                action, reason = _revalidate_delete(
+                    gh, slug, branch, cand["sha"], open_refs_cache
+                )
+                if action == "already-gone":
+                    gone_count += 1
+                    cand["disposition"] = "already-gone"
+                    cand["acted_at"] = now_iso
+                    cand["acted_mode"] = "apply"
+                    rs.record_error(
+                        f"{slug}:{branch} already gone — no-op ({reason})",
+                        level="WARNING",
+                        context={"slug": slug, "branch": branch,
+                                 "action": "already-gone"},
+                    )
+                    continue
+                if action == "refused":
+                    refused_count += 1
+                    cand["disposition"] = "refused"
+                    cand["refuse_reason"] = reason
+                    cand["acted_at"] = now_iso
+                    cand["acted_mode"] = "apply"
+                    rs.record_error(
+                        f"REFUSED delete of {slug}:{branch}: {reason}",
+                        level="WARNING",
+                        context={"slug": slug, "branch": branch,
+                                 "action": "refused", "reason": reason},
+                    )
+                    continue
                 gh.delete_branch_ref(slug, branch)
         except GHError as e:
             failure_count += 1
@@ -841,7 +921,9 @@ def _run_under_lock(
 
     _finalize_dispositions(results)
 
-    if failure_count > 0:
+    if failure_count > 0 or refused_count > 0:
+        # A refusal means reality diverged from the plan in an UNSAFE way
+        # (tip moved / branch reused) — the user should see it (node prnrv6kq).
         exit_code, attention = EXIT_ATTENTION_NEEDED, True
     elif skipped_repos or skipped_entries:
         exit_code, attention = EXIT_INVARIANT_SKIPPED, True
@@ -852,7 +934,8 @@ def _run_under_lock(
 
     summary_text = (
         f"deleted {deleted_count} of {len(delete_candidates)} branches; "
-        f"{failure_count} failed; {len(skipped_repos)} repos skipped; "
+        f"{failure_count} failed; {refused_count} refused (stale); "
+        f"{gone_count} already gone; {len(skipped_repos)} repos skipped; "
         f"{len(skipped_entries)} entries skipped"
         + (f"; {filter_line}" if filter_line else "")
     )
@@ -910,8 +993,12 @@ def _build_summary_md(
         lines.append(filter_line)
 
     delete_rows = [r for r in rows if r["decision"] == "delete"]
-    deleted = [r for r in delete_rows if _disposition_of(r) == "deleted"]
+    deleted = [
+        r for r in delete_rows
+        if _disposition_of(r) in ("deleted", "already-gone")
+    ]
     failed = [r for r in delete_rows if _disposition_of(r) == "failed"]
+    refused = [r for r in delete_rows if _disposition_of(r) == "refused"]
     pending = [r for r in delete_rows if _disposition_of(r) == "pending"]
     # Only skips that cite a PR are interesting ("kept despite a closed PR").
     # The "no closed PR" skips are stored for the SHA cache (prnsh5kp) but are
@@ -950,8 +1037,17 @@ def _build_summary_md(
             )
         lines.append("")
 
-    _emit("Deleted", deleted, lambda r: " — deleted")
+    _emit(
+        "Deleted", deleted,
+        lambda r: " — already gone"
+        if _disposition_of(r) == "already-gone"
+        else " — deleted",
+    )
     _emit("Deleted", failed, lambda r: " — FAILED: " + r.get("error", ""))
+    _emit(
+        "Refused (plan stale)", refused,
+        lambda r: " — " + r.get("refuse_reason", "unsafe drift"),
+    )
     _emit("Would delete", pending, lambda r: "")
 
     if skips:

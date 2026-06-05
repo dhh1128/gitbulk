@@ -359,6 +359,15 @@ class GHClient(Protocol):
         (prdls2nq) uses this."""
         ...
 
+    def branch_ref_sha(
+        self, slug: str, branch: str, *, timeout: float | None = None
+    ) -> str | None:
+        """Return the current tip SHA of ``branch`` on ``slug``, or ``None``
+        if the ref does not exist (404). Read-only — the pre-delete
+        re-validation (node prnrv6kq) uses this to catch a moved/deleted tip
+        right before acting on a (possibly cached) plan."""
+        ...
+
     def delete_branch_ref(
         self, slug: str, branch: str, *, timeout: float | None = None
     ) -> None:
@@ -443,6 +452,9 @@ class FakeGHClient:
         branch_ahead_by: Mapping[
             tuple[str, str, str], "int | Exception"
         ] | None = None,
+        branch_ref_shas: Mapping[
+            tuple[str, str], "str | None | Exception"
+        ] | None = None,
         delete_branch_responses: Mapping[
             tuple[str, str], "None | Exception"
         ] | None = None,
@@ -505,6 +517,9 @@ class FakeGHClient:
         self._branch_ahead_by = (
             dict(branch_ahead_by) if branch_ahead_by is not None else None
         )
+        self._branch_ref_shas = (
+            dict(branch_ref_shas) if branch_ref_shas is not None else None
+        )
         self._delete_branch_responses = (
             dict(delete_branch_responses)
             if delete_branch_responses is not None
@@ -538,6 +553,7 @@ class FakeGHClient:
             "list_branches": 0,
             "closed_prs_for_head": 0,
             "branch_ahead_by": 0,
+            "branch_ref_sha": 0,
             "delete_branch_ref": 0,
         }
 
@@ -857,6 +873,27 @@ class FakeGHClient:
         if isinstance(value, Exception):
             raise value
         return value
+
+    def branch_ref_sha(
+        self, slug: str, branch: str, *, timeout: float | None = None
+    ) -> str | None:
+        self.call_count["branch_ref_sha"] += 1
+        key = (slug, branch)
+        if self._branch_ref_shas is not None and key in self._branch_ref_shas:
+            value = self._branch_ref_shas[key]
+            if isinstance(value, Exception):
+                raise value
+            return value
+        # Default: the live tip is whatever the branches map reports for this
+        # branch (so an unconfigured apply re-validates to the same SHA and
+        # proceeds); a branch absent from the map reads as deleted (None).
+        entry = (self._branches or {}).get(slug)
+        if isinstance(entry, Exception) or entry is None:
+            return None
+        for ref in entry:
+            if ref.name == branch:
+                return ref.sha
+        return None
 
     def delete_branch_ref(
         self, slug: str, branch: str, *, timeout: float | None = None
@@ -1812,6 +1849,31 @@ class ProductionGHClient:
                 f"branch_ahead_by({slug!r}, {base!r}, {branch!r}): "
                 f"unexpected ahead_by value {stripped!r}"
             ) from exc
+
+    def branch_ref_sha(
+        self, slug: str, branch: str, *, timeout: float | None = None
+    ) -> str | None:
+        # verified non-deprecated against gh CLI 2026-06-04
+        # (REST GET /repos/<slug>/git/ref/heads/<branch> — the read sibling
+        # of the delete endpoint above; returns object.sha. A missing ref is
+        # HTTP 404 → we map it to None, the "already gone" signal node
+        # prnrv6kq relies on. Any other gh error propagates.)
+        try:
+            stdout = self._run(
+                (
+                    "api",
+                    f"repos/{slug}/git/ref/heads/{branch}",
+                    "--jq",
+                    ".object.sha",
+                ),
+                timeout=timeout,
+            )
+        except GHError as e:
+            low = str(e).lower()
+            if "404" in low or "not found" in low:
+                return None
+            raise
+        return stdout.strip() or None
 
     def delete_branch_ref(
         self, slug: str, branch: str, *, timeout: float | None = None

@@ -2211,6 +2211,42 @@ def test_branch_ahead_by_unexpected_value_raises():
             ProductionGHClient().branch_ahead_by("o/r", "main", "f")
 
 
+# ─── branch_ref_sha (node prnrv6kq) ────────────────────────────────────────
+
+
+def test_branch_ref_sha_returns_tip():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout="a" * 40 + "\n"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        result = ProductionGHClient().branch_ref_sha("o/r", "feat/x")
+    argv = mock_run.call_args[0][0]
+    assert argv[1:] == [
+        "api",
+        "repos/o/r/git/ref/heads/feat/x",
+        "--jq",
+        ".object.sha",
+    ]
+    assert result == "a" * 40
+
+
+def test_branch_ref_sha_404_returns_none():
+    side_effect = _make_run_mock(_CompletedFake(1, stderr="gh: Not Found (HTTP 404)"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        assert ProductionGHClient().branch_ref_sha("o/r", "gone") is None
+
+
+def test_branch_ref_sha_empty_returns_none():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout="\n"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        assert ProductionGHClient().branch_ref_sha("o/r", "feat") is None
+
+
+def test_branch_ref_sha_other_error_propagates():
+    side_effect = _make_run_mock(_CompletedFake(1, stderr="HTTP 403: forbidden"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        with pytest.raises(GHError):
+            ProductionGHClient().branch_ref_sha("o/r", "feat")
+
+
 # ─── delete_branch_ref (node prdel4rq) ─────────────────────────────────────
 
 

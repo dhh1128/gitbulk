@@ -709,3 +709,42 @@ def test_fake_delete_branch_ref_configured_exception_raises():
         fake.delete_branch_ref("o/r", "feat")
     # Call is still recorded before the raise.
     assert fake.delete_branch_calls == [{"slug": "o/r", "branch": "feat"}]
+
+
+# ─── FakeGHClient.branch_ref_sha (node prnrv6kq) ───────────────────────────
+
+
+def test_fake_branch_ref_sha_configured_value():
+    fake = FakeGHClient(branch_ref_shas={("o/r", "feat"): "a" * 40})
+    assert fake.branch_ref_sha("o/r", "feat") == "a" * 40
+
+
+def test_fake_branch_ref_sha_configured_none():
+    fake = FakeGHClient(branch_ref_shas={("o/r", "feat"): None})
+    assert fake.branch_ref_sha("o/r", "feat") is None
+
+
+def test_fake_branch_ref_sha_configured_exception_raises():
+    fake = FakeGHClient(branch_ref_shas={("o/r", "feat"): GHError("boom")})
+    with pytest.raises(GHError, match="boom"):
+        fake.branch_ref_sha("o/r", "feat")
+
+
+def test_fake_branch_ref_sha_derives_from_branches_map():
+    fake = FakeGHClient(branches={"o/r": [_branch(name="feat", sha="d" * 40)]})
+    assert fake.branch_ref_sha("o/r", "feat") == "d" * 40
+
+
+def test_fake_branch_ref_sha_unknown_slug_is_none():
+    fake = FakeGHClient(branches={"o/r": [_branch(name="feat")]})
+    assert fake.branch_ref_sha("o/other", "feat") is None
+
+
+def test_fake_branch_ref_sha_unknown_branch_is_none():
+    fake = FakeGHClient(branches={"o/r": [_branch(name="feat")]})
+    assert fake.branch_ref_sha("o/r", "missing") is None
+
+
+def test_fake_branch_ref_sha_errored_branches_entry_is_none():
+    fake = FakeGHClient(branches={"o/r": GHError("listing failed")})
+    assert fake.branch_ref_sha("o/r", "feat") is None

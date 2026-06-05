@@ -516,6 +516,158 @@ def test_parallel_apply_deletes_every_candidate(
     assert {c["slug"] for c in fake.delete_branch_calls} == set(slugs)
 
 
+# ─── pre-delete re-validation (node prnrv6kq) ──────────────────────────────
+
+
+def test_revalidate_delete_safe_when_unchanged():
+    fake = FakeGHClient(
+        branch_ref_shas={("o/r", "feat"): "a" * 40},
+        my_open_prs={"o/r": []},
+    )
+    assert pb._revalidate_delete(fake, "o/r", "feat", "a" * 40, {}) == (
+        "delete", None,
+    )
+
+
+def test_revalidate_delete_already_gone():
+    fake = FakeGHClient(branch_ref_shas={("o/r", "feat"): None})
+    action, reason = pb._revalidate_delete(fake, "o/r", "feat", "a" * 40, {})
+    assert action == "already-gone"
+
+
+def test_revalidate_delete_refuses_moved_tip():
+    fake = FakeGHClient(branch_ref_shas={("o/r", "feat"): "b" * 40})
+    action, reason = pb._revalidate_delete(fake, "o/r", "feat", "a" * 40, {})
+    assert action == "refused" and "tip moved" in reason
+
+
+def test_revalidate_delete_refuses_when_tip_unverifiable():
+    fake = FakeGHClient(branch_ref_shas={("o/r", "feat"): GHError("boom")})
+    action, reason = pb._revalidate_delete(fake, "o/r", "feat", "a" * 40, {})
+    assert action == "refused" and "could not re-verify tip" in reason
+
+
+def test_revalidate_delete_refuses_reused_as_head():
+    fake = FakeGHClient(
+        branch_ref_shas={("o/r", "feat"): "a" * 40},
+        my_open_prs={"o/r": [_open_pr("o/r", 1, head_ref="feat")]},
+    )
+    action, reason = pb._revalidate_delete(fake, "o/r", "feat", "a" * 40, {})
+    assert action == "refused" and "head of an open PR" in reason
+
+
+def test_revalidate_delete_refuses_reused_as_base():
+    fake = FakeGHClient(
+        branch_ref_shas={("o/r", "feat"): "a" * 40},
+        my_open_prs={"o/r": [_open_pr("o/r", 1, head_ref="x", base_ref="feat")]},
+    )
+    action, reason = pb._revalidate_delete(fake, "o/r", "feat", "a" * 40, {})
+    assert action == "refused" and "base of an open PR" in reason
+
+
+def test_revalidate_delete_refuses_when_open_prs_unverifiable():
+    fake = FakeGHClient(branch_ref_shas={("o/r", "feat"): "a" * 40})  # my_open_prs unset → raises
+    action, reason = pb._revalidate_delete(fake, "o/r", "feat", "a" * 40, {})
+    assert action == "refused" and "could not re-verify open PRs" in reason
+
+
+def test_revalidate_delete_caches_open_refs():
+    fake = FakeGHClient(
+        branch_ref_shas={("o/r", "feat"): "a" * 40, ("o/r", "feat2"): "a" * 40},
+        my_open_prs={"o/r": []},
+    )
+    cache: dict = {}
+    pb._revalidate_delete(fake, "o/r", "feat", "a" * 40, cache)
+    pb._revalidate_delete(fake, "o/r", "feat2", "a" * 40, cache)
+    assert fake.call_count["my_open_prs"] == 1  # second call hit the cache
+
+
+def test_apply_calls_branch_ref_sha_before_deleting(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+        branches={"dhh1128/alpha": [_br(name="merged-feat", sha="a" * 40)]},
+        closed_prs_for_head={
+            ("dhh1128/alpha", "merged-feat"): [
+                _closed("dhh1128/alpha", 7, head_ref="merged-feat",
+                        head_sha="a" * 40, days_ago=30)
+            ],
+        },
+    )
+    _install(monkeypatch, fake)
+    rc = prune_branches_handler(_args(apply=True, code_root=code_root))
+    assert rc == EXIT_OK
+    assert fake.call_count["branch_ref_sha"] == 1
+    assert fake.delete_branch_calls == [
+        {"slug": "dhh1128/alpha", "branch": "merged-feat"}
+    ]
+
+
+def test_apply_refuses_moved_tip(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+        branches={"dhh1128/alpha": [_br(name="merged-feat", sha="a" * 40)]},
+        closed_prs_for_head={
+            ("dhh1128/alpha", "merged-feat"): [
+                _closed("dhh1128/alpha", 7, head_ref="merged-feat",
+                        head_sha="a" * 40, days_ago=30)
+            ],
+        },
+        # Tip moved between analysis and apply.
+        branch_ref_shas={("dhh1128/alpha", "merged-feat"): "b" * 40},
+    )
+    _install(monkeypatch, fake)
+    rc = prune_branches_handler(_args(apply=True, code_root=code_root))
+    assert rc == EXIT_ATTENTION_NEEDED
+    assert sentinel.has_attention()
+    assert fake.delete_branch_calls == []   # NOT deleted
+    summary = _latest_summary()
+    assert "Refused (plan stale)" in summary and "tip moved" in summary
+
+
+def test_apply_tolerates_already_gone(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+        branches={"dhh1128/alpha": [_br(name="merged-feat", sha="a" * 40)]},
+        closed_prs_for_head={
+            ("dhh1128/alpha", "merged-feat"): [
+                _closed("dhh1128/alpha", 7, head_ref="merged-feat",
+                        head_sha="a" * 40, days_ago=30)
+            ],
+        },
+        # Ref already deleted (e.g. by another tool) since analysis.
+        branch_ref_shas={("dhh1128/alpha", "merged-feat"): None},
+    )
+    _install(monkeypatch, fake)
+    rc = prune_branches_handler(_args(apply=True, code_root=code_root))
+    assert rc == EXIT_OK                      # already-gone is a quiet success
+    assert not sentinel.has_attention()
+    assert fake.delete_branch_calls == []
+    br = _latest_state()["repos"]["dhh1128/alpha"]["branches"][0]
+    assert br["disposition"] == "already-gone"
+    assert "already gone" in _latest_summary()
+
+
 # ─── plan persistence + dispositions + carry-forward (node prnpl3kq) ────────
 
 
