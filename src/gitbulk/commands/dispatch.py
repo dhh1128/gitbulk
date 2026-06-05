@@ -433,9 +433,14 @@ def dispatch_handler(args: argparse.Namespace) -> int:
     code_root = (
         Path(args.code_root).expanduser() if args.code_root else None
     )
-    # TODO: surface skipped_entries in dispatch summary (mirror
-    # report/merge treatment). For now ignore them so a typo in
-    # repos.txt doesn't block the dispatch run.
+    # TECH_DEBT: surface skipped repos.txt entries in dispatch summary [ISSUE-TBD]
+    # INTENTIONAL DIVERGENCE — do NOT "fix" this into surfacing skips without
+    # the summary work below. Unlike report/merge (which collect skipped_entries
+    # and render a "Skipped repos.txt entries" section), dispatch deliberately
+    # drops the second load_repos() return value so a typo in repos.txt does
+    # not block a dispatch run. Resolving this means mirroring the report/merge
+    # treatment: thread skipped_entries through _config_snapshot and the summary
+    # builder. Until then the skips are silently ignored, by design.
     repos, _ = load_repos(code_root=code_root)
     repos_text = read_repos_text()
 
