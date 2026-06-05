@@ -29,6 +29,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+import yaml
+
 from gitbulk import paths, sentinel
 from gitbulk.config.policy import Policy, load_policy, policy_for
 from gitbulk.config.repos import RepoEntry, SkippedEntry, load_repos
@@ -388,7 +390,117 @@ def _scan_branches(
         for res in deep_by_slug.get(slug, []):
             if res["decision"] == "delete" or "pr_number" in res:
                 results.append(res)
-    return results
+
+    # scanned: slug → default_branch for every repo that fetched cleanly.
+    # Drives which plan entries this run REFRESHES (overwrites); a repo whose
+    # scan errored is absent, so its prior plan entry is carried forward
+    # untouched rather than clobbered with a transient failure (node prnpl3kq).
+    scanned = {
+        scan["slug"]: scan["default_branch"]
+        for scan in repo_scans
+        if scan["error"] is None
+    }
+    return results, scanned
+
+
+# ─── plan persistence + dispositions (nodes prnpl3kq, prnrv6kq) ────────────
+
+#: Version of the prune-branches *plan payload* (the per-repo/per-branch shape
+#: written under state.yaml's ``repos`` + the ``prune_plan`` extra). Tracked
+#: independently of runstate's envelope SCHEMA_VERSION because only this
+#: subcommand's payload changed; readers tolerate its absence (old plans).
+_PLAN_VERSION = 2
+
+
+def _disposition_of(row: dict) -> str:
+    """The action state of one branch row. Reads an explicit ``disposition``
+    if present (fresh rows, and rows carried forward from a P2+ plan); else
+    derives one from the legacy fields so a pre-P2 plan still renders."""
+    explicit = row.get("disposition")
+    if explicit is not None:
+        return explicit
+    decision = row.get("decision")
+    if decision == "delete":
+        if row.get("deleted"):
+            return "deleted"
+        if "error" in row:
+            return "failed"
+        return "pending"
+    if decision == "error":
+        return "error"
+    return "kept"
+
+
+def _finalize_dispositions(results: list[dict]) -> None:
+    """Stamp disposition/acted_at/acted_mode on every surfaced row that the
+    apply loop didn't already set (pending candidates, kept skips, errors)."""
+    for row in results:
+        row.setdefault("disposition", _disposition_of(row))
+        row.setdefault("acted_at", None)
+        row.setdefault("acted_mode", None)
+
+
+def _load_latest_plan_repos() -> dict:
+    """The ``repos`` map of the most recent prune-branches plan, or ``{}``.
+
+    Read from the ``latest-prune-branches`` symlink, which still points at the
+    PRIOR run until this run's :meth:`RunState.complete`. Must be called inside
+    ``run_state_lock`` so the read→merge→advance is atomic against a concurrent
+    apply (node prnpl3kq; rsclk7nq §2 row 1)."""
+    symlink = paths.latest_run_symlink("prune-branches")
+    try:
+        state_path = symlink.resolve(strict=True) / "state.yaml"
+        data = yaml.safe_load(state_path.read_text())
+    except (OSError, yaml.YAMLError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    repos = data.get("repos")
+    return repos if isinstance(repos, dict) else {}
+
+
+def _plan_branch(row: dict) -> dict:
+    """One branch row as stored in the plan (state.yaml): everything but the
+    redundant ``slug`` key, with disposition fields guaranteed present."""
+    out = {k: v for k, v in row.items() if k != "slug"}
+    out["disposition"] = _disposition_of(out)
+    out.setdefault("acted_at", None)
+    out.setdefault("acted_mode", None)
+    return out
+
+
+def _merge_plan(
+    prior_repos: dict, scanned: dict, results: list[dict], now_iso: str | None
+) -> dict:
+    """Carry the prior plan forward, overwriting only the repos THIS run
+    scanned cleanly (node prnpl3kq). Repos out of scope, or whose scan
+    errored, keep their prior entry — so subset applies accumulate and a
+    transient failure never wipes good data."""
+    merged = dict(prior_repos)
+    by_slug: dict[str, list[dict]] = {}
+    for row in results:
+        if row["decision"] == "error":
+            continue
+        by_slug.setdefault(row["slug"], []).append(row)
+    for slug, default_branch in scanned.items():
+        rows = by_slug.get(slug, [])
+        merged[slug] = {
+            "analyzed_at": now_iso,
+            "default_branch": default_branch,
+            "branch_count": len(rows),
+            "branches": [_plan_branch(r) for r in rows],
+        }
+    return merged
+
+
+def _flatten_plan(merged: dict) -> list[dict]:
+    """Plan repos → a flat, slug-stamped, slug-sorted row list for the
+    summary builder."""
+    rows: list[dict] = []
+    for slug in sorted(merged):
+        for branch in merged[slug].get("branches", []):
+            rows.append({"slug": slug, **branch})
+    return rows
 
 
 # ─── public handler ────────────────────────────────────────────────────────
@@ -448,7 +560,7 @@ def _run_under_lock(
         return _finish(
             rs, EXIT_STRUCTURAL_FAILURE, summary=str(e), policy=policy,
             attention=False, all_repos=repos, passing_repos=[],
-            skipped_repos=[], results=[], apply=bool(args.apply),
+            skipped_repos=[], results=[], apply=bool(args.apply), failed=True,
             skipped_entries=skipped_entries, filter_line=None,
         )
 
@@ -472,7 +584,7 @@ def _run_under_lock(
             rs, EXIT_STRUCTURAL_FAILURE,
             summary=f"universal preflight failed: {universal_result.fail_reason}",
             policy=policy, attention=False, all_repos=repos, passing_repos=[],
-            skipped_repos=[], results=[], apply=bool(args.apply),
+            skipped_repos=[], results=[], apply=bool(args.apply), failed=True,
             skipped_entries=skipped_entries, filter_line=None,
         )
 
@@ -496,7 +608,7 @@ def _run_under_lock(
                 summary=f"per-repo invariant failed on {repo.slug}: {r.fail_reason}",
                 policy=policy, attention=False, all_repos=repos,
                 passing_repos=passing_repos, skipped_repos=skipped_repos,
-                results=[], apply=bool(args.apply),
+                results=[], apply=bool(args.apply), failed=True,
                 skipped_entries=skipped_entries, filter_line=None,
             )
         intrinsic_skips = [(n, reason) for n, reason in r.skips if n not in skip_set]
@@ -509,18 +621,23 @@ def _run_under_lock(
     progress.done()
 
     now = _utc_now()
+    now_iso = now.isoformat()
     filter_line = filter_summary_line(spec, repos_excluded, 0)
     concurrency = _resolve_concurrency(args, policy)
     # results: one record per branch we evaluated to a delete/skip decision.
     # (Branches with no closed PR are recorded as skips so the run is auditable.)
-    results = _scan_branches(gh, policy, rs, passing_repos, now, concurrency)
+    # scanned: slug → default_branch for the repos this run refreshed.
+    results, scanned = _scan_branches(
+        gh, policy, rs, passing_repos, now, concurrency
+    )
 
     delete_candidates = [r for r in results if r["decision"] == "delete"]
 
     if not args.apply:
+        _finalize_dispositions(results)
         return _finish_dry_run(
-            rs, policy, repos, passing_repos, skipped_repos, results,
-            delete_candidates, skip_list, skipped_entries, filter_line,
+            rs, policy, repos, passing_repos, skipped_repos, results, scanned,
+            now_iso, delete_candidates, skip_list, skipped_entries, filter_line,
         )
 
     # ── --apply: delete each candidate ──
@@ -540,6 +657,9 @@ def _run_under_lock(
         except GHError as e:
             failure_count += 1
             cand["error"] = str(e)
+            cand["disposition"] = "failed"
+            cand["acted_at"] = now_iso
+            cand["acted_mode"] = "apply"
             rs.record_error(
                 f"delete_branch_ref failed for {slug}:{branch}: {e}",
                 level="ERROR",
@@ -547,6 +667,9 @@ def _run_under_lock(
             )
             continue
         cand["deleted"] = True
+        cand["disposition"] = "deleted"
+        cand["acted_at"] = now_iso
+        cand["acted_mode"] = "apply"
         deleted_count += 1
         # AUDIT: record the SHA so a mistaken delete is restorable.
         rs.record_error(
@@ -558,8 +681,7 @@ def _run_under_lock(
             },
         )
 
-    for repo in passing_repos:
-        _record_repo_state(rs, repo.slug, results)
+    _finalize_dispositions(results)
 
     if failure_count > 0:
         exit_code, attention = EXIT_ATTENTION_NEEDED, True
@@ -576,32 +698,18 @@ def _run_under_lock(
         f"{len(skipped_entries)} entries skipped"
         + (f"; {filter_line}" if filter_line else "")
     )
-    rs.write_summary(
-        _build_summary_md(
-            policy, all_repos=repos, passing_repos=passing_repos,
-            skipped_repos=skipped_repos, results=results, apply=True,
-            skipped_entries=skipped_entries, filter_line=filter_line,
-        )
-    )
     return _finish(
         rs, exit_code, summary=summary_text, policy=policy, attention=attention,
         all_repos=repos, passing_repos=passing_repos, skipped_repos=skipped_repos,
-        results=results, apply=True, skip_writing_summary=True,
+        results=results, scanned=scanned, now_iso=now_iso, apply=True,
         skipped_entries=skipped_entries, filter_line=filter_line,
     )
 
 
 def _finish_dry_run(
-    rs, policy, repos, passing_repos, skipped_repos, results,
-    delete_candidates, skip_list, skipped_entries, filter_line,
+    rs, policy, repos, passing_repos, skipped_repos, results, scanned,
+    now_iso, delete_candidates, skip_list, skipped_entries, filter_line,
 ) -> int:
-    rs.write_summary(
-        _build_summary_md(
-            policy, all_repos=repos, passing_repos=passing_repos,
-            skipped_repos=skipped_repos, results=results, apply=False,
-            skipped_entries=skipped_entries, filter_line=filter_line,
-        )
-    )
     if skipped_repos or skipped_entries:
         exit_code, attention = EXIT_INVARIANT_SKIPPED, True
     elif skip_list:
@@ -610,8 +718,6 @@ def _finish_dry_run(
         # Pending deletions in a dry run are NOT attention-worthy: routine
         # cleanup the user will confirm by re-running with --apply.
         exit_code, attention = EXIT_OK, False
-    for repo in passing_repos:
-        _record_repo_state(rs, repo.slug, results)
     summary_text = (
         f"dry-run: {len(delete_candidates)} branches would be deleted; "
         f"{len(skipped_repos)} repos skipped; "
@@ -621,33 +727,41 @@ def _finish_dry_run(
     return _finish(
         rs, exit_code, summary=summary_text, policy=policy, attention=attention,
         all_repos=repos, passing_repos=passing_repos, skipped_repos=skipped_repos,
-        results=results, apply=False, skip_writing_summary=True,
+        results=results, scanned=scanned, now_iso=now_iso, apply=False,
         skipped_entries=skipped_entries, filter_line=filter_line,
     )
 
 
 def _build_summary_md(
-    policy: Policy,
+    rows: list[dict],
     *,
     all_repos: list[RepoEntry],
     passing_repos: list[RepoEntry],
     skipped_repos: list[tuple[str, str]],
-    results: list[dict],
     apply: bool,
     skipped_entries: list[SkippedEntry] | None = None,
     filter_line: str | None = None,
 ) -> str:
+    """Render the plan as markdown. ``rows`` is the FULL plan (carried-forward
+    + freshly scanned, each row carrying a ``disposition``) plus this run's
+    transient error rows — so a partial apply shows accumulated dispositions
+    (node prnpl3kq)."""
     lines: list[str] = ["# gitbulk prune-branches", ""]
     lines.append(f"Mode: **{'APPLY' if apply else 'DRY-RUN'}**")
     if filter_line:
         lines.append(filter_line)
-    deletes = [r for r in results if r["decision"] == "delete"]
-    skips = [r for r in results if r["decision"] == "skip"]
-    errors = [r for r in results if r["decision"] == "error"]
+
+    delete_rows = [r for r in rows if r["decision"] == "delete"]
+    deleted = [r for r in delete_rows if _disposition_of(r) == "deleted"]
+    failed = [r for r in delete_rows if _disposition_of(r) == "failed"]
+    pending = [r for r in delete_rows if _disposition_of(r) == "pending"]
+    skips = [r for r in rows if r["decision"] == "skip"]
+    errors = [r for r in rows if r["decision"] == "error"]
+
     lines.append(
         f"Configured repos: {len(all_repos)}  Reachable: {len(passing_repos)}  "
         f"Skipped repos: {len(skipped_repos)}  "
-        f"Delete candidates: {len(deletes)}"
+        f"Delete candidates: {len(delete_rows)}"
     )
     lines.append("")
 
@@ -662,17 +776,21 @@ def _build_summary_md(
             lines.append(f"- line {entry.lineno} (`{entry.raw}`): {entry.reason}")
         lines.append("")
 
-    if deletes:
-        lines.append("## Deleted" if apply else "## Would delete")
-        for r in deletes:
-            status = ""
-            if apply:
-                status = " — FAILED: " + r["error"] if "error" in r else " — deleted"
+    def _emit(header: str, group: list[dict], suffix) -> None:
+        if not group:
+            return
+        lines.append(f"## {header}")
+        for r in group:
             lines.append(
                 f"- `{r['slug']}` `{r['branch']}` @ {r['sha'][:7]} "
-                f"({r['reason']}){status}"
+                f"({r['reason']}){suffix(r)}"
             )
         lines.append("")
+
+    _emit("Deleted", deleted, lambda r: " — deleted")
+    _emit("Deleted", failed, lambda r: " — FAILED: " + r.get("error", ""))
+    _emit("Would delete", pending, lambda r: "")
+
     if skips:
         lines.append("## Kept (guardrail)")
         for r in skips:
@@ -683,25 +801,10 @@ def _build_summary_md(
         for r in errors:
             lines.append(f"- `{r['slug']}` — {r['reason']}")
         lines.append("")
-    if not deletes and not skips and not errors:
+    if not delete_rows and not skips and not errors:
         lines.append("(no branches matched)")
         lines.append("")
     return "\n".join(lines)
-
-
-def _record_repo_state(rs: RunState, slug: str, results: list[dict]) -> None:
-    rows = [r for r in results if r["slug"] == slug]
-    if not rows:
-        return
-    rs.record_repo_state(
-        slug,
-        {
-            "branch_count": len(rows),
-            "branches": [
-                {k: v for k, v in r.items() if k != "slug"} for r in rows
-            ],
-        },
-    )
 
 
 def _finish(
@@ -716,25 +819,45 @@ def _finish(
     skipped_repos: list[tuple[str, str]],
     results: list[dict],
     apply: bool,
+    scanned: dict | None = None,
+    now_iso: str | None = None,
+    failed: bool = False,
     skipped_entries: list[SkippedEntry] | None = None,
     filter_line: str | None = None,
-    skip_writing_summary: bool = False,
 ) -> int:
-    if not skip_writing_summary:
-        synth = _build_summary_md(
-            policy, all_repos=all_repos, passing_repos=passing_repos,
-            skipped_repos=skipped_repos, results=results, apply=apply,
-            skipped_entries=skipped_entries, filter_line=filter_line,
-        )
-        rs.write_summary(f"# gitbulk prune-branches (FAILED)\n\n{summary}\n\n{synth}")
+    scanned = scanned or {}
     if attention:
         runid = _runid_from_run_dir(rs.run_dir)
         with sentinel_lock(timeout=_LOCK_TIMEOUT_SECONDS, subcommand="prune-branches"):
             sentinel.set_attention(exit_code, "prune-branches", runid, summary)
+    # The carry-forward read→merge→write→symlink-advance is one critical
+    # section under run_state_lock so two concurrent subset applies accumulate
+    # without losing each other's dispositions (node prnpl3kq; rsclk7nq §2 #1).
     with run_state_lock(
         "prune-branches", "exclusive", timeout=_LOCK_TIMEOUT_SECONDS,
         subcommand="prune-branches",
     ):
+        merged = _merge_plan(_load_latest_plan_repos(), scanned, results, now_iso)
+        rs.set_repos(merged)
+        rs.record_extra(
+            "prune_plan",
+            {
+                "version": _PLAN_VERSION,
+                "scope_slugs": sorted(r.slug for r in all_repos),
+            },
+        )
+        # Transient scan-failure rows aren't persisted in the plan (we keep the
+        # prior good entry), but they ARE surfaced in this run's summary.
+        current_errors = [r for r in results if r["decision"] == "error"]
+        body = _build_summary_md(
+            _flatten_plan(merged) + current_errors,
+            all_repos=all_repos, passing_repos=passing_repos,
+            skipped_repos=skipped_repos, apply=apply,
+            skipped_entries=skipped_entries, filter_line=filter_line,
+        )
+        if failed:
+            body = f"# gitbulk prune-branches (FAILED)\n\n{summary}\n\n{body}"
+        rs.write_summary(body)
         rs.complete(exit_code, retain_runs=policy.defaults.retain_runs)
     print(summary_line(
         f"gitbulk prune-branches: {summary}. View: gitbulk show prune-branches",

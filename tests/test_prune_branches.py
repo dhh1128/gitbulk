@@ -126,6 +126,14 @@ def _install(monkeypatch, fake):
     )
 
 
+def _latest_state():
+    import yaml as _yaml
+    return _yaml.safe_load(
+        (paths.latest_run_symlink("prune-branches").resolve() / "state.yaml")
+        .read_text()
+    )
+
+
 def _latest_summary():
     return (
         paths.latest_run_symlink("prune-branches").resolve() / "summary.md"
@@ -504,6 +512,192 @@ def test_parallel_apply_deletes_every_candidate(
     # delete_branch_calls.append is atomic in CPython, so the count is safe
     # to assert even under the thread pool.
     assert {c["slug"] for c in fake.delete_branch_calls} == set(slugs)
+
+
+# ─── plan persistence + dispositions + carry-forward (node prnpl3kq) ────────
+
+
+@pytest.mark.parametrize(
+    "row,expected",
+    [
+        ({"disposition": "already-gone"}, "already-gone"),  # explicit wins
+        ({"decision": "delete", "deleted": True}, "deleted"),
+        ({"decision": "delete", "error": "boom"}, "failed"),
+        ({"decision": "delete"}, "pending"),
+        ({"decision": "error"}, "error"),
+        ({"decision": "skip"}, "kept"),
+    ],
+)
+def test_disposition_of_derives_from_legacy_fields(row, expected):
+    assert pb._disposition_of(row) == expected
+
+
+def test_load_latest_plan_repos_no_prior_returns_empty(isolated_xdg):
+    assert pb._load_latest_plan_repos() == {}
+
+
+def _corrupt_latest_state(text):
+    (paths.latest_run_symlink("prune-branches").resolve() / "state.yaml").write_text(text)
+
+
+def _seed_one_repo_plan(monkeypatch, code_root, write_config, fresh_org_cache):
+    """Run a dry-run that produces a one-repo plan, returning the fake."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+        branches={"dhh1128/alpha": [_br(name="merged-feat", sha="a" * 40)]},
+        closed_prs_for_head={
+            ("dhh1128/alpha", "merged-feat"): [
+                _closed("dhh1128/alpha", 7, head_ref="merged-feat",
+                        head_sha="a" * 40, days_ago=30)
+            ],
+        },
+    )
+    _install(monkeypatch, fake)
+    prune_branches_handler(_args(code_root=code_root))
+    return fake
+
+
+def test_load_latest_plan_repos_tolerates_malformed_yaml(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    _seed_one_repo_plan(monkeypatch, code_root, write_config, fresh_org_cache)
+    _corrupt_latest_state("a: b: c")  # not valid YAML
+    assert pb._load_latest_plan_repos() == {}
+
+
+def test_load_latest_plan_repos_non_dict_top_level(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    _seed_one_repo_plan(monkeypatch, code_root, write_config, fresh_org_cache)
+    _corrupt_latest_state("- 1\n- 2\n")  # a list, not a mapping
+    assert pb._load_latest_plan_repos() == {}
+
+
+def test_load_latest_plan_repos_repos_not_a_mapping(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    _seed_one_repo_plan(monkeypatch, code_root, write_config, fresh_org_cache)
+    _corrupt_latest_state("schema_version: 1\nrepos: 5\n")
+    assert pb._load_latest_plan_repos() == {}
+
+
+def test_dry_run_writes_plan_with_pending_disposition(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    _seed_one_repo_plan(monkeypatch, code_root, write_config, fresh_org_cache)
+    state = _latest_state()
+    repo = state["repos"]["dhh1128/alpha"]
+    assert repo["default_branch"] == "main"
+    assert repo["analyzed_at"] is not None
+    br = repo["branches"][0]
+    assert br["branch"] == "merged-feat"
+    assert br["disposition"] == "pending"
+    assert br["acted_at"] is None
+    assert state["prune_plan"]["version"] == 2
+    assert state["prune_plan"]["scope_slugs"] == ["dhh1128/alpha"]
+
+
+def test_apply_marks_branch_deleted_in_plan(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+        branches={"dhh1128/alpha": [_br(name="merged-feat", sha="a" * 40)]},
+        closed_prs_for_head={
+            ("dhh1128/alpha", "merged-feat"): [
+                _closed("dhh1128/alpha", 7, head_ref="merged-feat",
+                        head_sha="a" * 40, days_ago=30)
+            ],
+        },
+    )
+    _install(monkeypatch, fake)
+    prune_branches_handler(_args(apply=True, code_root=code_root))
+    br = _latest_state()["repos"]["dhh1128/alpha"]["branches"][0]
+    assert br["disposition"] == "deleted"
+    assert br["acted_at"] is not None
+    assert br["acted_mode"] == "apply"
+
+
+def _two_repo_fake():
+    slugs = ["dhh1128/a", "dhh1128/b"]
+    return slugs, FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={s: "main" for s in slugs},
+        my_open_prs={s: [] for s in slugs},
+        branches={s: [_br(name="merged-feat", sha="a" * 40)] for s in slugs},
+        closed_prs_for_head={
+            (s, "merged-feat"): [
+                _closed(s, 7, head_ref="merged-feat", head_sha="a" * 40,
+                        days_ago=30)
+            ]
+            for s in slugs
+        },
+    )
+
+
+def test_partial_apply_accumulates_and_carries_forward(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    slugs, fake = _two_repo_fake()
+    write_config(repos_slugs=slugs)
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    _install(monkeypatch, fake)
+    # 1) full-fleet dry run → both pending.
+    prune_branches_handler(_args(code_root=code_root))
+    s1 = _latest_state()["repos"]
+    assert s1["dhh1128/a"]["branches"][0]["disposition"] == "pending"
+    assert s1["dhh1128/b"]["branches"][0]["disposition"] == "pending"
+    # 2) apply only repo a → a deleted, b CARRIED FORWARD as pending.
+    prune_branches_handler(
+        _args(apply=True, code_root=code_root, repo=["dhh1128/a"])
+    )
+    s2 = _latest_state()["repos"]
+    assert s2["dhh1128/a"]["branches"][0]["disposition"] == "deleted"
+    assert s2["dhh1128/b"]["branches"][0]["disposition"] == "pending"
+    assert fake.delete_branch_calls == [{"slug": "dhh1128/a", "branch": "merged-feat"}]
+    summary = _latest_summary()
+    assert "## Deleted" in summary and "## Would delete" in summary
+
+
+def test_two_subset_applies_accumulate(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    slugs, fake = _two_repo_fake()
+    write_config(repos_slugs=slugs)
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    _install(monkeypatch, fake)
+    prune_branches_handler(_args(code_root=code_root))            # plan
+    prune_branches_handler(_args(apply=True, code_root=code_root, repo=["dhh1128/a"]))
+    prune_branches_handler(_args(apply=True, code_root=code_root, repo=["dhh1128/b"]))
+    s = _latest_state()["repos"]
+    assert s["dhh1128/a"]["branches"][0]["disposition"] == "deleted"
+    assert s["dhh1128/b"]["branches"][0]["disposition"] == "deleted"
+
+
+def test_failed_preflight_preserves_prior_plan(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """A later run that aborts in preflight must not wipe the plan — the
+    prior entry is carried forward."""
+    _seed_one_repo_plan(monkeypatch, code_root, write_config, fresh_org_cache)
+    # Second run aborts in the universal preflight (structural failure).
+    monkeypatch.setattr(pb, "run_chain", _fake_run_chain(fail={"global"}))
+    rc = prune_branches_handler(_args(code_root=code_root))
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    # Plan survived: alpha still present and pending.
+    br = _latest_state()["repos"]["dhh1128/alpha"]["branches"][0]
+    assert br["disposition"] == "pending"
 
 
 def test_org_refresh_failure_aborts(

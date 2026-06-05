@@ -210,6 +210,38 @@ def test_record_repo_state_leaves_no_tmp_file(isolated_cache):
     assert not (rs.run_dir / "state.yaml.tmp").exists()
 
 
+# ─── set_repos() ───────────────────────────────────────────────────────────
+
+
+def test_set_repos_replaces_whole_map_in_one_write(isolated_cache):
+    rs = RunState.begin("prune-branches", [], {})
+    rs.record_repo_state("owner/old", {"x": 1})
+    rs.set_repos({"owner/a": {"v": 1}, "owner/b": {"v": 2}})
+    state = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
+    # The earlier "owner/old" is gone — set_repos REPLACES, not merges.
+    assert state["repos"] == {"owner/a": {"v": 1}, "owner/b": {"v": 2}}
+
+
+def test_set_repos_preserves_extras(isolated_cache):
+    rs = RunState.begin("prune-branches", [], {})
+    rs.record_extra("prune_plan", {"scope_slugs": ["o/a"]})
+    rs.set_repos({"o/a": {"v": 1}})
+    state = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
+    assert state["prune_plan"] == {"scope_slugs": ["o/a"]}
+    assert state["repos"] == {"o/a": {"v": 1}}
+
+
+def test_set_repos_deep_copies_input(isolated_cache):
+    rs = RunState.begin("prune-branches", [], {})
+    payload = {"o/a": {"branches": [1]}}
+    rs.set_repos(payload)
+    payload["o/a"]["branches"].append(2)  # mutate caller's nested list
+    rs.record_extra("k", "v")  # forces a re-dump of _per_repo
+    state = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
+    # Deep copy means the caller's later mutation never reached the re-dump.
+    assert state["repos"]["o/a"]["branches"] == [1]
+
+
 # ─── record_extra() ────────────────────────────────────────────────────────
 
 
