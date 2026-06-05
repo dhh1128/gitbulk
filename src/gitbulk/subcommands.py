@@ -13,10 +13,6 @@ See this.i node ``smodlpr3`` for the contract; ``scinv4qm`` for the
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
-
-LockMode = Literal["shared", "exclusive"]
-
 
 # Phase 2 invariant chains (this.i node ``ph2inv4n``). Ordering is
 # UNIVERSAL → PER_REPO → PER_PR per ``c4jzm5pn``; the chain runner
@@ -139,9 +135,6 @@ class Subcommand:
     help: str
     mutating: bool
     """When True, the subcommand defaults to --dry-run (per node 2vqp4nk6)."""
-    lock_mode: LockMode
-    """Global lock mode this subcommand acquires (per node lj5pqn4kr).
-    Mutating subcommands take exclusive; read-only take shared."""
     needs_clone: bool
     """When True, the local.exists invariant (node 5xqp2nkr) applies."""
     invariant_chain: tuple[str, ...] = field(default=())
@@ -165,7 +158,6 @@ KNOWN: tuple[Subcommand, ...] = (
         name="report",
         help="Summarize the state of your open PRs across all repos.",
         mutating=False,
-        lock_mode="shared",
         needs_clone=False,
         invariant_chain=_GH_TOUCHING_CHAIN,
         sets_attention=True,
@@ -174,7 +166,6 @@ KNOWN: tuple[Subcommand, ...] = (
         name="summarize",
         help="Run Claude over a previous report to prioritize attention.",
         mutating=False,
-        lock_mode="shared",
         needs_clone=False,
         invariant_chain=_GH_TOUCHING_CHAIN,
         sets_attention=True,
@@ -183,7 +174,6 @@ KNOWN: tuple[Subcommand, ...] = (
         name="dispatch",
         help="Launch headless Claude agents against PRs matching a filter.",
         mutating=True,
-        lock_mode="exclusive",
         needs_clone=True,
         invariant_chain=_CLONE_TOUCHING_CHAIN,
         sets_attention=True,
@@ -192,7 +182,6 @@ KNOWN: tuple[Subcommand, ...] = (
         name="merge",
         help="Auto-merge PRs that satisfy the per-repo merge policy.",
         mutating=True,
-        lock_mode="exclusive",
         needs_clone=False,
         invariant_chain=_MERGE_CHAIN,
         sets_attention=True,
@@ -201,7 +190,6 @@ KNOWN: tuple[Subcommand, ...] = (
         name="rebase-pr",
         help="Rebase your behind/conflicting PRs onto their current base.",
         mutating=True,
-        lock_mode="exclusive",
         needs_clone=True,
         invariant_chain=_REBASE_PR_CHAIN,
         sets_attention=True,
@@ -210,7 +198,6 @@ KNOWN: tuple[Subcommand, ...] = (
         name="close-stale",
         help="Close PRs that are inactive past the configured threshold.",
         mutating=True,
-        lock_mode="exclusive",
         needs_clone=False,
         invariant_chain=_CLOSE_STALE_CHAIN,
         sets_attention=True,
@@ -219,7 +206,6 @@ KNOWN: tuple[Subcommand, ...] = (
         name="prune-branches",
         help="Delete remote branches whose only PRs are merged or closed.",
         mutating=True,
-        lock_mode="exclusive",
         needs_clone=False,
         invariant_chain=_PRUNE_BRANCHES_CHAIN,
         sets_attention=True,
@@ -228,7 +214,6 @@ KNOWN: tuple[Subcommand, ...] = (
         name="prune-worktrees",
         help="Remove local worktrees whose branch's only PRs are merged/closed.",
         mutating=True,
-        lock_mode="exclusive",
         needs_clone=True,
         invariant_chain=_PRUNE_WORKTREES_CHAIN,
         sets_attention=True,
@@ -237,7 +222,6 @@ KNOWN: tuple[Subcommand, ...] = (
         name="show",
         help="Show the latest run of a given subcommand.",
         mutating=False,
-        lock_mode="shared",
         needs_clone=False,
         invariant_chain=(),
     ),
@@ -245,7 +229,6 @@ KNOWN: tuple[Subcommand, ...] = (
         name="ack",
         help="Clear the ATTENTION sentinel after you have reviewed it.",
         mutating=False,
-        lock_mode="shared",
         needs_clone=False,
         invariant_chain=(),
     ),
@@ -253,7 +236,6 @@ KNOWN: tuple[Subcommand, ...] = (
         name="invariants",
         help="List the invariant registry and which subcommands use them.",
         mutating=False,
-        lock_mode="shared",
         needs_clone=False,
         invariant_chain=(),
     ),
