@@ -630,6 +630,23 @@ def test_working_directory_honored(claude_fake, tmp_log_dir, tmp_path):
 # ─── CTRL+C / drain semantics ──────────────────────────────────────────────
 
 
+def _install_ctx_capture(monkeypatch) -> dict:
+    """Wrap the internal ``_install_sigint_handler`` so a test can read the
+    run's ``_RunCtx`` and synchronise on ``stop_event`` actually being set,
+    instead of racing the async signal with a fixed sleep. Returns a dict that
+    gets a ``"ctx"`` key once the run installs its handler. Zero production
+    change — the function already receives the ctx."""
+    captured: dict = {}
+    real_install = exec_mod._install_sigint_handler
+
+    def _capturing_install(ctx):
+        captured["ctx"] = ctx
+        return real_install(ctx)
+
+    monkeypatch.setattr(exec_mod, "_install_sigint_handler", _capturing_install)
+    return captured
+
+
 def test_sigint_drains_remaining_queued_targets(
     claude_fake, tmp_log_dir, tmp_wd, monkeypatch
 ):
@@ -639,19 +656,9 @@ def test_sigint_drains_remaining_queued_targets(
     monkeypatch.setattr(exec_mod, "_MONITOR_TICK_SECONDS", 0.005)
     script = _FakeRunnerScript()
 
-    # Capture the run's _RunCtx so the signaler can synchronise on stop_event
-    # ACTUALLY being set by the handler, instead of betting on a fixed sleep
-    # (the bet raced the async signal delivery and made this test flaky).
-    # _install_sigint_handler already receives the ctx, so wrapping it is a
-    # zero-production-change seam.
-    captured: dict = {}
-    _real_install = exec_mod._install_sigint_handler
-
-    def _capturing_install(ctx):
-        captured["ctx"] = ctx
-        return _real_install(ctx)
-
-    monkeypatch.setattr(exec_mod, "_install_sigint_handler", _capturing_install)
+    # Synchronise on stop_event actually being set by the handler, instead of
+    # betting on a fixed sleep (the bet raced async signal delivery → flaky).
+    captured = _install_ctx_capture(monkeypatch)
 
     # Target 0 hangs on a barrier so it's still in-flight when we
     # signal. Targets 1 and 2 are queued and should become interrupted.
@@ -667,19 +674,24 @@ def test_sigint_drains_remaining_queued_targets(
     # after stop_event is set — so t1/t2 are guaranteed to be dequeued with it
     # already set (concurrency=1 keeps the worker blocked on t0 until then).
     def signaler():
-        # Wait for the first FakePopen AND the captured ctx (both exist well
-        # before t0 finishes, since the worker is blocked on the barrier).
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline and not (
-            script.created and "ctx" in captured
-        ):
-            time.sleep(0.001)
-        # Send SIGINT to ourselves → the handler sets stop_event.
-        os.kill(os.getpid(), signal.SIGINT)
-        # Deterministic gate: only release the in-flight worker once the
-        # handler has observably set stop_event.
-        assert captured["ctx"].stop_event.wait(timeout=5.0)
-        barrier.set()
+        try:
+            # Wait for the first FakePopen AND the captured ctx (both exist
+            # well before t0 finishes — the worker is blocked on the barrier).
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not (
+                script.created and "ctx" in captured
+            ):
+                time.sleep(0.001)
+            # Send SIGINT to ourselves → the handler sets stop_event.
+            os.kill(os.getpid(), signal.SIGINT)
+            # Deterministic gate: release t0 only once the handler has
+            # observably set stop_event, so t1/t2 are dequeued with it set.
+            captured["ctx"].stop_event.wait(timeout=5.0)
+        finally:
+            # ALWAYS release t0 — a missed signal would otherwise hang the
+            # main thread forever on future.result(). A failed sync degrades
+            # to a clean assertion failure below, never a deadlock.
+            barrier.set()
 
     threading.Thread(target=signaler, daemon=True).start()
     results = execute_targets(
@@ -705,26 +717,46 @@ def test_second_sigint_within_window_signals_active_children(
     in-flight child."""
     monkeypatch.setattr(exec_mod, "_MONITOR_TICK_SECONDS", 0.005)
     monkeypatch.setattr(exec_mod, "_TERM_TO_KILL_GRACE_SECONDS", 0.05)
+    captured = _install_ctx_capture(monkeypatch)
     script = _FakeRunnerScript()
     barrier = threading.Event()
     script.barriers["hang-me"] = barrier
     targets = [ExecTarget("t0", tmp_wd, "hang-me")]
 
     def signaler():
-        for _ in range(200):
-            if script.created:
-                break
-            time.sleep(0.005)
-        # First SIGINT: drain.
-        os.kill(os.getpid(), signal.SIGINT)
-        time.sleep(0.01)
-        # Second SIGINT inside the window: hard kill.
-        os.kill(os.getpid(), signal.SIGINT)
-        # Give the hard-kill thread time to send SIGTERM.
-        time.sleep(0.1)
-        # Release the barrier so the worker can finish in case it
-        # didn't already.
-        barrier.set()
+        try:
+            # Wait for t0 in-flight AND the captured ctx.
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not (
+                script.created and "ctx" in captured
+            ):
+                time.sleep(0.001)
+            ctx = captured["ctx"]
+            # First SIGINT (REAL): drain. Wait until the handler has set
+            # stop_event (and, before it, first_sigint_at) so the second call
+            # is classified as "within the hard-kill window".
+            os.kill(os.getpid(), signal.SIGINT)
+            ctx.stop_event.wait(timeout=5.0)
+            # The child lands in script.created a few lines BEFORE it registers
+            # in ctx.active; the hard-kill handler reads ctx.active, so wait for
+            # the registration (not just the launch).
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                with ctx.lock:
+                    if ctx.active:
+                        break
+                time.sleep(0.001)
+            # Second SIGINT inside the window → hard kill. Invoke the INSTALLED
+            # handler directly rather than racing a second async OS delivery
+            # (which was the flake): it sends SIGTERM to active children
+            # synchronously, so it's recorded before we release the child.
+            # Real signal delivery is still exercised by the first SIGINT.
+            handler = signal.getsignal(signal.SIGINT)
+            handler(signal.SIGINT, None)
+        finally:
+            # ALWAYS release the child — never let a missed sync hang the main
+            # thread on future.result(); degrade to a clean failure instead.
+            barrier.set()
 
     threading.Thread(target=signaler, daemon=True).start()
     results = execute_targets(
