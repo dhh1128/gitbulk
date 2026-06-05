@@ -367,11 +367,26 @@ This repository has an established test suite. Follow strict TDD:
 
 ## CI and Documentation
 
-This repo has no CI workflows. Until it does, any time you make code
-changes to the user, propose an appropriate set of GitHub actions (e.g.,
-`.github/workflows/ci.yml`) that builds and runs tests on every push and
-pull request. Propose to remove this instruction from AGENTS.md on the
-same commit.
+This repo HAS CI workflows in `.github/workflows/`:
+
+- `ci.yml` — runs on every push to `main` and on every pull request. It
+  runs the test suite across a Python matrix (3.10 and 3.12) behind a 100%
+  branch-coverage gate, a separate real-binary e2e job (bubblewrap sandbox +
+  isolated clone), a release-asset build/validation job (exercises the
+  release path without publishing), a Trojan-Source/invisible-Unicode guard
+  (`scripts/check_unicode.py`), and `actionlint`.
+- `release.yml` — tag-triggered (`v*`); verifies the tag matches the package
+  version, builds the single-file zipapp binary plus `update.json`, and
+  publishes both as GitHub release assets.
+- `deploy-docs.yml` — builds the Zensical docs site and deploys it to GitHub
+  Pages (runs on `main` when docs change, or via manual dispatch).
+- `copilot-review-gate.yml` — requests or removes Copilot as a PR reviewer
+  based on the PR title/labels (e.g. the `[no-ccr]` / `no-ccr` convention).
+
+When you change code, MAINTAIN these workflows: keep them green and update
+them as needed (e.g. when adding a dependency, a Python version, or a new
+build step). Do NOT propose creating new CI workflows that duplicate what
+already exists here.
 
 When writing or modifying GitHub Actions workflows, always use the latest
 stable release of each action. Avoid versions pinned to Node.js 16 or
