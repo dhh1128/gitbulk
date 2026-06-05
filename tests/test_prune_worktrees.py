@@ -26,7 +26,6 @@ from gitbulk.commands.prune_worktrees import (
 )
 from gitbulk.config.policy import Policy
 from gitbulk.gh import FakeGHClient, GHError
-from gitbulk.org_members_cache import CachedMembers, save_cache
 from gitbulk.pr_info import ClosedPRRef, PRInfo
 from gitbulk.worktree import WorktreeEntry, WorktreeError
 
@@ -34,21 +33,9 @@ from gitbulk.worktree import WorktreeEntry, WorktreeError
 # ─── fixtures ──────────────────────────────────────────────────────────────
 
 
-@pytest.fixture
-def isolated_xdg(monkeypatch, tmp_path):
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    paths.ensure_directories()
-    return tmp_path
-
-
-@pytest.fixture
-def code_root(tmp_path):
-    root = tmp_path / "code"
-    root.mkdir()
-    return root
-
-
+# isolated_xdg, code_root, and fresh_org_cache live in tests/conftest.py
+# (shared across the command tests). write_config stays local because it
+# materializes REAL git repos with an origin remote (not empty dirs).
 @pytest.fixture
 def write_config(isolated_xdg, code_root):
     def _write(*, repos_slugs):
@@ -76,16 +63,6 @@ def write_config(isolated_xdg, code_root):
         return cfg_dir
 
     return _write
-
-
-@pytest.fixture
-def fresh_org_cache():
-    def _save(org, members):
-        save_cache(CachedMembers(
-            org=org, fetched_at=datetime.now(timezone.utc),
-            members=frozenset(members),
-        ))
-    return _save
 
 
 def _args(*, apply=False, code_root=None, skip_check=None,
