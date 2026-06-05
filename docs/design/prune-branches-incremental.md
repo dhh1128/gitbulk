@@ -390,5 +390,3 @@ fresh re-validation stub so no unsafe delete is ever possible in between.
   handled by the per-slug membership test in §4, not the digest).
 - **Coverage:** 100% branch coverage stands (AGENTS.md); the new branches
   (reuse/skip/refuse/tolerate) are all exercised by the P2–P4 tests above.
-</content>
-</invoke>

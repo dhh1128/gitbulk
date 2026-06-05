@@ -582,9 +582,18 @@ def _load_latest_plan_repos() -> dict:
     """The ``repos`` map of the most recent prune-branches plan, or ``{}``.
 
     Read from the ``latest-prune-branches`` symlink, which still points at the
-    PRIOR run until this run's :meth:`RunState.complete`. Must be called inside
-    ``run_state_lock`` so the read→merge→advance is atomic against a concurrent
-    apply (node prnpl3kq; rsclk7nq §2 row 1)."""
+    PRIOR run until this run's :meth:`RunState.complete`. Called from two
+    places (node prnpl3kq):
+
+      - the handler, BEFORE the scan, as a best-effort freshness heuristic
+        (which repos to reuse vs re-scan) — NOT under any lock; a slightly
+        stale read here only ever mis-picks a repo to reuse/rescan, which is
+        harmless.
+      - :func:`_finish`, INSIDE ``run_state_lock``, for the carry-forward
+        merge: there the read→merge→write→symlink-advance must be one atomic
+        critical section so concurrent subset applies don't lose each other's
+        dispositions (rsclk7nq §2 row 1). The lock is a requirement of THAT
+        call site, not of this function."""
     symlink = paths.latest_run_symlink("prune-branches")
     try:
         state_path = symlink.resolve(strict=True) / "state.yaml"
@@ -1043,7 +1052,7 @@ def _build_summary_md(
         if _disposition_of(r) == "already-gone"
         else " — deleted",
     )
-    _emit("Deleted", failed, lambda r: " — FAILED: " + r.get("error", ""))
+    _emit("Failed to delete", failed, lambda r: " — " + r.get("error", ""))
     _emit(
         "Refused (plan stale)", refused,
         lambda r: " — " + r.get("refuse_reason", "unsafe drift"),

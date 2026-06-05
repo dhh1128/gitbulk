@@ -363,7 +363,9 @@ def test_apply_delete_failure_raises_attention(
     rc = prune_branches_handler(_args(apply=True, code_root=code_root))
     assert rc == EXIT_ATTENTION_NEEDED
     assert sentinel.has_attention()
-    assert "FAILED" in _latest_summary()
+    summary = _latest_summary()
+    assert "## Failed to delete" in summary   # distinct header, not a 2nd "## Deleted"
+    assert "403 protected" in summary
 
 
 def test_open_head_branch_is_kept(
