@@ -40,6 +40,12 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
+        with:
+          # Deploy publishes via the official Pages actions (upload-pages-
+          # artifact + deploy-pages, which use the job's id-token), not a
+          # credentialed `git push`, so the persisted git token is unused —
+          # don't bake it into .git/config.
+          persist-credentials: false
 
       - name: Install uv
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
