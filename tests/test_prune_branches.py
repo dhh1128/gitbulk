@@ -456,13 +456,28 @@ def test_resolve_concurrency_floors_at_one():
     assert pb._resolve_concurrency(_args(concurrency=-5), Policy()) == 1
 
 
-def test_parallel_scan_surfaces_all_candidates_in_repo_order(
+def test_parallel_scan_surfaces_all_candidates_in_slug_sorted_order(
     monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
 ):
-    """With concurrency>1 the two-pass scan must still surface every
-    candidate and lay them out in passing-repos order — byte-for-byte the
-    sequential result."""
-    slugs = [f"dhh1128/r{i}" for i in range(4)]
+    """With concurrency>1 the two-pass scan must surface every candidate, and
+    the rendered summary must list them in **slug-sorted** order regardless of
+    repos.txt order or thread completion order.
+
+    The summary is built from ``_flatten_plan(merged)`` which iterates
+    ``sorted(merged)`` — so the guaranteed, deterministic ordering of the
+    *report* is by slug, NOT by repos.txt input order. (The internal scan
+    result list does preserve input order via ``parallel_map``, but that is
+    not what the user-visible summary renders.)
+
+    The inputs here are deliberately NON-alphabetical (``r3, r1, r0, r2``) so
+    this assertion genuinely distinguishes "slug-sorted" from "input order" and
+    from "thread-completion order": a regression that emitted rows in repos.txt
+    order — or in whatever order the pool happened to finish — would now fail,
+    whereas the old alphabetical-input fixture would have passed either way.
+    """
+    # repos.txt order intentionally differs from sorted-slug order.
+    slugs = ["dhh1128/r3", "dhh1128/r1", "dhh1128/r0", "dhh1128/r2"]
+    assert slugs != sorted(slugs), "fixture must be non-alphabetical to be meaningful"
     write_config(repos_slugs=slugs)
     fresh_org_cache("provenant-dev", ["dhh1128"])
     branches = {s: [_br(name="merged-feat", sha="a" * 40)] for s in slugs}
@@ -484,9 +499,14 @@ def test_parallel_scan_surfaces_all_candidates_in_repo_order(
     rc = prune_branches_handler(_args(code_root=code_root, concurrency=4))
     assert rc == EXIT_OK
     summary = _latest_summary()
-    # Every repo's candidate is present, listed in repos.txt order.
-    positions = [summary.index(s) for s in slugs]
-    assert positions == sorted(positions)
+    # Every repo's candidate is present...
+    positions = {s: summary.index(s) for s in slugs}
+    assert all(s in summary for s in slugs)
+    # ...and they are rendered in slug-SORTED order, which is distinct from the
+    # repos.txt input order above — so this catches a reorder regression.
+    rendered_order = sorted(slugs, key=lambda s: positions[s])
+    assert rendered_order == sorted(slugs)
+    assert rendered_order != slugs  # guards against an accidental input==sorted fixture
     assert fake.call_count["closed_prs_for_head"] == 4
 
 
