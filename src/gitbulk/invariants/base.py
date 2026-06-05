@@ -8,11 +8,19 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 from gitbulk.config.policy import Policy
 from gitbulk.config.repos import RepoEntry
 from gitbulk.runstate import RunState
+
+if TYPE_CHECKING:
+    # Type-check-only imports: ``from __future__ import annotations`` keeps
+    # these annotations as strings, so importing the real types here (rather
+    # than at runtime) types ``pr``/``gh`` precisely without risking an import
+    # cycle through gh.py / pr_info.py.
+    from gitbulk.gh import GHClient
+    from gitbulk.pr_info import PRInfo
 
 
 @dataclass(frozen=True)
@@ -64,8 +72,8 @@ class InvariantContext:
     policy: Policy
     runstate: RunState
     repo: RepoEntry | None = None
-    pr: Any = None  # PRInfo | None — defined in Phase 2
-    gh: Any = None  # GHClient | None — defined in Phase 2
+    pr: PRInfo | None = None
+    gh: GHClient | None = None
 
 
 class Invariant(ABC):

@@ -35,25 +35,24 @@ def test_subcommand_dataclass_is_frozen():
 
 
 @pytest.mark.parametrize(
-    "name,mutating,lock_mode,needs_clone",
+    "name,mutating,needs_clone",
     [
-        ("report", False, "shared", False),
-        ("summarize", False, "shared", False),
-        ("dispatch", True, "exclusive", True),
-        ("merge", True, "exclusive", False),
-        ("rebase-pr", True, "exclusive", True),
-        ("close-stale", True, "exclusive", False),
-        ("prune-branches", True, "exclusive", False),
-        ("prune-worktrees", True, "exclusive", True),
-        ("show", False, "shared", False),
-        ("ack", False, "shared", False),
-        ("invariants", False, "shared", False),
+        ("report", False, False),
+        ("summarize", False, False),
+        ("dispatch", True, True),
+        ("merge", True, False),
+        ("rebase-pr", True, True),
+        ("close-stale", True, False),
+        ("prune-branches", True, False),
+        ("prune-worktrees", True, True),
+        ("show", False, False),
+        ("ack", False, False),
+        ("invariants", False, False),
     ],
 )
-def test_subcommand_metadata(name, mutating, lock_mode, needs_clone):
+def test_subcommand_metadata(name, mutating, needs_clone):
     sc = by_name(name)
     assert sc.mutating == mutating
-    assert sc.lock_mode == lock_mode
     assert sc.needs_clone == needs_clone
 
 
@@ -62,32 +61,14 @@ def test_by_name_unknown_raises_keyerror():
         by_name("definitely-not-a-subcommand")
 
 
-def test_mutating_subcommands_take_exclusive_lock():
-    """Invariant from node lj5pqn4kr: every mutating subcommand uses exclusive."""
-    for sc in KNOWN:
-        if sc.mutating:
-            assert sc.lock_mode == "exclusive", (
-                f"{sc.name} is mutating but lock_mode={sc.lock_mode!r}"
-            )
-
-
-def test_read_only_subcommands_take_shared_lock():
-    """Symmetric: every read-only subcommand uses shared lock."""
-    for sc in KNOWN:
-        if not sc.mutating:
-            assert sc.lock_mode == "shared", (
-                f"{sc.name} is read-only but lock_mode={sc.lock_mode!r}"
-            )
-
-
 def test_help_strings_are_non_empty():
     for sc in KNOWN:
         assert sc.help.strip(), f"{sc.name} has empty help string"
 
 
 def test_subcommand_equality_by_value():
-    a = Subcommand("x", "h", mutating=False, lock_mode="shared", needs_clone=False)
-    b = Subcommand("x", "h", mutating=False, lock_mode="shared", needs_clone=False)
+    a = Subcommand("x", "h", mutating=False, needs_clone=False)
+    b = Subcommand("x", "h", mutating=False, needs_clone=False)
     assert a == b
 
 
@@ -95,7 +76,7 @@ def test_subcommand_equality_by_value():
 
 
 def test_subcommand_has_invariant_chain_default_empty():
-    sc = Subcommand("x", "h", mutating=False, lock_mode="shared", needs_clone=False)
+    sc = Subcommand("x", "h", mutating=False, needs_clone=False)
     assert sc.invariant_chain == ()
 
 
@@ -222,7 +203,7 @@ def test_subcommand_invariant_chain(name, expected_chain):
 
 
 def test_subcommand_has_sets_attention_default_false():
-    sc = Subcommand("x", "h", mutating=False, lock_mode="shared", needs_clone=False)
+    sc = Subcommand("x", "h", mutating=False, needs_clone=False)
     assert sc.sets_attention is False
 
 
