@@ -36,6 +36,21 @@ jobs:
       - name: Install package from lockfile
         run: uv sync --frozen --extra test
 
+      # Re-run the hermetic 100%-branch-coverage gate before building the
+      # published artifact: scripts/release.py runs it locally pre-tag, but the
+      # tag-triggered publish job must independently prove the binary it ships
+      # passed its tests (OPS-F1). Mirrors ci.yml's gate on Python 3.12 only;
+      # 3.10 compat is covered by ci.yml's matrix on the merge that produced
+      # the tag, so gating the build on the 3.12 hermetic run is sufficient.
+      - name: Run tests with branch coverage gate
+        run: |
+          uv run --python 3.12 pytest -v \
+            -m "not e2e" \
+            --cov=src/gitbulk \
+            --cov-branch \
+            --cov-report=term-missing \
+            --cov-fail-under=100
+
       - name: Check tagged version matches package version
         run: |
           set -euo pipefail
