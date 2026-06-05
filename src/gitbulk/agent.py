@@ -30,9 +30,11 @@ Security contract (threat-model §5, this.i ``agtmpl9k`` / ``agdang5k``):
     cloud creds it was not explicitly granted. ``env: None`` (the default)
     inherits the full environment for backward compatibility.
 
-The ``claude`` default is intentionally served by the native
-:class:`~gitbulk.claude.ProductionClaudeClient` so the no-config path stays
-byte-identical to pre-feature behavior.
+The ``claude`` default is just another :data:`PRESETS` entry driven by
+:class:`CommandAgentBackend`, exactly like every other agent (SEC-F1). It ships
+its own ``env`` allowlist, so the no-config cron dispatch path is *secure by
+default*: it no longer inherits the operator's ``GH_TOKEN`` / SSH agent / cloud
+creds. There is no special-cased native client.
 """
 
 from __future__ import annotations
@@ -48,7 +50,6 @@ from gitbulk.claude import (
     AgentInvocation,
     ClaudeError,
     ClaudeTimeoutError,
-    ProductionClaudeClient,
 )
 from gitbulk.config.repos import ConfigError
 from gitbulk.sandbox import SANDBOX_NONE, bwrap_available, wrap_argv
@@ -143,10 +144,31 @@ PRESETS: dict[str, AgentProfile] = {
         command=("claude", "-p", PROMPT_PLACEHOLDER, "--dangerously-skip-permissions"),
         model_args=("--model", MODEL_PLACEHOLDER),
         model="claude-sonnet-4-6",
+        # SECURE BY DEFAULT (SEC-F1): like every other preset, claude ships an
+        # ``env`` allowlist so the default no-config cron dispatch path does NOT
+        # inherit the operator's GH_TOKEN / SSH agent / AWS / npm creds — only
+        # claude's own API/auth vars plus the minimal safe base reach the child.
+        # OAuth login still works: those credentials live in ``~/.claude``
+        # (filesystem, reached via HOME in the base) and ``sandbox: none`` (the
+        # default) keeps HOME. Bedrock/Vertex/custom-gateway users grant their
+        # creds (AWS_*, GOOGLE_*, …) by extending ``agents.claude.env`` in
+        # config — an override REPLACES this list, so re-list these vars plus
+        # the additions. Flags verified non-deprecated vs the claude CLI
+        # 2026-05-28; the var names below are claude CLI auth/endpoint vars and
+        # should be re-verified when that CLI changes.
+        env=(
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "ANTHROPIC_MODEL",
+            "ANTHROPIC_SMALL_FAST_MODEL",
+        ),
     ),
-    # Non-claude presets are SECURE BY DEFAULT (SEC-F2): each ships an ``env``
-    # allowlist so the agent gets only its own API credential plus the minimal
-    # safe base — NOT the operator's GH_TOKEN / SSH agent / AWS / npm tokens.
+    # The non-claude presets are SECURE BY DEFAULT the same way (SEC-F2): each
+    # ships an ``env`` allowlist so the agent gets only its own API credential
+    # plus the minimal safe base — NOT the operator's GH_TOKEN / SSH agent /
+    # AWS / npm tokens.
     # (The exact var names, like the flags, must be verified against each CLI;
     # extend the allowlist in config if a tool needs more.) Note: env scoping
     # stops *environment*-borne secret leakage only — filesystem isolation
@@ -192,8 +214,7 @@ def _pin_binary(cmd0: str) -> str:
     - Bare name (no ``/``) → :func:`shutil.which`, so a later ``PATH`` prepend
       cannot substitute it; falls back to the bare name when unresolved (a
       missing binary then surfaces as a per-target launch failure rather than
-      aborting the whole run — mirrors :class:`ProductionClaudeClient`, and an
-      absent binary cannot be PATH-hijacked).
+      aborting the whole run, and an absent binary cannot be PATH-hijacked).
     - Relative *path* (contains ``/`` but not absolute) → resolved against cwd;
       a non-existent one is a config error (it cannot be PATH-resolved, so a
       typo would otherwise fail confusingly mid-run).
@@ -555,25 +576,17 @@ def backend_for(
 ):
     """Build the effective :class:`~gitbulk.claude.AgentBackend` for a run/target.
 
-    The ``claude`` default is served by the native
-    :class:`ProductionClaudeClient` so the no-config path is byte-identical to
-    pre-feature behavior; every other agent uses :class:`CommandAgentBackend`,
-    which applies the profile's sandbox (subject to ``policy.sandbox_fallback``)
-    and any injected ``token_env`` (scoped-token seam, this.i agtok2n).
+    Every agent — ``claude`` included (SEC-F1) — is driven by
+    :class:`CommandAgentBackend` from its :class:`AgentProfile`, which applies
+    the profile's ``env`` allowlist, its sandbox (subject to
+    ``policy.sandbox_fallback``), and any injected ``token_env`` (scoped-token
+    seam, this.i agtok2n). There is no special-cased native claude client.
 
     Raises :class:`AgentConfigError` if the profile requires a sandbox the host
     cannot provide and the fallback policy is ``refuse`` (the default).
     """
     name = resolve_agent_name(policy, requested, slug=slug)
     profile = resolve_profile(policy, name)
-    if name == "claude":
-        # The trusted native path: no generic sandbox/token plumbing.
-        kwargs: dict = {}
-        if profile.model is not None:
-            kwargs["default_model"] = profile.model
-        if profile.timeout is not None:
-            kwargs["default_timeout"] = profile.timeout
-        return ProductionClaudeClient(**kwargs)
     fallback = getattr(policy, "sandbox_fallback", None) or SANDBOX_FALLBACK_REFUSE
     return CommandAgentBackend(
         profile,

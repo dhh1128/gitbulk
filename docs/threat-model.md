@@ -19,6 +19,22 @@ The body below is the original point-in-time analysis at `8ecc50a`; it is
 preserved as the record. Findings addressed since are tracked here rather than
 by editing the analysis.
 
+- **2026-06-05 — SEC-F1 (review-panel): the default `claude` dispatch backend
+  no longer runs with the operator's full ambient env — DONE.** Previously the
+  no-config path was special-cased to a native `ProductionClaudeClient` that
+  emitted `env=None`, so `claude --dangerously-skip-permissions` inherited
+  `GH_TOKEN` / `SSH_AUTH_SOCK` / `AWS_*` / npm creds — full RCE-with-identity by
+  default, including under cron. The `claude` preset now ships an `env`
+  allowlist (its own `ANTHROPIC_*` auth/endpoint vars only) and is driven by
+  the same `CommandAgentBackend` as every other agent, so it is *secure by
+  default* on equal footing with the non-claude presets (SEC-F2). The
+  special-cased `ProductionClaudeClient` / `ProductionAgentBackend` were removed
+  entirely. OAuth login is unaffected (credentials live in `~/.claude`, reached
+  via `HOME` in the minimal base; `sandbox: none` stays the default). **Still
+  open:** filesystem isolation of the dispatch agent (reading `~/.ssh` etc.)
+  remains opt-in via `sandbox: fs-only` / `fs+no-net` — `fs+no-net` is
+  unavailable to direct-API claude (it needs egress to `api.anthropic.com`),
+  and `fs-only` requires `ANTHROPIC_API_KEY` (it shadows `~/.claude`).
 - **2026-06-03 — quick wins landed on `main`:**
   - **T2** (no invisible-Unicode / Trojan-Source gate) — **DONE**:
     `scripts/check_unicode.py` + a `unicode-guard` CI job now reject
@@ -29,9 +45,10 @@ by editing the analysis.
     download checksum-verified, and the github-actions Dependabot updates grouped
     (commits `82f7d9c`, `5581564`).
   - **T6** (the `claude` PATH-hijack asymmetry vs. the `gh` F2 fix) — **DONE**:
-    `ProductionClaudeClient` resolves its binary via `shutil.which` at
-    construction (commit `565372d`). The broader T6 review-policy / CODEOWNERS
-    items remain open.
+    the claude binary resolves via `shutil.which` at construction (commit
+    `565372d`; the logic now lives in `gitbulk.agent._pin_binary` after the
+    SEC-F1 unification removed `ProductionClaudeClient`). The broader T6
+    review-policy / CODEOWNERS items remain open.
 - **2026-06-04 — pluggable coding agents + dispatch hardening (branch
   `feat/pluggable-agents`; see docs/pluggable-agents.md, this.i `agbknd7q`…
   `agatk5n`):** this is the substantive remediation of **T1** and adds a new,
@@ -474,10 +491,10 @@ indirect-prompt-injection vector into a skip-permissions agent. Treat any change
 that flows PR/issue/branch text into a prompt or `run:` block as security-
 critical (mirrors SC §4.4 for Actions).
 
-**(4) Make config control which binary runs.** Note the existing asymmetry: the
-`gh` client pins via `shutil.which` (F2 fix), but `ProductionClaudeClient` takes
-`claude_path="claude"` from PATH and `dispatch` constructs it with **no
-arguments** (dispatch.py:711). A contributor could "improve testability/config"
+**(4) Make config control which binary runs.** The agent binary is pinned via
+`shutil.which` at construction (`gitbulk.agent._pin_binary`, parity with the
+`gh` client's F2 fix), so PATH cannot substitute it. A contributor could
+"improve testability/config"
 by adding a config-driven `claude_path` / `gh_path` — instantly turning a config
 file (or a poisoned one) into **arbitrary binary execution**, re-opening the very
 PATH-hijack the F2 fix closed. Any PR that lets config or CLI choose an

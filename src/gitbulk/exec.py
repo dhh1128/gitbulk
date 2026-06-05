@@ -159,13 +159,15 @@ def _claude_argv(claude: ClaudeClient, prompt: str, model: str | None) -> list[s
     """Build the claude argv for one target.
 
     Reads ``_claude_path`` and ``_default_model`` off the
-    :class:`~gitbulk.claude.ClaudeClient` if it exposes them (both the
-    production and fake clients do as of Phase 3). Falls back to
-    ``"claude"`` and the kernel-call-site default otherwise so a
-    minimal user-supplied implementation still works.
+    :class:`~gitbulk.claude.ClaudeClient` if it exposes them (the fake
+    client does). Falls back to ``"claude"`` and the kernel-call-site
+    default otherwise so a minimal user-supplied implementation still
+    works.
 
-    Mirrors :class:`gitbulk.claude.ProductionClaudeClient.run_prompt`
-    argv shape — see that class for the deprecation-verification note.
+    This is the legacy fallback for a backend that exposes only
+    ``run_prompt`` (no :meth:`plan`); the real production path is
+    :meth:`gitbulk.agent.CommandAgentBackend.plan`, which carries the
+    flag-deprecation-verification note for the ``claude`` preset.
     """
     claude_path = getattr(claude, "_claude_path", "claude")
     effective_model = (

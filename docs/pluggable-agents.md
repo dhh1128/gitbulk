@@ -45,9 +45,11 @@ The agent contract that is *already* agent-neutral and stays so:
 
 ## 2. The seam: `AgentBackend` (this.i `agbknd7q`)
 
-Generalize the existing `ClaudeClient` Protocol (Protocol + Fake + Production)
-into `AgentBackend`, keeping `ClaudeClient`/`ProductionClaudeClient`/
-`FakeClaudeClient` as deprecated aliases so nothing breaks during migration.
+Generalize the existing `ClaudeClient` Protocol into `AgentBackend`, keeping
+`ClaudeClient` as an alias of `AgentBackend` and `FakeClaudeClient` as the test
+double. (The native `ProductionClaudeClient` that originally backed this seam
+was removed in the SEC-F1 unification — the single production backend is now
+`gitbulk.agent.CommandAgentBackend`.)
 
 A single argv builder replaces the two hardcoded ones. `exec.py` stops
 constructing argv itself and asks the backend, so `dispatch` and `summarize`
@@ -155,9 +157,14 @@ profile's model. Resolution order: `--agent` → per-repo `agent:` →
 
 ### Backward compatibility
 
-With no `agents:`/`default_agent:` config, behavior is byte-identical to today
-(implicit `claude` preset reproducing the current argv). Existing configs, cron
-jobs, and the 1556-test suite are unaffected.
+With no `agents:`/`default_agent:` config, the implicit `claude` preset
+reproduces the current argv. The argv is unchanged; the one deliberate
+behavior change (SEC-F1, 2026-06-05) is that the `claude` preset now ships an
+`env` allowlist, so the dispatched agent no longer inherits the operator's
+`GH_TOKEN` / SSH agent / cloud creds — only its own `ANTHROPIC_*` vars plus the
+minimal safe base. OAuth login is unaffected (`~/.claude` is reached via `HOME`,
+and `sandbox: none` stays the default). Bedrock/Vertex/gateway users extend
+`agents.claude.env` in config.
 
 ---
 
