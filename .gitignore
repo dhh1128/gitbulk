@@ -14,3 +14,15 @@ dist/
 # Zensical docs build output
 /site/
 .cache/
+
+# Local environment / secrets (keep credentials out of git)
+.env
+.env.*
+
+# Editor / IDE settings
+.idea/
+.vscode/
+
+# OS cruft
+.DS_Store
+Thumbs.db
