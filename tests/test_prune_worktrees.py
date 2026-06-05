@@ -93,11 +93,34 @@ def _entry(path, branch="feat", *, is_main=False, is_detached=False,
     )
 
 
+# The single reference "now" every test timestamp derives from. The handler
+# computes its own "now" via ``pw._utc_now`` (pinned to this value by the
+# autouse ``_pin_clock`` fixture below), and the ``_classify_worktree`` unit
+# tests pass this same constant as their explicit ``now`` argument. Deriving
+# the date helpers from it (rather than wall-clock ``datetime.now()``) makes
+# a "``days_ago`` days old" PR genuinely that old relative to the clock the
+# code uses, so grace-boundary tests exercise the real boundary (TST-F3).
+NOW = datetime(2026, 6, 3, tzinfo=timezone.utc)
+
+# The genuine, unpatched production clock, captured before any test pins it,
+# so ``test_utc_now_returns_aware`` can assert on the real implementation.
+_REAL_UTC_NOW = pw._utc_now
+
+
+@pytest.fixture(autouse=True)
+def _pin_clock(monkeypatch):
+    """Pin the handler's clock to ``NOW`` so handler-path grace decisions are
+    deterministic and consistent with the date helpers (TST-F3). Tests that
+    need to control time monkeypatch ``pw._utc_now`` themselves afterwards;
+    that later setattr wins over this autouse default."""
+    monkeypatch.setattr(pw, "_utc_now", lambda: NOW)
+
+
 def _closed(slug, number, *, head_ref, merged=True, days_ago=30):
     return ClosedPRRef(
         number=number, title="t", url="u", merged=merged, base_ref="main",
         head_ref=head_ref, head_sha="z" * 40, head_repo_slug=slug,
-        closed_at=datetime.now(timezone.utc) - timedelta(days=days_ago),
+        closed_at=NOW - timedelta(days=days_ago),
     )
 
 
@@ -106,13 +129,10 @@ def _open_pr(slug, number, head_ref):
         slug=slug, number=number, title="o", url="u", author="dhh1128",
         base_ref="main", head_ref=head_ref, head_sha="f" * 40, state="OPEN",
         is_draft=False, mergeable_state="CLEAN",
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc), last_pushed_at=None,
+        created_at=NOW,
+        updated_at=NOW, last_pushed_at=None,
         labels=(), review_decision=None, checks_status=None,
     )
-
-
-NOW = datetime(2026, 6, 3, tzinfo=timezone.utc)
 
 
 @pytest.fixture
@@ -367,6 +387,84 @@ def test_apply_keeps_unmerged_branch(
     assert "branch kept" in summary
 
 
+def test_handler_grace_boundary_honored_through_injected_clock(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
+):
+    """End-to-end coverage of the handler's clock wiring (TST-F4).
+
+    The grace gate in ``_classify_worktree`` is unit-tested with an explicit
+    ``now`` argument, but the HANDLER's wiring of ``_utc_now()`` into that
+    call (prune_worktrees.py: ``now = _utc_now()`` → passed to
+    ``_classify_worktree``) had no end-to-end test. This drives the whole
+    handler with a fixed injected clock ``T`` and two worktrees on the same
+    repo whose closed PRs are anchored *relative to T* — one 6 days old
+    (inside the 7-day grace window → kept) and one 8 days old (outside →
+    pruned). The boundary decision is therefore driven entirely by the
+    injected clock reaching the classifier.
+
+    Regression guard: anchoring ``closed_at`` to ``T`` (not ``NOW``/wall
+    clock) means BOTH the "kept" and "pruned" assertions only hold when the
+    handler actually passes the injected ``T`` through. If the handler
+    hardcoded a different ``now`` or stopped threading the clock to
+    ``_classify_worktree`` (falling back to real wall-clock, which is well
+    before ``T``), both PRs would read as "negative age" / within grace and
+    the 8-day worktree would be (wrongly) kept — failing this test.
+    """
+    T = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(pw, "_utc_now", lambda: T)  # overrides autouse pin
+
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    inside_wt = clone.parent / "alpha-inside"   # 6d old → kept (grace)
+    outside_wt = clone.parent / "alpha-outside"  # 8d old → pruned
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),
+        _entry(inside_wt, branch="inside"),
+        _entry(outside_wt, branch="outside"),
+    ])
+    removed = []
+    monkeypatch.setattr(pw, "remove_linked_worktree", lambda r, p: removed.append(p))
+
+    def _closed_at(slug, number, head_ref, days_before_T):
+        return ClosedPRRef(
+            number=number, title="t", url="u", merged=True, base_ref="main",
+            head_ref=head_ref, head_sha="z" * 40, head_repo_slug=slug,
+            closed_at=T - timedelta(days=days_before_T),
+        )
+
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+        closed_prs_for_head={
+            ("dhh1128/alpha", "inside"): [
+                _closed_at("dhh1128/alpha", 5, "inside", days_before_T=6)
+            ],
+            ("dhh1128/alpha", "outside"): [
+                _closed_at("dhh1128/alpha", 6, "outside", days_before_T=8)
+            ],
+        },
+    )
+    _install(monkeypatch, fake)
+    rc = prune_worktrees_handler(_args(code_root=code_root))  # dry-run
+    assert rc == EXIT_OK
+    assert removed == []  # dry-run never removes
+
+    summary = (
+        paths.latest_run_symlink("prune-worktrees").resolve() / "summary.md"
+    ).read_text()
+    # The 8-day worktree crosses the boundary → "Would remove"; the 6-day one
+    # stays inside grace → "Kept (guardrail)" citing the grace period.
+    assert "## Would remove" in summary
+    assert "alpha-outside" in summary
+    assert "alpha-inside" not in summary.split("## Kept (guardrail)")[0]
+    kept_section = summary.split("## Kept (guardrail)")[1]
+    assert "alpha-inside" in kept_section
+    assert "grace period" in kept_section
+
+
 def test_scan_error_recorded(
     monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
 ):
@@ -585,7 +683,8 @@ def test_cli_wrapper_delegates(monkeypatch):
 
 
 def test_utc_now_returns_aware():
-    assert pw._utc_now().tzinfo is not None
+    # Assert on the genuine implementation, not the pinned test clock.
+    assert _REAL_UTC_NOW().tzinfo is not None
 
 
 def test_dry_run_skip_check_exits_4(
