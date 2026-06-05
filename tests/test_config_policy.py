@@ -165,6 +165,36 @@ repos:
     assert policy_for(policy, "owner/other").prune_min_age_days == 7
 
 
+# ─── prune_scan_concurrency (node prnpf8nq) ────────────────────────────────
+
+
+def test_prune_scan_concurrency_default():
+    from gitbulk.config.policy import Defaults
+    assert Defaults().prune_scan_concurrency == 12
+
+
+def test_prune_scan_concurrency_explicit_in_defaults(tmp_path):
+    content = "defaults:\n  prune_scan_concurrency: 24\n"
+    policy = load_policy(_write_policy(tmp_path, content))
+    assert policy.defaults.prune_scan_concurrency == 24
+
+
+def test_prune_scan_concurrency_rejects_below_one(tmp_path):
+    content = "defaults:\n  prune_scan_concurrency: 0\n"
+    with pytest.raises(ConfigError, match="prune_scan_concurrency"):
+        load_policy(_write_policy(tmp_path, content))
+
+
+def test_prune_scan_concurrency_is_defaults_only_not_per_repo(tmp_path):
+    # The thread pool is global, so a per-repo override is meaningless and
+    # rejected rather than silently ignored.
+    content = (
+        "repos:\n  owner/r:\n    prune_scan_concurrency: 4\n"
+    )
+    with pytest.raises(ConfigError, match="unknown key"):
+        load_policy(_write_policy(tmp_path, content))
+
+
 # ─── merge_method ─────────────────────────────────────────────────────────
 
 

@@ -25,6 +25,7 @@ and the feedback memory ``feedback-gh-cli-deprecation-verification``).
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import time
 from datetime import datetime
@@ -891,16 +892,43 @@ _RETRYABLE_STDERR_MARKERS: tuple[str, ...] = (
     # lookups: ~25% of chunks were silently failing on HTTP 502 without
     # ever retrying because none of the other markers matched.
     "http 50",
+    # HTTP 429 (Too Many Requests) is GitHub's secondary-rate-limit answer.
+    # The textual "secondary rate limit" message is already caught by the
+    # "rate limit" marker; the bare status line needs its own (node prnpf8nq,
+    # added when the parallel scan made tripping the concurrent-request
+    # limiter plausible).
+    "http 429",
     "timeout",
     "could not resolve",
     "eof",
 )
+
+#: Upper bound (seconds) on a single inter-attempt sleep. A malformed or
+#: hostile ``Retry-After`` must not be able to stall a run unbounded.
+_MAX_BACKOFF_SECONDS: float = 60.0
+
+#: ``Retry-After: <n>`` header echoed by ``gh`` on a 429/secondary-limit.
+_RETRY_AFTER_RE = re.compile(r"retry-after:\s*(\d+)", re.IGNORECASE)
 
 
 def _is_retryable_stderr(stderr: str) -> bool:
     """True if ``stderr`` matches one of the retryable patterns."""
     low = stderr.lower()
     return any(marker in low for marker in _RETRYABLE_STDERR_MARKERS)
+
+
+def _retry_after_seconds(stderr: str) -> float | None:
+    """Parse a ``Retry-After: <seconds>`` value out of gh stderr, if present.
+
+    GitHub returns this on a secondary-rate-limit (HTTP 429) to say how long
+    to wait. Honouring it lets the parallel scan (node prnpf8nq) back off for
+    exactly the requested cooldown instead of a blind exponential guess.
+    Returns ``None`` when no such header is present.
+    """
+    match = _RETRY_AFTER_RE.search(stderr or "")
+    if match is None:
+        return None
+    return float(match.group(1))
 
 
 #: GraphQL document used by ``my_open_prs``. Lives at module scope so the
@@ -1095,9 +1123,15 @@ class ProductionGHClient:
                     )
 
             # Retryable path: sleep with exponential backoff before next
-            # attempt, but not after the final attempt.
+            # attempt, but not after the final attempt. A Retry-After header
+            # (secondary rate limit) overrides the exponential delay when it
+            # asks for longer, clamped to _MAX_BACKOFF_SECONDS (node prnpf8nq).
             if attempt < self._max_retries - 1:
-                time.sleep(2 ** attempt)
+                delay: float = 2 ** attempt
+                retry_after = _retry_after_seconds(last_stderr)
+                if retry_after is not None:
+                    delay = min(max(delay, retry_after), _MAX_BACKOFF_SECONDS)
+                time.sleep(delay)
 
         # Exhausted all attempts on retryable / timeout failures.
         message = (

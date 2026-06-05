@@ -85,14 +85,16 @@ def fresh_org_cache():
 
 def _args(*, apply=False, code_root=None, skip_check=None,
           refresh_org_members=False, org=None, repo=None, base=None,
-          mergeable_state=None, author=None, filter=None):
+          mergeable_state=None, author=None, filter=None, concurrency=1):
+    # concurrency defaults to 1 here so handler tests run the deterministic
+    # inline scan path; parallel-path tests pass concurrency>1 explicitly.
     return argparse.Namespace(
         subcommand="prune-branches", apply=apply,
         code_root=str(code_root) if code_root else None,
         skip_check=list(skip_check) if skip_check else None,
         refresh_org_members=refresh_org_members,
         org=org, repo=repo, base=base, mergeable_state=mergeable_state,
-        author=author, filter=filter,
+        author=author, filter=filter, concurrency=concurrency,
     )
 
 
@@ -393,6 +395,115 @@ def test_scan_gh_error_records_error_result(
     # Scan error is recorded but not fatal; no skipped repos → exit OK.
     assert rc == EXIT_OK
     assert "Errors" in _latest_summary()
+
+
+# ─── parallel scan (node prnpf8nq) ─────────────────────────────────────────
+
+
+def test_branch_with_no_closed_pr_is_not_surfaced(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """A branch that clears the cheap guards but has no upstream closed PR
+    is dropped from the report (deep skip, no pr_number) — it isn't
+    interesting. Exercises the drop arm of the surface filter."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+        branches={"dhh1128/alpha": [_br(name="orphan", sha="a" * 40)]},
+        closed_prs_for_head={("dhh1128/alpha", "orphan"): []},
+    )
+    _install(monkeypatch, fake)
+    rc = prune_branches_handler(_args(code_root=code_root))
+    assert rc == EXIT_OK
+    summary = _latest_summary()
+    assert "orphan" not in summary
+    assert "no branches matched" in summary
+    assert fake.call_count["closed_prs_for_head"] == 1
+
+
+def test_resolve_concurrency_prefers_arg_over_policy():
+    from gitbulk.config.policy import Policy
+    policy = Policy()  # default prune_scan_concurrency == 12
+    assert pb._resolve_concurrency(_args(concurrency=4), policy) == 4
+
+
+def test_resolve_concurrency_falls_back_to_policy_when_unset():
+    from dataclasses import replace
+    from gitbulk.config.policy import Policy, Defaults
+    policy = Policy(defaults=replace(Defaults(), prune_scan_concurrency=7))
+    assert pb._resolve_concurrency(_args(concurrency=None), policy) == 7
+
+
+def test_resolve_concurrency_floors_at_one():
+    from gitbulk.config.policy import Policy
+    assert pb._resolve_concurrency(_args(concurrency=0), Policy()) == 1
+    assert pb._resolve_concurrency(_args(concurrency=-5), Policy()) == 1
+
+
+def test_parallel_scan_surfaces_all_candidates_in_repo_order(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """With concurrency>1 the two-pass scan must still surface every
+    candidate and lay them out in passing-repos order — byte-for-byte the
+    sequential result."""
+    slugs = [f"dhh1128/r{i}" for i in range(4)]
+    write_config(repos_slugs=slugs)
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    branches = {s: [_br(name="merged-feat", sha="a" * 40)] for s in slugs}
+    closed = {
+        (s, "merged-feat"): [
+            _closed(s, 7, head_ref="merged-feat", head_sha="a" * 40, days_ago=30)
+        ]
+        for s in slugs
+    }
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={s: "main" for s in slugs},
+        my_open_prs={s: [] for s in slugs},
+        branches=branches,
+        closed_prs_for_head=closed,
+    )
+    _install(monkeypatch, fake)
+    rc = prune_branches_handler(_args(code_root=code_root, concurrency=4))
+    assert rc == EXIT_OK
+    summary = _latest_summary()
+    # Every repo's candidate is present, listed in repos.txt order.
+    positions = [summary.index(s) for s in slugs]
+    assert positions == sorted(positions)
+    assert fake.call_count["closed_prs_for_head"] == 4
+
+
+def test_parallel_apply_deletes_every_candidate(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    slugs = [f"dhh1128/r{i}" for i in range(3)]
+    write_config(repos_slugs=slugs)
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={s: "main" for s in slugs},
+        my_open_prs={s: [] for s in slugs},
+        branches={s: [_br(name="merged-feat", sha="a" * 40)] for s in slugs},
+        closed_prs_for_head={
+            (s, "merged-feat"): [
+                _closed(s, 7, head_ref="merged-feat", head_sha="a" * 40,
+                        days_ago=30)
+            ]
+            for s in slugs
+        },
+    )
+    _install(monkeypatch, fake)
+    rc = prune_branches_handler(_args(apply=True, code_root=code_root, concurrency=3))
+    assert rc == EXIT_OK
+    # delete_branch_calls.append is atomic in CPython, so the count is safe
+    # to assert even under the thread pool.
+    assert {c["slug"] for c in fake.delete_branch_calls} == set(slugs)
 
 
 def test_org_refresh_failure_aborts(

@@ -711,6 +711,17 @@ def _add_prune_branches_args(sp: argparse.ArgumentParser) -> None:
     _add_prune_common_args(
         sp, what="delete remote branches whose only PRs are merged/closed"
     )
+    sp.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Parallel workers for the branch scan (node prnpf8nq). Defaults "
+            "to the policy's prune_scan_concurrency (12). Lower it if GitHub "
+            "secondary-rate-limits you; 1 forces a sequential scan."
+        ),
+    )
 
 
 def _add_prune_worktrees_args(sp: argparse.ArgumentParser) -> None:

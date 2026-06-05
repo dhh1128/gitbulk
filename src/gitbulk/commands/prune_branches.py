@@ -52,6 +52,7 @@ from gitbulk.locks import (
     sentinel_lock,
 )
 from gitbulk.runstate import RunState
+from gitbulk.util.parallel import parallel_map
 from gitbulk.util.progress import Progress
 from gitbulk.util.style import error_line, summary_line
 from gitbulk import subcommands as subcommands_mod
@@ -162,14 +163,31 @@ def _classify_branch(
          default branch
 
     Any gh error or inconclusive check biases to ``skip`` (fail safe).
-    """
-    name = branch.name
-    base = {
-        "slug": slug,
-        "branch": name,
-        "sha": branch.sha,
-    }
 
+    Guards 1-4 are *cheap* (no network) and 5-7 are *deep* (per-branch gh
+    calls). The parallel scan (node prnpf8nq) runs them as two passes via
+    :func:`_classify_cheap` / :func:`_classify_deep`; this wrapper preserves
+    the original single-call semantics for direct callers and unit tests.
+    """
+    cheap = _classify_cheap(slug, default_branch, branch, open_heads, open_bases)
+    if cheap is not None:
+        return cheap
+    return _classify_deep(gh, policy, slug, default_branch, branch, now)
+
+
+def _classify_cheap(
+    slug: str,
+    default_branch: str,
+    branch,
+    open_heads: set[str],
+    open_bases: set[str],
+) -> dict | None:
+    """Network-free guards 1-4 (node prnbr4kq). Returns a terminal ``skip``
+    dict when one fires, or ``None`` when the branch needs deep
+    classification (guards 5-7). These never surface a delete on their own,
+    so a cheap-skipped branch is dropped from the report just as before."""
+    name = branch.name
+    base = {"slug": slug, "branch": name, "sha": branch.sha}
     if name == default_branch:
         return {**base, "decision": "skip", "reason": "default branch"}
     if branch.protected:
@@ -182,7 +200,23 @@ def _classify_branch(
             "decision": "skip",
             "reason": "base of an open PR (stacked dependency)",
         }
+    return None
 
+
+def _classify_deep(
+    gh,
+    policy: Policy,
+    slug: str,
+    default_branch: str,
+    branch,
+    now: datetime,
+) -> dict:
+    """Guards 5-7 (node prnbr4kq): the closed-PR lookup, grace period, and
+    data-loss check (node prdls2nq). Each makes per-branch gh calls and is
+    the dominant scan cost, so it runs in the flattened Pass B of the
+    parallel scan. Any gh error or inconclusive check biases to ``skip``."""
+    name = branch.name
+    base = {"slug": slug, "branch": name, "sha": branch.sha}
     try:
         closed = gh.closed_prs_for_head(slug, name)
     except GHError as e:
@@ -242,6 +276,119 @@ def _classify_branch(
             f"{ahead} commit(s) not in {default_branch} — would lose work"
         ),
     }
+
+
+# ─── parallel scan (node prnpf8nq) ─────────────────────────────────────────
+
+
+def _resolve_concurrency(args: argparse.Namespace, policy: Policy) -> int:
+    """The branch-scan worker count: ``--concurrency`` if given, else the
+    policy default (``prune_scan_concurrency``). Floored at 1 so a bogus 0/
+    negative never disables the scan."""
+    val = getattr(args, "concurrency", None)
+    if val is None:
+        val = policy.defaults.prune_scan_concurrency
+    return max(1, int(val))
+
+
+def _scan_repo_cheap(gh, slug: str) -> dict:
+    """Pass A for one repo: read-only fetch + network-free cheap triage.
+
+    Returns a dict with ``error`` set (the fetch failed) OR ``default_branch``
+    plus ``needs_deep`` — the branches that cleared the cheap guards and so
+    need Pass B's deep classification. Runs in a worker thread and touches
+    only the gh network boundary (read-only), never the run state.
+    """
+    try:
+        default_branch = gh.default_branch(slug)
+        branches = gh.list_branches(slug)
+        open_prs = gh.my_open_prs([slug], author=None).get(slug, [])
+    except GHError as e:
+        return {"slug": slug, "error": str(e)}
+    open_heads = {pr.head_ref for pr in open_prs}
+    open_bases = {pr.base_ref for pr in open_prs}
+    needs_deep = [
+        branch
+        for branch in branches
+        if _classify_cheap(slug, default_branch, branch, open_heads, open_bases)
+        is None
+    ]
+    return {
+        "slug": slug,
+        "error": None,
+        "default_branch": default_branch,
+        "needs_deep": needs_deep,
+    }
+
+
+def _scan_branches(
+    gh,
+    policy: Policy,
+    rs: RunState,
+    passing_repos: list[RepoEntry],
+    now: datetime,
+    concurrency: int,
+) -> list[dict]:
+    """Two-pass parallel scan (node prnpf8nq) returning surfaced decisions.
+
+    Pass A fans out the per-repo read-only fetch + cheap triage; Pass B fans
+    out the dominant per-branch deep classification *flattened across all
+    repos* so the pool stays saturated regardless of branch skew. Results are
+    assembled in ``passing_repos`` order (then branch order within a repo) so
+    the report is byte-for-byte stable with the old sequential scan.
+    """
+    # Pass A — over repos.
+    prog_a = Progress(len(passing_repos), prefix="scanning repos: ")
+    repo_scans = parallel_map(
+        lambda repo: _scan_repo_cheap(gh, repo.slug),
+        passing_repos,
+        concurrency=concurrency,
+        on_progress=lambda done, total: prog_a.update(done),
+    )
+    prog_a.done()
+
+    # Pass B — flattened over every branch needing deep classification.
+    deep_items: list[tuple[str, str, object]] = []
+    for scan in repo_scans:
+        if scan["error"] is not None:
+            continue
+        for branch in scan["needs_deep"]:
+            deep_items.append((scan["slug"], scan["default_branch"], branch))
+
+    prog_b = Progress(len(deep_items), prefix="classifying branches: ")
+    deep_results = parallel_map(
+        lambda item: _classify_deep(gh, policy, item[0], item[1], item[2], now),
+        deep_items,
+        concurrency=concurrency,
+        on_progress=lambda done, total: prog_b.update(done),
+    )
+    prog_b.done()
+
+    deep_by_slug: dict[str, list[dict]] = {}
+    for (slug, _db, _branch), res in zip(deep_items, deep_results):
+        deep_by_slug.setdefault(slug, []).append(res)
+
+    results: list[dict] = []
+    for repo, scan in zip(passing_repos, repo_scans):
+        slug = repo.slug
+        if scan["error"] is not None:
+            rs.record_error(
+                f"branch scan failed for {slug}: {scan['error']}",
+                level="ERROR",
+                context={"slug": slug, "error": scan["error"]},
+            )
+            results.append(
+                {"slug": slug, "branch": None, "decision": "error",
+                 "reason": f"scan failed: {scan['error']}"}
+            )
+            continue
+        # Only surface branches that are delete candidates OR that had a
+        # closed/merged PR but were skipped for a safety reason. A branch
+        # with simply no PR is not interesting to report.
+        for res in deep_by_slug.get(slug, []):
+            if res["decision"] == "delete" or "pr_number" in res:
+                results.append(res)
+    return results
 
 
 # ─── public handler ────────────────────────────────────────────────────────
@@ -363,41 +510,10 @@ def _run_under_lock(
 
     now = _utc_now()
     filter_line = filter_summary_line(spec, repos_excluded, 0)
+    concurrency = _resolve_concurrency(args, policy)
     # results: one record per branch we evaluated to a delete/skip decision.
     # (Branches with no closed PR are recorded as skips so the run is auditable.)
-    results: list[dict] = []
-    scan = Progress(len(passing_repos), prefix="scanning branches: ")
-    for i, repo in enumerate(passing_repos, start=1):
-        scan.update(i, repo.slug)
-        slug = repo.slug
-        try:
-            default_branch = gh.default_branch(slug)
-            branches = gh.list_branches(slug)
-            open_prs = gh.my_open_prs([slug], author=None).get(slug, [])
-        except GHError as e:
-            rs.record_error(
-                f"branch scan failed for {slug}: {e}",
-                level="ERROR",
-                context={"slug": slug, "error": str(e)},
-            )
-            results.append(
-                {"slug": slug, "branch": None, "decision": "error",
-                 "reason": f"scan failed: {e}"}
-            )
-            continue
-        open_heads = {pr.head_ref for pr in open_prs}
-        open_bases = {pr.base_ref for pr in open_prs}
-        for branch in branches:
-            decision = _classify_branch(
-                gh, policy, slug, default_branch, branch,
-                open_heads, open_bases, now,
-            )
-            # Only surface branches that are delete candidates OR that had a
-            # closed/merged PR but were skipped for a safety reason. A branch
-            # with simply no PR is not interesting to report.
-            if decision["decision"] == "delete" or "pr_number" in decision:
-                results.append(decision)
-    scan.done()
+    results = _scan_branches(gh, policy, rs, passing_repos, now, concurrency)
 
     delete_candidates = [r for r in results if r["decision"] == "delete"]
 

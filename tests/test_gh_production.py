@@ -31,6 +31,7 @@ from gitbulk.gh import (
     _is_retryable_stderr,
     _parse_iso8601,
     _pr_info_from_graphql_node,
+    _retry_after_seconds,
 )
 from gitbulk.pr_info import PRInfo, TimelineEvent
 
@@ -100,10 +101,30 @@ def _make_run_mock(*outcomes: Any):
         "gh: HTTP 502",
         "gh: HTTP 503",
         "gh: HTTP 504",
+        # Secondary rate limits (node prnpf8nq): the parallel scan can trip
+        # GitHub's concurrent-request limiter, which answers HTTP 429 and/or
+        # "secondary rate limit". The former needs its own marker; the latter
+        # is already caught by "rate limit".
+        "gh: HTTP 429: Too Many Requests",
+        "You have exceeded a secondary rate limit",
     ],
 )
 def test_is_retryable_stderr_matches_known_transient_patterns(stderr):
     assert _is_retryable_stderr(stderr) is True
+
+
+@pytest.mark.parametrize(
+    "stderr,expected",
+    [
+        ("rate limit; Retry-After: 5", 5.0),
+        ("HTTP 429\nretry-after: 42\n", 42.0),
+        ("RETRY-AFTER:  7", 7.0),
+        ("rate limit, no header", None),
+        ("", None),
+    ],
+)
+def test_retry_after_seconds(stderr, expected):
+    assert _retry_after_seconds(stderr) == expected
 
 
 def test_is_retryable_stderr_returns_false_for_unknown_errors():
@@ -300,6 +321,38 @@ def test_retry_exponential_backoff_then_failure_raises_gherror():
     assert "exhausted 3 attempts" in str(exc_info.value)
     assert "rate limit final" in str(exc_info.value)
     assert exc_info.value.command == ("gh", "api", "user")
+
+
+def test_retry_after_header_overrides_exponential_backoff():
+    """A Retry-After header longer than the exponential delay wins, so the
+    parallel scan honours GitHub's secondary-rate-limit cooldown."""
+    side_effect = _make_run_mock(
+        _CompletedFake(1, stderr="secondary rate limit; Retry-After: 5"),
+        _CompletedFake(0, stdout='{"login":"x"}'),
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        with patch("gitbulk.gh.time.sleep") as mock_sleep:
+            client = ProductionGHClient()
+            result = client.authenticated_user()
+
+    assert result == {"login": "x"}
+    # max(2**0, 5) = 5, not the bare 1s exponential delay.
+    mock_sleep.assert_called_once_with(5.0)
+
+
+def test_retry_after_header_is_capped():
+    """An absurd Retry-After is clamped so one bad header can't stall a run
+    for an unbounded time."""
+    side_effect = _make_run_mock(
+        _CompletedFake(1, stderr="rate limit; Retry-After: 100000"),
+        _CompletedFake(0, stdout='{"login":"x"}'),
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        with patch("gitbulk.gh.time.sleep") as mock_sleep:
+            client = ProductionGHClient()
+            client.authenticated_user()
+
+    mock_sleep.assert_called_once_with(60.0)
 
 
 def test_non_retryable_failure_raises_immediately():
