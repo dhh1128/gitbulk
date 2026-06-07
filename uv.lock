@@ -164,7 +164,7 @@ wheels = [
 
 [[package]]
 name = "gitbulk"
-version = "0.7.3"
+version = "0.7.4"
 source = { editable = "." }
 dependencies = [
     { name = "pyyaml" },
