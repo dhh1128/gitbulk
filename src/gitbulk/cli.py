@@ -758,6 +758,28 @@ def _add_prune_worktrees_args(sp: argparse.ArgumentParser) -> None:
             "changes. By default an untracked file blocks removal."
         ),
     )
+    sp.add_argument(
+        "--concurrency",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Parallel workers for the scan (node prnwpf9k). Defaults to the "
+            "policy's prune_scan_concurrency (12). Lower it if GitHub "
+            "secondary-rate-limits you; 1 forces a sequential scan."
+        ),
+    )
+    sp.add_argument(
+        "--no-prune-local-branches",
+        action="store_true",
+        default=False,
+        help=(
+            "Do NOT sweep local branches that have no worktree (node "
+            "prnwlb7q). By default prune-worktrees also deletes such a branch "
+            "when its only PRs are merged/closed and it is fully merged "
+            "(git branch -d), for a worktrees-only run pass this flag."
+        ),
+    )
 
 
 def _add_merge_args(sp: argparse.ArgumentParser) -> None:

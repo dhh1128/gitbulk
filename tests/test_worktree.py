@@ -491,6 +491,47 @@ def test_branch_unpushed_commit_count_bad_output_raises():
             branch_unpushed_commit_count(Path("/r"), "feat")
 
 
+def test_local_branch_upstreams_parses_and_strips():
+    # tab-separated: short-name <TAB> upstream:remoteref. Empty remoteref =>
+    # no upstream (None). Blank lines ignored.
+    out = (
+        "main\trefs/heads/main\n"
+        "feature/foo\trefs/heads/dev\n"
+        "orphan\t\n"
+        "\n"
+        "\trefs/heads/x\n"  # defensive: non-blank line with empty name -> skip
+        # Defensive: a tracking-ref form (refs/remotes/<remote>/<branch>) is
+        # NOT what :remoteref emits, but the parser strips it to the bare name
+        # so a format regression can't break the protection guard. Branch names
+        # with slashes survive the remote-prefix strip.
+        "tracked\trefs/remotes/origin/feature/x\n"
+        "weird\tsomething-else\n"
+    )
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout=out),
+    ) as mock_run:
+        assert worktree_mod.local_branch_upstreams(Path("/r")) == [
+            ("main", "main"),
+            ("feature/foo", "dev"),
+            ("orphan", None),
+            ("tracked", "feature/x"),
+            ("weird", "something-else"),
+        ]
+    argv = mock_run.call_args[0][0]
+    assert "for-each-ref" in argv and "refs/heads" in argv
+    assert "--format=%(refname:short)%09%(upstream:remoteref)" in argv
+
+
+def test_local_branch_upstreams_raises_on_git_failure():
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(returncode=1, stderr="boom"),
+    ):
+        with pytest.raises(WorktreeError):
+            worktree_mod.local_branch_upstreams(Path("/r"))
+
+
 def test_remove_linked_worktree_argv_and_prune(tmp_path: Path):
     calls = []
 
