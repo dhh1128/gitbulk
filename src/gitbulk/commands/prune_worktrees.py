@@ -49,13 +49,18 @@ from gitbulk.util.style import error_line, summary_line
 from gitbulk import subcommands as subcommands_mod
 from gitbulk.worktree import (
     WorktreeError,
+    branch_ahead_behind,
+    branch_committer_age_days,
+    branch_contained_in,
     branch_unpushed_commit_count,
+    delete_branch_trusting_local_default,
     delete_merged_local_branch,
     list_worktrees,
     local_branch_upstreams,
     remove_linked_worktree,
     worktree_change_summary,
     worktree_in_progress_op,
+    worktree_mtime_age_days,
 )
 
 EXIT_OK = 0
@@ -126,6 +131,7 @@ def _config_snapshot(
         "include_untracked": bool(getattr(args, "include_untracked", False)),
         "concurrency": _resolve_concurrency(args, policy),
         "prune_local_branches": _prune_local_enabled(args),
+        "trust_local_default": bool(getattr(args, "trust_local_default", False)),
     }
 
 
@@ -154,6 +160,7 @@ def _classify_branch_by_pr(
     default_branch: str | None,
     protected_upstreams: frozenset[str] | None,
     upstream: str | None,
+    trust_local_default: bool = False,
 ) -> dict:
     """The protection/PR/grace/data-loss guardrails shared by a worktree's
     branch and a worktree-less local branch (nodes prnwt5nq, prnwlb7q,
@@ -164,9 +171,14 @@ def _classify_branch_by_pr(
     remote branch this local branch tracks, and the branch is kept when that
     upstream is the repo's default branch OR is protected on GitHub. If
     ``protected_upstreams`` is ``None`` the remote protection could not be
-    fetched, so we refuse (bias to safe). Returns a ``delete`` only when, after
-    those gates, the branch is not the head of an open PR, HAS a merged/closed
-    upstream PR past the grace period, and has no unpushed commits.
+    fetched, so we refuse (bias to safe).
+
+    Returns a ``delete`` when, after the protection/open-PR gates, the branch
+    HAS a merged/closed upstream PR past the grace period and no unpushed
+    commits. When NO such PR exists the decision is delegated to
+    :func:`_classify_no_pr`, which implements the no-PR safe paths (empty
+    worktree behind its local base; all commits already on a remote; opt-in
+    local-default merge) and otherwise keeps the historical skip.
     """
     if protected_upstreams is None:
         return {
@@ -189,15 +201,18 @@ def _classify_branch_by_pr(
     except GHError as e:
         return {**base, "decision": "skip", "reason": f"could not list closed PRs: {e}"}
     upstream_closed = [c for c in closed if c.head_repo_slug == slug]
+    grace = policy_for(policy, slug).prune_min_age_days
     if not upstream_closed:
-        return {
-            **base, "decision": "skip",
-            "reason": "no merged/closed PR for this branch on the upstream",
-        }
+        return _classify_no_pr(
+            clone_path, branch, base,
+            kind=base.get("kind"),
+            worktree_path=Path(base["path"]) if base.get("path") else None,
+            grace_days=grace, now=now, default_branch=default_branch,
+            trust_local_default=trust_local_default,
+        )
     pr = upstream_closed[0]
     base = {**base, "pr_number": pr.number, "pr_state": pr.state}
 
-    grace = policy_for(policy, slug).prune_min_age_days
     age_days = (now - pr.closed_at).days
     if age_days < grace:
         return {
@@ -220,6 +235,143 @@ def _classify_branch_by_pr(
     return {**base, "decision": "delete", "reason": f"PR #{pr.number} {pr.state.lower()}"}
 
 
+def _classify_no_pr(
+    clone_path: Path,
+    branch: str,
+    base: dict,
+    *,
+    kind: str | None,
+    worktree_path: Path | None,
+    grace_days: int,
+    now: datetime,
+    default_branch: str | None,
+    trust_local_default: bool,
+) -> dict:
+    """Decide a branch that has NO merged/closed upstream PR (bias to keep).
+
+    The three no-PR safe paths, in priority order:
+
+    * **State 1 (worktrees only):** an EMPTY worktree — no commits unique to it
+      relative to the LOCAL ``default_branch`` it was created from (``ahead ==
+      0``) — that is also BEHIND that base (``behind > 0``) and has sat
+      untouched past the grace period (worktree dir mtime). A created-but-
+      abandoned scratch tree the local base moved past. Empty worktrees are
+      decided HERE and never fall through to State 2a, so the behind+stale
+      guardrails the user asked for always govern them. The base is the LOCAL
+      default branch, NOT the remote upstream — the worktree is measured against
+      the branch it was forked from locally.
+    * **State 2a:** every commit on the branch is already on a remote
+      (``branch_unpushed_commit_count == 0``), so removal loses nothing —
+      additionally gated on staleness (worktree mtime, or branch committer date
+      for a free branch) to avoid reaping freshly-pushed work.
+    * **State 2b (opt-in ``--trust-local-default``):** the branch was merged
+      into the LOCAL default branch directly (no PR); its commits may live only
+      locally, so this trusts the local default as proof the work landed. The
+      delete is force-applied (``git branch -D``) ONLY after re-verifying
+      containment at apply time.
+
+    Anything else keeps the historical "no merged/closed PR" skip.
+    """
+    keep = {
+        **base, "decision": "skip",
+        "reason": "no merged/closed PR for this branch on the upstream",
+    }
+
+    # ── State 1: empty worktree behind its local base (worktrees only). ──
+    # Resolved here exclusively so the behind+stale guardrails always apply;
+    # never falls through to State 2a (an empty tree may well have unpushed==0).
+    if kind == "worktree" and worktree_path is not None and default_branch:
+        ab = branch_ahead_behind(clone_path, branch, default_branch)
+        if ab is not None and ab[0] == 0:
+            behind = ab[1]
+            if behind <= 0:
+                return {
+                    **base, "decision": "skip",
+                    "reason": (
+                        f"empty worktree but not behind local '{default_branch}' "
+                        f"(possibly fresh)"
+                    ),
+                }
+            age = worktree_mtime_age_days(worktree_path, now)
+            if age is None:
+                return {
+                    **base, "decision": "skip",
+                    "reason": "empty worktree but could not determine age",
+                }
+            if age < grace_days:
+                return {
+                    **base, "decision": "skip",
+                    "reason": (
+                        f"empty worktree behind local '{default_branch}' by "
+                        f"{behind} but untouched only {int(age)}d "
+                        f"(< {grace_days}d grace period)"
+                    ),
+                }
+            return {
+                **base, "decision": "delete",
+                "reason": (
+                    f"empty worktree behind local '{default_branch}' by {behind}, "
+                    f"untouched {int(age)}d (no PR)"
+                ),
+            }
+
+    # ── State 2a: nothing would be lost — every commit already on a remote. ──
+    try:
+        unpushed = branch_unpushed_commit_count(clone_path, branch)
+    except WorktreeError as e:
+        return {**base, "decision": "skip", "reason": f"could not verify commits: {e}"}
+    if unpushed == 0:
+        age = (
+            worktree_mtime_age_days(worktree_path, now)
+            if kind == "worktree" and worktree_path is not None
+            else branch_committer_age_days(clone_path, branch, now)
+        )
+        if age is None:
+            return {
+                **base, "decision": "skip",
+                "reason": (
+                    "no PR; all commits already on a remote but could not "
+                    "determine age"
+                ),
+            }
+        if age >= grace_days:
+            return {
+                **base, "decision": "delete",
+                "reason": (
+                    f"no PR, but every commit is already on a remote; "
+                    f"{int(age)}d stale"
+                ),
+            }
+        return {
+            **base, "decision": "skip",
+            "reason": (
+                f"no PR; all commits already on a remote but only {int(age)}d "
+                f"old (< {grace_days}d grace period)"
+            ),
+        }
+
+    # ── State 2b (opt-in): merged into the local default branch. ──
+    if trust_local_default and default_branch:
+        try:
+            contained = branch_contained_in(clone_path, default_branch, branch)
+        except WorktreeError as e:
+            return {
+                **base, "decision": "skip",
+                "reason": f"could not verify local-default merge: {e}",
+            }
+        if contained:
+            return {
+                **base, "decision": "delete",
+                "trust_local_default": True, "local_default": default_branch,
+                "reason": (
+                    f"no PR, but merged into local default '{default_branch}' "
+                    f"(--trust-local-default)"
+                ),
+            }
+
+    return keep
+
+
 def _classify_worktree(
     gh,
     policy: Policy,
@@ -233,6 +385,7 @@ def _classify_worktree(
     default_branch: str | None = None,
     protected_upstreams: frozenset[str] | None = frozenset(),
     upstream: str | None = None,
+    trust_local_default: bool = False,
 ) -> dict:
     """Decide what to do with one LINKED worktree ``wt`` of ``slug``.
 
@@ -272,7 +425,7 @@ def _classify_worktree(
     return _classify_branch_by_pr(
         gh, policy, slug, clone_path, wt.branch, open_heads, now, base,
         default_branch=default_branch, protected_upstreams=protected_upstreams,
-        upstream=upstream,
+        upstream=upstream, trust_local_default=trust_local_default,
     )
 
 
@@ -288,20 +441,24 @@ def _classify_local_branch(
     default_branch: str | None = None,
     protected_upstreams: frozenset[str] | None = frozenset(),
     upstream: str | None = None,
+    trust_local_default: bool = False,
 ) -> dict:
     """Decide what to do with one LOCAL branch of ``slug`` that is NOT checked
     out in any worktree (node prnwlb7q).
 
     Applies the same protection/PR/grace/data-loss gates as a worktree's branch
     (there is no working-tree state to guard, since the branch has no worktree).
-    A ``delete`` is acted on via ``git branch -d`` (merged-only), so an unmerged
-    branch is kept even if this returns delete.
+    A ``delete`` is acted on via ``git branch -d`` (merged-only) — except a
+    State-2b candidate, which carries ``trust_local_default`` and is force-
+    deleted after re-verifying containment — so a branch whose work is not
+    preserved is kept even if this returns delete. State 1 (empty worktree) does
+    NOT apply here: a free branch has no worktree.
     """
     base = {"slug": slug, "kind": "branch", "path": None, "branch": branch}
     return _classify_branch_by_pr(
         gh, policy, slug, clone_path, branch, open_heads, now, base,
         default_branch=default_branch, protected_upstreams=protected_upstreams,
-        upstream=upstream,
+        upstream=upstream, trust_local_default=trust_local_default,
     )
 
 
@@ -344,6 +501,23 @@ def _scan_repo(repo: RepoEntry, prune_local: bool) -> dict:
         "free_branches": free_branches,
         "upstreams": upstreams,
     }
+
+
+def _delete_branch_for(clone: Path, cand: dict) -> bool:
+    """Delete a delete-candidate's local branch, choosing the safe mechanism.
+
+    A State-2b candidate (carries ``trust_local_default``) was merged into the
+    local default branch with no PR; ``git branch -d`` would refuse it even
+    though the work is preserved there, so it is force-deleted via
+    :func:`delete_branch_trusting_local_default` (which re-verifies containment).
+    Every other candidate uses ``git branch -d`` (merged-only), so an unmerged
+    branch is kept. Returns True iff the branch was actually deleted.
+    """
+    if cand.get("trust_local_default"):
+        return delete_branch_trusting_local_default(
+            clone, cand["branch"], cand["local_default"]
+        )
+    return delete_merged_local_branch(clone, cand["branch"])
 
 
 # ─── public handler ────────────────────────────────────────────────────────
@@ -389,6 +563,7 @@ def _run_under_lock(
         "prune-worktrees", argv=list(sys.argv), config_snapshot=config_snapshot
     )
     include_untracked = bool(getattr(args, "include_untracked", False))
+    trust_local_default = bool(getattr(args, "trust_local_default", False))
 
     gh = ProductionGHClient()
     ctx_base = InvariantContext(policy=policy, runstate=rs, gh=gh)
@@ -573,11 +748,12 @@ def _run_under_lock(
                 gh, policy, slug, repo.local_path, obj, open_heads, now,
                 include_untracked, default_branch=default_branch,
                 protected_upstreams=protected, upstream=ups.get(obj.branch),
+                trust_local_default=trust_local_default,
             )
         return _classify_local_branch(
             gh, policy, slug, repo.local_path, obj, open_heads, now,
             default_branch=default_branch, protected_upstreams=protected,
-            upstream=ups.get(obj),
+            upstream=ups.get(obj), trust_local_default=trust_local_default,
         )
 
     prog_b = Progress(len(deep_items), prefix="classifying: ")
@@ -620,9 +796,9 @@ def _run_under_lock(
                     remove_linked_worktree(clone, Path(cand["path"]))
                     cand["removed"] = True
                     removed_count += 1
-                    branch_deleted = delete_merged_local_branch(clone, cand["branch"])
+                    branch_deleted = _delete_branch_for(clone, cand)
                 else:  # bare local branch — no worktree to remove
-                    branch_deleted = delete_merged_local_branch(clone, cand["branch"])
+                    branch_deleted = _delete_branch_for(clone, cand)
                     if branch_deleted:
                         branch_count += 1
         except WorktreeError as e:

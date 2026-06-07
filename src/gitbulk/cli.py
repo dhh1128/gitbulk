@@ -780,6 +780,21 @@ def _add_prune_worktrees_args(sp: argparse.ArgumentParser) -> None:
             "(git branch -d), for a worktrees-only run pass this flag."
         ),
     )
+    sp.add_argument(
+        "--trust-local-default",
+        action="store_true",
+        default=False,
+        help=(
+            "OPT-IN (State 2b): also prune a branch that has no PR but was "
+            "merged into the LOCAL default branch directly, even when its "
+            "commits live only locally. This trusts the local default branch "
+            "as proof the work landed (a force-delete after re-verifying "
+            "containment); off by default because a later reset of local "
+            "default could orphan the commits. Empty worktrees behind their "
+            "local base, and branches whose commits are already on a remote, "
+            "are pruned WITHOUT this flag."
+        ),
+    )
 
 
 def _add_merge_args(sp: argparse.ArgumentParser) -> None:

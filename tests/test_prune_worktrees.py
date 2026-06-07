@@ -73,7 +73,8 @@ def write_config(isolated_xdg, code_root):
 def _args(*, apply=False, code_root=None, skip_check=None,
           refresh_org_members=False, include_untracked=False, org=None,
           repo=None, base=None, mergeable_state=None, author=None, filter=None,
-          concurrency=None, no_prune_local_branches=False):
+          concurrency=None, no_prune_local_branches=False,
+          trust_local_default=False):
     return argparse.Namespace(
         subcommand="prune-worktrees", apply=apply,
         code_root=str(code_root) if code_root else None,
@@ -84,6 +85,7 @@ def _args(*, apply=False, code_root=None, skip_check=None,
         author=author, filter=filter,
         concurrency=concurrency,
         no_prune_local_branches=no_prune_local_branches,
+        trust_local_default=trust_local_default,
     )
 
 
@@ -146,19 +148,30 @@ def _open_pr(slug, number, head_ref):
 @pytest.fixture
 def clean_helpers(monkeypatch):
     """Patch the read-only worktree helpers to a clean/no-op baseline.
-    Individual tests override specific ones."""
+    Individual tests override specific ones.
+
+    The no-PR-path helpers (State 1 / 2a / 2b) default to "can't establish"
+    (``branch_ahead_behind`` → None, age helpers → None, ``branch_contained_in``
+    → False) so a clean baseline run keeps a no-PR branch rather than inventing
+    a deletion; the State 1/2a/2b tests override exactly what they exercise."""
     monkeypatch.setattr(pw, "worktree_in_progress_op", lambda p: None)
     monkeypatch.setattr(pw, "worktree_change_summary", lambda p: (False, False, False))
     monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 0)
+    monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: None)
+    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: None)
+    monkeypatch.setattr(pw, "branch_committer_age_days", lambda r, b, now: None)
+    monkeypatch.setattr(pw, "branch_contained_in", lambda r, base, b: False)
 
 
 # ─── _classify_worktree unit tests ─────────────────────────────────────────
 
 
-def _classify(fake, wt, open_heads=frozenset(), include_untracked=False):
+def _classify(fake, wt, open_heads=frozenset(), include_untracked=False,
+              *, default_branch=None, trust_local_default=False):
     return _classify_worktree(
         fake, Policy(), "o/r", Path("/clone"), wt, set(open_heads), NOW,
-        include_untracked,
+        include_untracked, default_branch=default_branch,
+        trust_local_default=trust_local_default,
     )
 
 
@@ -221,7 +234,11 @@ def test_classify_skips_closed_lookup_error(clean_helpers):
     assert out["decision"] == "skip" and "could not list closed" in out["reason"]
 
 
-def test_classify_skips_no_upstream_pr(clean_helpers):
+def test_classify_skips_no_upstream_pr(monkeypatch, clean_helpers):
+    # A fork-only closed PR is not an UPSTREAM PR, so the branch has no
+    # qualifying PR. With unpushed commits (work only local) and none of the
+    # no-PR safe paths applying, it keeps the historical skip.
+    monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 1)
     fork = ClosedPRRef(
         number=1, title="t", url="u", merged=True, base_ref="main",
         head_ref="feat", head_sha="z" * 40, head_repo_slug="x/fork",
@@ -266,6 +283,170 @@ def test_classify_deletes_clean_merged(clean_helpers):
     })
     out = _classify(fake, _entry("/wt"))
     assert out["decision"] == "delete" and out["pr_number"] == 1
+
+
+# ─── no-PR safe paths: State 1 (empty worktree behind its local base) ───────
+#
+# These configure ``closed_prs_for_head`` to ``[]`` so the branch reaches the
+# no-PR classifier (an UNconfigured key would raise GHError instead).
+
+
+def _no_pr_fake(branch="feat"):
+    return FakeGHClient(closed_prs_for_head={("o/r", branch): []})
+
+
+def test_state1_empty_behind_stale_deletes(monkeypatch, clean_helpers):
+    monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (0, 3))
+    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: 30.0)
+    out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
+    assert out["decision"] == "delete"
+    assert "empty worktree behind local 'main' by 3" in out["reason"]
+
+
+def test_state1_empty_not_behind_kept(monkeypatch, clean_helpers):
+    # ahead==0 but behind==0: nothing unique AND base hasn't moved → maybe fresh.
+    monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (0, 0))
+    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: 99.0)
+    out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
+    assert out["decision"] == "skip" and "not behind local 'main'" in out["reason"]
+
+
+def test_state1_empty_behind_but_fresh_kept(monkeypatch, clean_helpers):
+    monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (0, 5))
+    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: 2.0)
+    out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
+    assert out["decision"] == "skip"
+    assert "untouched only 2d" in out["reason"] and "grace period" in out["reason"]
+
+
+def test_state1_empty_behind_age_unknown_kept(monkeypatch, clean_helpers):
+    monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (0, 5))
+    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: None)
+    out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
+    assert out["decision"] == "skip" and "could not determine age" in out["reason"]
+
+
+def test_state1_empty_does_not_fall_through_to_2a(monkeypatch, clean_helpers):
+    # An empty worktree typically has unpushed==0, which WOULD satisfy State 2a.
+    # The behind-guardrail must still win: an empty-but-not-behind tree is kept
+    # even though every commit is on a remote and it is stale.
+    monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (0, 0))
+    monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 0)
+    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: 365.0)
+    out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
+    assert out["decision"] == "skip" and "not behind" in out["reason"]
+
+
+def test_state1_skipped_when_no_local_base(monkeypatch, clean_helpers):
+    # default_branch=None → no local base → State 1 cannot apply; with unpushed
+    # commits and 2b off, it keeps the historical skip.
+    monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 1)
+    out = _classify(_no_pr_fake(), _entry("/wt"), default_branch=None)
+    assert out["decision"] == "skip" and "no merged/closed PR" in out["reason"]
+
+
+# ─── no-PR safe paths: State 2a (every commit already on a remote) ──────────
+
+
+def test_state2a_on_remote_stale_deletes(monkeypatch, clean_helpers):
+    monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (2, 0))
+    monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 0)
+    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: 30.0)
+    out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
+    assert out["decision"] == "delete"
+    assert "every commit is already on a remote" in out["reason"]
+
+
+def test_state2a_fresh_kept(monkeypatch, clean_helpers):
+    monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (2, 0))
+    monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 0)
+    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: 1.0)
+    out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
+    assert out["decision"] == "skip" and "only 1d old" in out["reason"]
+
+
+def test_state2a_age_unknown_kept(monkeypatch, clean_helpers):
+    monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (2, 0))
+    monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 0)
+    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: None)
+    out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
+    assert out["decision"] == "skip" and "could not determine age" in out["reason"]
+
+
+def test_state2a_commit_check_error_kept(monkeypatch, clean_helpers):
+    # No PR, not an empty worktree (ahead>0) → State 2a; the unpushed-commit
+    # probe errors, so the branch is kept with a clear reason.
+    monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (2, 0))
+
+    def boom(r, b):
+        raise WorktreeError("rev-list failed")
+    monkeypatch.setattr(pw, "branch_unpushed_commit_count", boom)
+    out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
+    assert out["decision"] == "skip" and "could not verify commits" in out["reason"]
+
+
+def test_state2a_free_branch_uses_committer_date(monkeypatch, clean_helpers):
+    monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 0)
+    monkeypatch.setattr(pw, "branch_committer_age_days", lambda r, b, now: 40.0)
+    out = pw._classify_local_branch(
+        _no_pr_fake("stale"), Policy(), "o/r", Path("/clone"), "stale",
+        set(), NOW, default_branch="main", protected_upstreams=frozenset(),
+        upstream="stale",
+    )
+    assert out["decision"] == "delete"
+    assert out["kind"] == "branch"
+    assert "every commit is already on a remote" in out["reason"]
+
+
+# ─── no-PR safe paths: State 2b (merged into local default, opt-in) ─────────
+
+
+def test_state2b_opt_in_deletes(monkeypatch, clean_helpers):
+    monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (2, 0))
+    monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 1)
+    monkeypatch.setattr(pw, "branch_contained_in", lambda r, base, b: True)
+    out = _classify(
+        _no_pr_fake(), _entry("/wt"), default_branch="main",
+        trust_local_default=True,
+    )
+    assert out["decision"] == "delete"
+    assert out["trust_local_default"] is True and out["local_default"] == "main"
+    assert "merged into local default 'main'" in out["reason"]
+
+
+def test_state2b_without_flag_kept(monkeypatch, clean_helpers):
+    monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (2, 0))
+    monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 1)
+    monkeypatch.setattr(pw, "branch_contained_in", lambda r, base, b: True)
+    out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
+    assert out["decision"] == "skip" and "no merged/closed PR" in out["reason"]
+    assert "trust_local_default" not in out
+
+
+def test_state2b_not_contained_kept(monkeypatch, clean_helpers):
+    monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (2, 0))
+    monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 1)
+    monkeypatch.setattr(pw, "branch_contained_in", lambda r, base, b: False)
+    out = _classify(
+        _no_pr_fake(), _entry("/wt"), default_branch="main",
+        trust_local_default=True,
+    )
+    assert out["decision"] == "skip" and "no merged/closed PR" in out["reason"]
+
+
+def test_state2b_containment_check_error_kept(monkeypatch, clean_helpers):
+    monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (2, 0))
+    monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 1)
+
+    def boom(r, base, b):
+        raise WorktreeError("rev-list failed")
+    monkeypatch.setattr(pw, "branch_contained_in", boom)
+    out = _classify(
+        _no_pr_fake(), _entry("/wt"), default_branch="main",
+        trust_local_default=True,
+    )
+    assert out["decision"] == "skip"
+    assert "could not verify local-default merge" in out["reason"]
 
 
 # ─── handler tests ─────────────────────────────────────────────────────────
@@ -1171,3 +1352,147 @@ def test_wrong_remote_clone_skipped_no_deletions(
     assert "origin points at" in summary
     assert fake.call_count["closed_prs_for_head"] == 0
     assert fake.call_count["list_branches"] == 0
+
+
+# ─── no-PR safe paths through the handler (State 1 / State 2b) ──────────────
+
+
+def test_state1_empty_worktree_swept_dry_run(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
+):
+    """An empty worktree (no commits vs local default) that is behind that base
+    and untouched past the grace period is a remove candidate even with NO PR."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),
+        _entry(clone.parent / "alpha-empty", branch="empty"),
+    ])
+    # Empty vs local main, base moved 4 commits ahead, untouched 30 days.
+    monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (0, 4))
+    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: 30.0)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": []},
+        my_open_prs={"dhh1128/alpha": []},
+        closed_prs_for_head={("dhh1128/alpha", "empty"): []},
+    )
+    _install(monkeypatch, fake)
+    rc = prune_worktrees_handler(_args(code_root=code_root))
+    assert rc == EXIT_OK
+    summary = _summary()
+    assert "## Would remove" in summary
+    assert "alpha-empty" in summary
+    assert "empty worktree behind local 'main' by 4" in summary
+
+
+def test_state1_empty_worktree_kept_without_flag_irrelevant(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
+):
+    """A fresh empty worktree (not behind its base) is kept — no State-1 reap."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),
+        _entry(clone.parent / "alpha-fresh", branch="fresh"),
+    ])
+    monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (0, 0))
+    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: 30.0)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": []},
+        my_open_prs={"dhh1128/alpha": []},
+        closed_prs_for_head={("dhh1128/alpha", "fresh"): []},
+    )
+    _install(monkeypatch, fake)
+    rc = prune_worktrees_handler(_args(code_root=code_root))
+    assert rc == EXIT_OK
+    summary = _summary()
+    assert "## Would remove" not in summary
+    kept = summary.split("## Kept (guardrail)")[1]
+    assert "alpha-fresh" in kept and "not behind local 'main'" in kept
+
+
+def test_state2b_apply_force_deletes_with_flag(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    clean_helpers, capsys,
+):
+    """--trust-local-default: a worktree branch merged only into local default
+    (no PR, commits not on a remote) is removed and force-deleted."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    wt = clone.parent / "alpha-local"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),
+        _entry(wt, branch="local"),
+    ])
+    # Not empty (has commits), commits NOT on any remote → only 2b can act.
+    monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (3, 0))
+    monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 3)
+    monkeypatch.setattr(pw, "branch_contained_in", lambda r, base, b: True)
+    removed, force_deleted = [], []
+    monkeypatch.setattr(pw, "remove_linked_worktree", lambda r, p: removed.append(p))
+    monkeypatch.setattr(
+        pw, "delete_branch_trusting_local_default",
+        lambda r, b, d: (force_deleted.append((b, d)) or True),
+    )
+    # Guard: the plain merged-only delete must NOT be used for a 2b candidate.
+    monkeypatch.setattr(
+        pw, "delete_merged_local_branch",
+        lambda r, b: pytest.fail("2b must force-delete, not git branch -d"),
+    )
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": []},
+        my_open_prs={"dhh1128/alpha": []},
+        closed_prs_for_head={("dhh1128/alpha", "local"): []},
+    )
+    _install(monkeypatch, fake)
+    rc = prune_worktrees_handler(
+        _args(apply=True, code_root=code_root, trust_local_default=True)
+    )
+    assert rc == EXIT_OK
+    assert removed == [wt]
+    assert force_deleted == [("local", "main")]
+    summary = _summary()
+    assert "merged into local default 'main'" in summary
+
+
+def test_state2b_branch_not_pruned_without_flag(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
+):
+    """Same branch as above, but WITHOUT --trust-local-default → kept."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    wt = clone.parent / "alpha-local"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),
+        _entry(wt, branch="local"),
+    ])
+    monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (3, 0))
+    monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 3)
+    monkeypatch.setattr(pw, "branch_contained_in", lambda r, base, b: True)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": []},
+        my_open_prs={"dhh1128/alpha": []},
+        closed_prs_for_head={("dhh1128/alpha", "local"): []},
+    )
+    _install(monkeypatch, fake)
+    rc = prune_worktrees_handler(_args(code_root=code_root))  # no flag
+    assert rc == EXIT_OK
+    summary = _summary()
+    assert "## Would remove" not in summary
+    assert "alpha-local" in summary.split("## Kept (guardrail)")[1]

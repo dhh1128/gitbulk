@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from gitbulk import paths
@@ -438,6 +439,131 @@ def branch_unpushed_commit_count(repo_path: Path, branch: str) -> int:
         ) from exc
 
 
+def branch_ahead_behind(
+    repo_path: Path, branch: str, base: str
+) -> tuple[int, int] | None:
+    """Return ``(ahead, behind)`` of ``branch`` relative to a LOCAL ``base``.
+
+    ``ahead`` = commits on ``branch`` not reachable from ``base``; ``behind`` =
+    commits on ``base`` not reachable from ``branch``. ``base`` is resolved as
+    ``refs/heads/<base>`` — deliberately the LOCAL branch, not the remote
+    ``@{upstream}`` — because prune-worktrees measures "empty" and "behind"
+    against the local branch the worktree was created from (typically the local
+    default branch), which always exists and does not depend on an upstream
+    being configured. Returns ``None`` when git cannot resolve the comparison
+    (e.g. the local base branch is absent), so the caller treats "base unknown"
+    as "can't establish empty/behind" and bias-skips. Read-only.
+
+    prune-worktrees' State-1 path keys on this: an EMPTY worktree has
+    ``ahead == 0`` (nothing unique to the branch), and a SUPERSEDED one has
+    ``behind > 0`` (the local base moved on past it).
+    """
+    completed = _git_run(
+        repo_path,
+        "rev-list",
+        "--left-right",
+        "--count",
+        f"{branch}...refs/heads/{base}",
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    parts = completed.stdout.split()
+    if len(parts) != 2:
+        return None
+    try:
+        return (int(parts[0]), int(parts[1]))
+    except ValueError:
+        return None
+
+
+def branch_contained_in(repo_path: Path, base: str, branch: str) -> bool:
+    """True if every commit on ``branch`` is already reachable from LOCAL ``base``.
+
+    ``git rev-list --count refs/heads/<base>..<branch> == 0`` — i.e. ``branch``
+    has been fully merged into the local ``base`` (e.g. a local default branch
+    the user merged into directly instead of opening a PR). Raises
+    :class:`WorktreeError` on git failure (e.g. ``base`` does not exist locally)
+    so the caller treats an unverifiable containment as "skip with reason".
+    Read-only. Backs prune-worktrees' opt-in State-2b path.
+    """
+    completed = _git_run(
+        repo_path, "rev-list", "--count", f"refs/heads/{base}..{branch}"
+    )
+    try:
+        return int(completed.stdout.strip()) == 0
+    except ValueError as exc:
+        raise WorktreeError(
+            f"branch_contained_in({base!r}, {branch!r}): unexpected output "
+            f"{completed.stdout.strip()!r}"
+        ) from exc
+
+
+def worktree_mtime_age_days(worktree_path: Path, now: datetime) -> float | None:
+    """Age in days of ``worktree_path`` by its directory mtime, or ``None``.
+
+    The staleness signal for an EMPTY worktree, which has no commit of its own
+    to date. The directory mtime tracks the last write into the worktree, so an
+    untouched scratch worktree's mtime stays near its creation time. Returns
+    ``None`` if the path is missing or unreadable, which the caller treats as
+    "staleness unknown → keep" (bias safe).
+    """
+    try:
+        mtime = worktree_path.stat().st_mtime
+    except OSError:
+        return None
+    return (
+        now - datetime.fromtimestamp(mtime, tz=timezone.utc)
+    ).total_seconds() / 86400.0
+
+
+def branch_committer_age_days(
+    repo_path: Path, branch: str, now: datetime
+) -> float | None:
+    """Age in days of ``branch``'s tip commit (committer date), or ``None``.
+
+    The staleness signal for a worktree-less local branch on the no-PR safe
+    path (a free branch has no worktree dir to mtime). ``git log -1 --format=
+    %cI`` gives the tip's strict-ISO committer date. Returns ``None`` if git
+    can't resolve it, treated by the caller as "staleness unknown → keep".
+    """
+    completed = _git_run(
+        repo_path, "log", "-1", "--format=%cI", branch, check=False
+    )
+    if completed.returncode != 0:
+        return None
+    raw = completed.stdout.strip()
+    if not raw:
+        return None
+    try:
+        tip = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if tip.tzinfo is None:
+        tip = tip.replace(tzinfo=timezone.utc)
+    return (now - tip).total_seconds() / 86400.0
+
+
+def delete_branch_trusting_local_default(
+    repo_path: Path, branch: str, local_default: str
+) -> bool:
+    """Force-delete ``branch`` IFF it is fully contained in ``local_default``.
+
+    The State-2b path (opt-in ``--trust-local-default``): the branch was merged
+    into the local default branch directly (no PR), so ``git branch -d`` would
+    refuse it — it is not merged into the clone's HEAD or its own upstream even
+    though the work is preserved in the local default. RE-verifies containment
+    at delete time (defense in depth against a change racing in since
+    classification) and only then uses ``git branch -D``. Returns True if
+    deleted, False if containment no longer holds (branch kept). Raises
+    :class:`WorktreeError` on git failure.
+    """
+    if not branch_contained_in(repo_path, local_default, branch):
+        return False
+    _git_run(repo_path, "branch", "-D", branch)
+    return True
+
+
 def remove_linked_worktree(repo_path: Path, worktree_path: Path) -> None:
     """Remove a LINKED worktree via ``git worktree remove`` (no --force).
 
@@ -474,8 +600,12 @@ def delete_merged_local_branch(repo_path: Path, branch: str) -> bool:
 __all__ = [
     "WorktreeEntry",
     "WorktreeError",
+    "branch_ahead_behind",
+    "branch_committer_age_days",
+    "branch_contained_in",
     "branch_unpushed_commit_count",
     "create_worktree",
+    "delete_branch_trusting_local_default",
     "delete_merged_local_branch",
     "is_worktree_in_conflict",
     "list_worktrees",
@@ -484,4 +614,5 @@ __all__ = [
     "remove_worktree",
     "worktree_change_summary",
     "worktree_in_progress_op",
+    "worktree_mtime_age_days",
 ]
