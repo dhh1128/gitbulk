@@ -70,6 +70,21 @@ EXIT_OVERRIDES_APPLIED = 4
 
 _LOCK_TIMEOUT_SECONDS: float = 1800.0
 
+#: Branch names ALWAYS treated as sacred (never auto-pruned) regardless of
+#: upstream/PR state. A name-based backstop to the remote-driven protection
+#: guard: the remote-driven check keys entirely off the branch's UPSTREAM, so it
+#: silently fails to protect a default-ish branch that has no upstream
+#: configured, or that tracks a remote branch which is not the repo's *current*
+#: GitHub default (e.g. a legacy ``main`` in a repo whose default has since
+#: moved). Deleting a branch literally named ``main``/``master`` is exactly what
+#: a fleet-cleanup tool must refuse to do unattended, so we keep these
+#: unconditionally. The repo's actual GitHub default branch (whatever its name)
+#: is protected too, in :func:`_classify_branch_by_pr`, as are any operator-
+#: configured names from ``defaults.sacred_branches`` (and per-repo overrides),
+#: which are UNIONED with this built-in set. This guard only ever KEEPS more
+#: branches, so it can never introduce an unsafe deletion.
+_SACRED_BRANCH_NAMES: frozenset[str] = frozenset({"main", "master"})
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -166,11 +181,15 @@ def _classify_branch_by_pr(
     prdls2nq, prgrc3kp).
 
     ``base`` carries the row identity (slug, kind, path, branch). The
-    protection guard is REMOTE-driven (never name-based): ``upstream`` is the
-    remote branch this local branch tracks, and the branch is kept when that
-    upstream is the repo's default branch OR is protected on GitHub. If
+    protection guard is primarily REMOTE-driven: ``upstream`` is the remote
+    branch this local branch tracks, and the branch is kept when that upstream
+    is the repo's default branch OR is protected on GitHub. If
     ``protected_upstreams`` is ``None`` the remote protection could not be
-    fetched, so we refuse (bias to safe).
+    fetched, so we refuse (bias to safe). A name-based backstop runs first and
+    unconditionally keeps any branch whose LOCAL name is the repo's GitHub
+    default branch or a sacred default name (``main``/``master``), since the
+    remote-driven guard keys off the upstream and silently misses default-ish
+    branches with no upstream or a stale one (see :data:`_SACRED_BRANCH_NAMES`).
 
     Returns a ``delete`` when, after the protection/open-PR gates, the branch
     HAS a merged/closed upstream PR past the grace period and no unpushed
@@ -179,6 +198,23 @@ def _classify_branch_by_pr(
     worktree behind its local base; all commits already on a remote; opt-in
     local-default merge) and otherwise keeps the historical skip.
     """
+    # Name-based backstop (defense in depth): never auto-prune a branch whose
+    # LOCAL name is the repo's GitHub default branch, a universally-sacred
+    # default name (``main``/``master``), or an operator-configured sacred name
+    # (``defaults.sacred_branches`` / per-repo override). The remote-driven guard
+    # below keys off the UPSTREAM and so misses these when the branch has no
+    # upstream configured, or tracks a remote branch that is not the repo's
+    # current default. This is additive — it can only ever keep a branch — so it
+    # closes the hole without weakening any existing protection (node prnwlb7q).
+    sacred = _SACRED_BRANCH_NAMES.union(policy_for(policy, slug).sacred_branches)
+    if branch in sacred or (
+        default_branch is not None and branch == default_branch
+    ):
+        return {
+            **base, "decision": "skip",
+            "reason": f"default/protected branch name '{branch}' (never auto-pruned)",
+        }
+
     if protected_upstreams is None:
         return {
             **base, "decision": "skip",

@@ -515,6 +515,43 @@ repos:
     assert effective.extra_checks == ("extra_global", "extra_repo")
 
 
+def test_sacred_branches_default_empty():
+    from gitbulk.config.policy import Defaults
+    assert Defaults().sacred_branches == ()
+
+
+def test_sacred_branches_parsed_from_defaults(tmp_path):
+    content = """
+defaults:
+  sacred_branches: [develop, trunk]
+"""
+    policy = load_policy(_write_policy(tmp_path, content))
+    assert policy.defaults.sacred_branches == ("develop", "trunk")
+
+
+def test_sacred_branches_append_on_override(tmp_path):
+    content = """
+defaults:
+  sacred_branches: [develop]
+repos:
+  owner/repo:
+    sacred_branches: [release/prod]
+"""
+    policy = load_policy(_write_policy(tmp_path, content))
+    assert policy.repos["owner/repo"].sacred_branches == ("release/prod",)
+    effective = policy_for(policy, "owner/repo")
+    assert effective.sacred_branches == ("develop", "release/prod")
+
+
+def test_sacred_branches_rejects_non_string(tmp_path):
+    content = """
+defaults:
+  sacred_branches: [develop, 7]
+"""
+    with pytest.raises(ConfigError):
+        load_policy(_write_policy(tmp_path, content))
+
+
 def test_policy_for_override_with_empty_lists(tmp_path):
     # If repo override doesn't specify skip_checks, defaults apply.
     content = """

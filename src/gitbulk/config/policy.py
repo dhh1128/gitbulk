@@ -64,6 +64,7 @@ _DEFAULTS_KEYS = {
     "prune_plan_max_age_minutes",
     "skip_checks",
     "extra_checks",
+    "sacred_branches",
 }
 
 #: Defaults-only keys: valid under ``defaults:`` but NOT as a per-repo
@@ -114,6 +115,13 @@ class Defaults:
     prune_plan_max_age_minutes: int = 720
     skip_checks: tuple[str, ...] = ()
     extra_checks: tuple[str, ...] = ()
+    #: Extra branch names prune-worktrees treats as SACRED — never auto-pruned,
+    #: exactly like the always-sacred ``main``/``master`` and the repo's GitHub
+    #: default branch. Match is exact and case-sensitive (git branch names are).
+    #: For org conventions like ``develop``/``trunk``/``release`` that the
+    #: local-branch sweep must never touch. Appended to (not replacing) the
+    #: built-in sacred set; a per-repo override appends further (node prnwlb7q).
+    sacred_branches: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -144,6 +152,7 @@ class RepoOverride:
     prune_plan_max_age_minutes: int | None = None
     skip_checks: tuple[str, ...] = ()  # appended to defaults
     extra_checks: tuple[str, ...] = ()  # appended to defaults
+    sacred_branches: tuple[str, ...] = ()  # appended to defaults
     #: Per-repo coding-agent selection (this.i agprof4k); names a profile
     #: under ``agents:`` or a built-in preset. ``None`` ⇒ use ``default_agent``.
     agent: str | None = None
@@ -288,6 +297,10 @@ def _parse_defaults(raw: dict[str, Any], where: str) -> Defaults:
         kwargs["extra_checks"] = _ensure_str_list(
             raw["extra_checks"], f"{where}.extra_checks"
         )
+    if "sacred_branches" in raw:
+        kwargs["sacred_branches"] = _ensure_str_list(
+            raw["sacred_branches"], f"{where}.sacred_branches"
+        )
     return Defaults(**kwargs)
 
 
@@ -374,6 +387,10 @@ def _parse_repo_override(raw: dict[str, Any], where: str) -> RepoOverride:
     if "extra_checks" in raw:
         kwargs["extra_checks"] = _ensure_str_list(
             raw["extra_checks"], f"{where}.extra_checks"
+        )
+    if "sacred_branches" in raw:
+        kwargs["sacred_branches"] = _ensure_str_list(
+            raw["sacred_branches"], f"{where}.sacred_branches"
         )
     if "agent" in raw:
         kwargs["agent"] = _ensure_str(raw["agent"], f"{where}.agent")
@@ -515,4 +532,5 @@ def policy_for(policy: Policy, slug: str) -> Defaults:
             updates[key] = v
     updates["skip_checks"] = base.skip_checks + override.skip_checks
     updates["extra_checks"] = base.extra_checks + override.extra_checks
+    updates["sacred_branches"] = base.sacred_branches + override.sacred_branches
     return replace(base, **updates)

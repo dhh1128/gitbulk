@@ -73,8 +73,8 @@ actually bots, and `humans.always_human` for humans outside the org.
 ### `repos` — per-repo overrides
 
 Keys are `owner/repo` strings from `repos.txt`. Scalar fields override the
-matching `defaults.` value; list fields (`skip_checks`, `extra_checks`) are
-**appended** to the defaults rather than replacing them.
+matching `defaults.` value; list fields (`skip_checks`, `extra_checks`,
+`sacred_branches`) are **appended** to the defaults rather than replacing them.
 
 ```yaml
 repos:
@@ -83,6 +83,22 @@ repos:
     min_business_days: 1
   provenant-dev/origin-platform:
     unresolved_burden: other   # acting as maintainer here, not contributor
+    sacred_branches: [release/prod]   # never let prune-worktrees sweep this one
+```
+
+### `sacred_branches` — branches `prune-worktrees` must never sweep
+
+`prune-worktrees` already refuses to delete a branch named `main`/`master` or
+one matching a repo's GitHub **default branch**, even when it has no upstream
+configured. Set `defaults.sacred_branches` (or a per-repo override) to extend
+that always-protected set with your own conventions — `develop`, `trunk`,
+`release`, integration branches, etc. Matching is exact and case-sensitive, and
+the configured names are *unioned* with the built-in protections, so this can
+only ever keep more branches.
+
+```yaml
+defaults:
+  sacred_branches: [develop, trunk]
 ```
 
 See [`config/gitbulk.yaml.example`](https://github.com/dhh1128/gitbulk/blob/main/config/gitbulk.yaml.example)

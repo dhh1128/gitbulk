@@ -24,7 +24,7 @@ from gitbulk.commands.prune_worktrees import (
     _classify_worktree,
     prune_worktrees_handler,
 )
-from gitbulk.config.policy import Policy
+from gitbulk.config.policy import Defaults, Policy, RepoOverride
 from gitbulk.gh import FakeGHClient, GHError
 from gitbulk.pr_info import BranchRef, ClosedPRRef, PRInfo
 from gitbulk.worktree import WorktreeEntry, WorktreeError
@@ -38,11 +38,14 @@ from gitbulk.worktree import WorktreeEntry, WorktreeError
 # materializes REAL git repos with an origin remote (not empty dirs).
 @pytest.fixture
 def write_config(isolated_xdg, code_root):
-    def _write(*, repos_slugs, remote="match"):
+    def _write(*, repos_slugs, remote="match", defaults_extra=None):
         cfg_dir = paths.config_dir()
         cfg_dir.mkdir(parents=True, exist_ok=True)
+        defaults = {"retain_runs": 5, "prune_min_age_days": 7}
+        if defaults_extra:
+            defaults.update(defaults_extra)
         policy_yaml = {
-            "defaults": {"retain_runs": 5, "prune_min_age_days": 7},
+            "defaults": defaults,
             "humans": {"org": "provenant-dev", "cache_ttl_hours": 24},
         }
         (cfg_dir / "gitbulk.yaml").write_text(yaml.safe_dump(policy_yaml))
@@ -1155,9 +1158,11 @@ def test_open_pr_fetch_failure_aborts_structural(
 
 
 def _classify_lb(fake, branch, *, default_branch="main",
-                 protected_upstreams=frozenset(), upstream=None, open_heads=()):
+                 protected_upstreams=frozenset(), upstream=None, open_heads=(),
+                 policy=None):
     return pw._classify_local_branch(
-        fake, Policy(), "o/r", Path("/clone"), branch, set(open_heads), NOW,
+        fake, policy or Policy(), "o/r", Path("/clone"), branch,
+        set(open_heads), NOW,
         default_branch=default_branch, protected_upstreams=protected_upstreams,
         upstream=upstream,
     )
@@ -1194,6 +1199,127 @@ def test_classify_deletes_when_upstream_not_protected(clean_helpers):
         protected_upstreams=frozenset({"main"}), upstream="stale",
     )
     assert out["decision"] == "delete"
+
+
+def test_classify_keeps_sacred_master_without_upstream(clean_helpers):
+    # Real failure mode (codecraft.co): a legacy local `master` with NO upstream
+    # configured. The remote-driven guard keys off the upstream and so never
+    # fires; the name backstop must keep it. Default is `main` (master is not it).
+    out = _classify_lb(
+        FakeGHClient(), "master", default_branch="main", upstream=None,
+    )
+    assert out["decision"] == "skip"
+    assert "never auto-pruned" in out["reason"]
+
+
+def test_classify_keeps_sacred_main_tracking_nondefault_upstream(clean_helpers):
+    # Real failure mode (kswg-cesr-specification): local `main` tracks
+    # `origin/main`, but the repo's GitHub default branch is something else
+    # (`revised-format`), so `main` is neither default nor protected. The
+    # remote-driven guard would delete it; the sacred-name backstop keeps it.
+    out = _classify_lb(
+        FakeGHClient(), "main", default_branch="revised-format",
+        protected_upstreams=frozenset({"revised-format"}), upstream="main",
+    )
+    assert out["decision"] == "skip"
+    assert "never auto-pruned" in out["reason"]
+
+
+def test_classify_keeps_actual_default_branch_without_upstream(clean_helpers):
+    # Most dangerous real case: the branch IS the repo's GitHub default
+    # (`revised-format`, an unconventional name) but has no upstream set, so the
+    # remote-driven guard misses it. Protected by name == default_branch.
+    out = _classify_lb(
+        FakeGHClient(), "revised-format", default_branch="revised-format",
+        upstream=None,
+    )
+    assert out["decision"] == "skip"
+    assert "never auto-pruned" in out["reason"]
+
+
+def test_sacred_backstop_runs_before_pr_lookup(clean_helpers):
+    # The backstop short-circuits ahead of any closed-PR lookup, so even a
+    # `main` with a merged PR past grace is never consulted/deleted.
+    fake = FakeGHClient(closed_prs_for_head={
+        ("o/r", "main"): [_closed("o/r", 7, head_ref="main")]
+    })
+    out = _classify_lb(fake, "main", default_branch="dev", upstream=None)
+    assert out["decision"] == "skip"
+    assert fake.call_count["closed_prs_for_head"] == 0
+
+
+def test_classify_keeps_configured_sacred_branch(clean_helpers):
+    # Operator-configured sacred name (defaults.sacred_branches) is unioned with
+    # the built-in main/master and protected just like them — even with no
+    # upstream and no PR.
+    policy = Policy(defaults=Defaults(sacred_branches=("develop", "trunk")))
+    out = _classify_lb(
+        FakeGHClient(), "develop", default_branch="main", upstream=None,
+        policy=policy,
+    )
+    assert out["decision"] == "skip"
+    assert "never auto-pruned" in out["reason"]
+
+
+def test_classify_configured_sacred_branch_per_repo_override(clean_helpers):
+    # A per-repo override appends to the defaults' sacred set for that slug.
+    policy = Policy(
+        defaults=Defaults(sacred_branches=("develop",)),
+        repos={"o/r": RepoOverride(sacred_branches=("release/prod",))},
+    )
+    out = _classify_lb(
+        FakeGHClient(), "release/prod", default_branch="main", upstream=None,
+        policy=policy,
+    )
+    assert out["decision"] == "skip" and "never auto-pruned" in out["reason"]
+
+
+def test_classify_non_sacred_branch_unaffected_by_config(clean_helpers):
+    # A branch NOT in the configured set is unaffected by the feature: the
+    # sacred backstop does not fire, so it proceeds to the normal no-PR path.
+    policy = Policy(defaults=Defaults(sacred_branches=("develop",)))
+    out = _classify_lb(
+        FakeGHClient(), "feature", default_branch="main", upstream=None,
+        policy=policy,
+    )
+    assert "never auto-pruned" not in out["reason"]
+
+
+def test_configured_sacred_branch_kept_end_to_end(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
+):
+    # End-to-end: a `develop` branch configured via defaults.sacred_branches is
+    # kept by the handler even though it has no upstream and no PR — proving the
+    # config flows from gitbulk.yaml through to the classifier.
+    write_config(
+        repos_slugs=["dhh1128/alpha"], defaults_extra={"sacred_branches": ["develop"]}
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),  # clone checked out on main
+    ])
+    # `develop` has no upstream and is not the GitHub default (main).
+    monkeypatch.setattr(pw, "local_branch_upstreams",
+                        lambda r: [("main", "main"), ("develop", None)])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": []},
+        my_open_prs={"dhh1128/alpha": []},
+        closed_prs_for_head={
+            ("dhh1128/alpha", "develop"): [_closed("dhh1128/alpha", 9, head_ref="develop")]
+        },
+    )
+    _install(monkeypatch, fake)
+    rc = prune_worktrees_handler(_args(code_root=code_root))
+    assert rc == EXIT_OK
+    # Sacred backstop fires before the PR lookup.
+    assert fake.call_count["closed_prs_for_head"] == 0
+    summary = _summary()
+    assert "branch name 'develop' (never auto-pruned)" in summary
+    assert "## Would remove" not in summary
 
 
 def test_local_branch_kept_when_tracks_default_upstream(
