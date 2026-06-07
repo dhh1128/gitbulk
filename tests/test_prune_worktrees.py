@@ -158,8 +158,7 @@ def clean_helpers(monkeypatch):
     monkeypatch.setattr(pw, "worktree_change_summary", lambda p: (False, False, False))
     monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 0)
     monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: None)
-    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: None)
-    monkeypatch.setattr(pw, "branch_committer_age_days", lambda r, b, now: None)
+    monkeypatch.setattr(pw, "ref_last_update_age_days", lambda r, ref, now: None)
     monkeypatch.setattr(pw, "branch_contained_in", lambda r, base, b: False)
 
 
@@ -297,7 +296,7 @@ def _no_pr_fake(branch="feat"):
 
 def test_state1_empty_behind_stale_deletes(monkeypatch, clean_helpers):
     monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (0, 3))
-    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: 30.0)
+    monkeypatch.setattr(pw, "ref_last_update_age_days", lambda r, ref, now: 30.0)
     out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
     assert out["decision"] == "delete"
     assert "empty worktree behind local 'main' by 3" in out["reason"]
@@ -306,14 +305,14 @@ def test_state1_empty_behind_stale_deletes(monkeypatch, clean_helpers):
 def test_state1_empty_not_behind_kept(monkeypatch, clean_helpers):
     # ahead==0 but behind==0: nothing unique AND base hasn't moved → maybe fresh.
     monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (0, 0))
-    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: 99.0)
+    monkeypatch.setattr(pw, "ref_last_update_age_days", lambda r, ref, now: 99.0)
     out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
     assert out["decision"] == "skip" and "not behind local 'main'" in out["reason"]
 
 
 def test_state1_empty_behind_but_fresh_kept(monkeypatch, clean_helpers):
     monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (0, 5))
-    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: 2.0)
+    monkeypatch.setattr(pw, "ref_last_update_age_days", lambda r, ref, now: 2.0)
     out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
     assert out["decision"] == "skip"
     assert "untouched only 2d" in out["reason"] and "grace period" in out["reason"]
@@ -321,7 +320,7 @@ def test_state1_empty_behind_but_fresh_kept(monkeypatch, clean_helpers):
 
 def test_state1_empty_behind_age_unknown_kept(monkeypatch, clean_helpers):
     monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (0, 5))
-    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: None)
+    monkeypatch.setattr(pw, "ref_last_update_age_days", lambda r, ref, now: None)
     out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
     assert out["decision"] == "skip" and "could not determine age" in out["reason"]
 
@@ -332,7 +331,7 @@ def test_state1_empty_does_not_fall_through_to_2a(monkeypatch, clean_helpers):
     # even though every commit is on a remote and it is stale.
     monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (0, 0))
     monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 0)
-    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: 365.0)
+    monkeypatch.setattr(pw, "ref_last_update_age_days", lambda r, ref, now: 365.0)
     out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
     assert out["decision"] == "skip" and "not behind" in out["reason"]
 
@@ -351,7 +350,7 @@ def test_state1_skipped_when_no_local_base(monkeypatch, clean_helpers):
 def test_state2a_on_remote_stale_deletes(monkeypatch, clean_helpers):
     monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (2, 0))
     monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 0)
-    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: 30.0)
+    monkeypatch.setattr(pw, "ref_last_update_age_days", lambda r, ref, now: 30.0)
     out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
     assert out["decision"] == "delete"
     assert "every commit is already on a remote" in out["reason"]
@@ -360,7 +359,7 @@ def test_state2a_on_remote_stale_deletes(monkeypatch, clean_helpers):
 def test_state2a_fresh_kept(monkeypatch, clean_helpers):
     monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (2, 0))
     monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 0)
-    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: 1.0)
+    monkeypatch.setattr(pw, "ref_last_update_age_days", lambda r, ref, now: 1.0)
     out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
     assert out["decision"] == "skip" and "only 1d old" in out["reason"]
 
@@ -368,7 +367,7 @@ def test_state2a_fresh_kept(monkeypatch, clean_helpers):
 def test_state2a_age_unknown_kept(monkeypatch, clean_helpers):
     monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (2, 0))
     monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 0)
-    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: None)
+    monkeypatch.setattr(pw, "ref_last_update_age_days", lambda r, ref, now: None)
     out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
     assert out["decision"] == "skip" and "could not determine age" in out["reason"]
 
@@ -385,9 +384,9 @@ def test_state2a_commit_check_error_kept(monkeypatch, clean_helpers):
     assert out["decision"] == "skip" and "could not verify commits" in out["reason"]
 
 
-def test_state2a_free_branch_uses_committer_date(monkeypatch, clean_helpers):
+def test_state2a_free_branch_uses_ref_age(monkeypatch, clean_helpers):
     monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 0)
-    monkeypatch.setattr(pw, "branch_committer_age_days", lambda r, b, now: 40.0)
+    monkeypatch.setattr(pw, "ref_last_update_age_days", lambda r, ref, now: 40.0)
     out = pw._classify_local_branch(
         _no_pr_fake("stale"), Policy(), "o/r", Path("/clone"), "stale",
         set(), NOW, default_branch="main", protected_upstreams=frozenset(),
@@ -1371,7 +1370,7 @@ def test_state1_empty_worktree_swept_dry_run(
     ])
     # Empty vs local main, base moved 4 commits ahead, untouched 30 days.
     monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (0, 4))
-    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: 30.0)
+    monkeypatch.setattr(pw, "ref_last_update_age_days", lambda r, ref, now: 30.0)
     fake = FakeGHClient(
         user={"login": "dhh1128"},
         org_members={"provenant-dev": ["dhh1128"]},
@@ -1401,7 +1400,7 @@ def test_state1_empty_worktree_kept_without_flag_irrelevant(
         _entry(clone.parent / "alpha-fresh", branch="fresh"),
     ])
     monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (0, 0))
-    monkeypatch.setattr(pw, "worktree_mtime_age_days", lambda p, now: 30.0)
+    monkeypatch.setattr(pw, "ref_last_update_age_days", lambda r, ref, now: 30.0)
     fake = FakeGHClient(
         user={"login": "dhh1128"},
         org_members={"provenant-dev": ["dhh1128"]},

@@ -50,17 +50,16 @@ from gitbulk import subcommands as subcommands_mod
 from gitbulk.worktree import (
     WorktreeError,
     branch_ahead_behind,
-    branch_committer_age_days,
     branch_contained_in,
     branch_unpushed_commit_count,
     delete_branch_trusting_local_default,
     delete_merged_local_branch,
     list_worktrees,
     local_branch_upstreams,
+    ref_last_update_age_days,
     remove_linked_worktree,
     worktree_change_summary,
     worktree_in_progress_op,
-    worktree_mtime_age_days,
 )
 
 EXIT_OK = 0
@@ -254,16 +253,17 @@ def _classify_no_pr(
     * **State 1 (worktrees only):** an EMPTY worktree — no commits unique to it
       relative to the LOCAL ``default_branch`` it was created from (``ahead ==
       0``) — that is also BEHIND that base (``behind > 0``) and has sat
-      untouched past the grace period (worktree dir mtime). A created-but-
-      abandoned scratch tree the local base moved past. Empty worktrees are
-      decided HERE and never fall through to State 2a, so the behind+stale
-      guardrails the user asked for always govern them. The base is the LOCAL
-      default branch, NOT the remote upstream — the worktree is measured against
-      the branch it was forked from locally.
+      untouched past the grace period (by the worktree's HEAD reflog). A
+      created-but-abandoned scratch tree the local base moved past. Empty
+      worktrees are decided HERE and never fall through to State 2a, so the
+      behind+stale guardrails the user asked for always govern them. The base is
+      the LOCAL default branch, NOT the remote upstream — the worktree is
+      measured against the branch it was forked from locally.
     * **State 2a:** every commit on the branch is already on a remote
       (``branch_unpushed_commit_count == 0``), so removal loses nothing —
-      additionally gated on staleness (worktree mtime, or branch committer date
-      for a free branch) to avoid reaping freshly-pushed work.
+      additionally gated on staleness (the ref's reflog age: the worktree's HEAD
+      reflog, or the branch reflog for a free branch) to avoid reaping freshly-
+      created or freshly-pushed work.
     * **State 2b (opt-in ``--trust-local-default``):** the branch was merged
       into the LOCAL default branch directly (no PR); its commits may live only
       locally, so this trusts the local default as proof the work landed. The
@@ -292,7 +292,7 @@ def _classify_no_pr(
                         f"(possibly fresh)"
                     ),
                 }
-            age = worktree_mtime_age_days(worktree_path, now)
+            age = ref_last_update_age_days(worktree_path, "HEAD", now)
             if age is None:
                 return {
                     **base, "decision": "skip",
@@ -322,9 +322,9 @@ def _classify_no_pr(
         return {**base, "decision": "skip", "reason": f"could not verify commits: {e}"}
     if unpushed == 0:
         age = (
-            worktree_mtime_age_days(worktree_path, now)
+            ref_last_update_age_days(worktree_path, "HEAD", now)
             if kind == "worktree" and worktree_path is not None
-            else branch_committer_age_days(clone_path, branch, now)
+            else ref_last_update_age_days(clone_path, branch, now)
         )
         if age is None:
             return {

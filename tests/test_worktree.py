@@ -308,16 +308,15 @@ def test_is_worktree_in_conflict_git_failure_treated_as_conflict(tmp_path):
 from gitbulk.worktree import (  # noqa: E402
     WorktreeEntry,
     branch_ahead_behind,
-    branch_committer_age_days,
     branch_contained_in,
     branch_unpushed_commit_count,
     delete_branch_trusting_local_default,
     delete_merged_local_branch,
     list_worktrees,
+    ref_last_update_age_days,
     remove_linked_worktree,
     worktree_change_summary,
     worktree_in_progress_op,
-    worktree_mtime_age_days,
 )
 
 
@@ -685,66 +684,50 @@ def test_branch_contained_in_raises_on_nonnumeric_output():
             branch_contained_in(Path("/r"), "main", "feat")
 
 
-def test_worktree_mtime_age_days(tmp_path: Path):
-    wt = tmp_path / "wt"
-    wt.mkdir()
-    import os
-    old = (_T - timedelta(days=10)).timestamp()
-    os.utime(wt, (old, old))
-    age = worktree_mtime_age_days(wt, _T)
-    assert age is not None and 9.9 < age < 10.1
-
-
-def test_worktree_mtime_age_days_none_when_missing(tmp_path: Path):
-    assert worktree_mtime_age_days(tmp_path / "gone", _T) is None
-
-
-def test_branch_committer_age_days_parses_iso():
-    iso = (_T - timedelta(days=5)).isoformat()
+def test_ref_last_update_age_days_parses_reflog_unix():
+    # `git log -g -1 --date=unix --format=%gd <ref>` renders as
+    # "<ref>@{<unixtime>}"; age is measured from that local-update time, NOT the
+    # tip commit's committer date.
+    ts = int((_T - timedelta(days=5)).timestamp())
     with patch(
         "gitbulk.worktree.subprocess.run",
-        side_effect=lambda *a, **k: _completed(stdout=iso + "\n"),
+        side_effect=lambda *a, **k: _completed(stdout=f"feat@{{{ts}}}\n"),
     ) as mock_run:
-        age = branch_committer_age_days(Path("/r"), "feat", _T)
+        age = ref_last_update_age_days(Path("/r"), "feat", _T)
     assert age is not None and 4.9 < age < 5.1
     argv = mock_run.call_args[0][0]
-    assert argv[-4:] == ["log", "-1", "--format=%cI", "feat"]
+    assert argv[-6:] == [
+        "log", "-g", "-1", "--date=unix", "--format=%gd", "feat",
+    ]
 
 
-def test_branch_committer_age_days_none_on_error():
+def test_ref_last_update_age_days_head_for_worktree():
+    ts = int((_T - timedelta(days=2)).timestamp())
     with patch(
         "gitbulk.worktree.subprocess.run",
-        side_effect=lambda *a, **k: _completed(returncode=1),
-    ):
-        assert branch_committer_age_days(Path("/r"), "feat", _T) is None
+        side_effect=lambda *a, **k: _completed(stdout=f"HEAD@{{{ts}}}\n"),
+    ) as mock_run:
+        age = ref_last_update_age_days(Path("/wt"), "HEAD", _T)
+    assert age is not None and 1.9 < age < 2.1
+    assert mock_run.call_args[0][0][-1] == "HEAD"
 
 
-def test_branch_committer_age_days_none_on_empty():
+def test_ref_last_update_age_days_none_on_git_error():
+    # Absent ref → git exits nonzero.
     with patch(
         "gitbulk.worktree.subprocess.run",
-        side_effect=lambda *a, **k: _completed(stdout="  \n"),
+        side_effect=lambda *a, **k: _completed(returncode=128, stderr="bad rev"),
     ):
-        assert branch_committer_age_days(Path("/r"), "feat", _T) is None
+        assert ref_last_update_age_days(Path("/r"), "gone", _T) is None
 
 
-def test_branch_committer_age_days_none_on_unparseable():
+def test_ref_last_update_age_days_none_when_no_reflog():
+    # A ref with reflog disabled/expired emits no @{...} selector (empty stdout).
     with patch(
         "gitbulk.worktree.subprocess.run",
-        side_effect=lambda *a, **k: _completed(stdout="not-a-date\n"),
+        side_effect=lambda *a, **k: _completed(stdout="\n"),
     ):
-        assert branch_committer_age_days(Path("/r"), "feat", _T) is None
-
-
-def test_branch_committer_age_days_assumes_utc_when_naive():
-    # A committer date without a timezone offset is treated as UTC (defensive;
-    # %cI normally carries an offset).
-    naive = (_T - timedelta(days=3)).replace(tzinfo=None).isoformat()
-    with patch(
-        "gitbulk.worktree.subprocess.run",
-        side_effect=lambda *a, **k: _completed(stdout=naive + "\n"),
-    ):
-        age = branch_committer_age_days(Path("/r"), "feat", _T)
-    assert age is not None and 2.9 < age < 3.1
+        assert ref_last_update_age_days(Path("/r"), "feat", _T) is None
 
 
 def test_delete_branch_trusting_local_default_force_deletes_when_contained():

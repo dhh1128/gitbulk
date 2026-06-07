@@ -151,13 +151,15 @@ period and the no-data-loss rule:
 - **Empty worktree behind its local base** — the branch has *no commits of its
   own* relative to the **local** branch it was created from (its local default
   branch) and that base has since moved ahead, and the worktree has sat
-  untouched (by directory mtime) past the grace period. A created-but-abandoned
-  scratch tree the world moved past. A *fresh* empty worktree (base hasn't
-  moved) is kept, so this never reaps a worktree you just made.
+  untouched (by the worktree's HEAD reflog — when it was last created, checked
+  out, or committed onto) past the grace period. A created-but-abandoned scratch
+  tree the world moved past. A *fresh* empty worktree (base hasn't moved) is
+  kept, so this never reaps a worktree you just made.
 - **All commits already on a remote** — every commit on the branch is present
   on some remote-tracking branch, so removing the local worktree loses nothing
-  (you can re-create it from the remote). Stale-gated to avoid reaping
-  freshly-pushed work.
+  (you can re-create it from the remote). Stale-gated on the ref's reflog age
+  (when it last moved locally, not the tip commit's date) to avoid reaping
+  freshly-created or freshly-pushed work.
 - **Merged into the local default branch** *(opt-in: `--trust-local-default`)* —
   the branch was merged into your local default branch directly instead of
   through a PR, and its commits may live **only** locally. Off by default

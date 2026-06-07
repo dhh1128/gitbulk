@@ -18,6 +18,7 @@ the main clone, that would breach the local-git safety contract. The
 
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -499,49 +500,42 @@ def branch_contained_in(repo_path: Path, base: str, branch: str) -> bool:
         ) from exc
 
 
-def worktree_mtime_age_days(worktree_path: Path, now: datetime) -> float | None:
-    """Age in days of ``worktree_path`` by its directory mtime, or ``None``.
-
-    The staleness signal for an EMPTY worktree, which has no commit of its own
-    to date. The directory mtime tracks the last write into the worktree, so an
-    untouched scratch worktree's mtime stays near its creation time. Returns
-    ``None`` if the path is missing or unreadable, which the caller treats as
-    "staleness unknown → keep" (bias safe).
-    """
-    try:
-        mtime = worktree_path.stat().st_mtime
-    except OSError:
-        return None
-    return (
-        now - datetime.fromtimestamp(mtime, tz=timezone.utc)
-    ).total_seconds() / 86400.0
+#: Extracts the ``@{<unixtime>}`` suffix from a ``%gd`` reflog selector.
+_REFLOG_UNIX = re.compile(r"@\{(\d+)\}")
 
 
-def branch_committer_age_days(
-    repo_path: Path, branch: str, now: datetime
+def ref_last_update_age_days(
+    repo_path: Path, ref: str, now: datetime
 ) -> float | None:
-    """Age in days of ``branch``'s tip commit (committer date), or ``None``.
+    """Age in days since ``ref`` last moved locally (by its reflog), or ``None``.
 
-    The staleness signal for a worktree-less local branch on the no-PR safe
-    path (a free branch has no worktree dir to mtime). ``git log -1 --format=
-    %cI`` gives the tip's strict-ISO committer date. Returns ``None`` if git
-    can't resolve it, treated by the caller as "staleness unknown → keep".
+    The staleness signal for the no-PR safe paths. Reads the MOST RECENT reflog
+    entry's timestamp via ``git log -g -1 --date=unix --format=%gd <ref>`` —
+    which renders as ``<ref>@{<unixtime>}`` — i.e. when the ref was last updated
+    in THIS clone/worktree (created, committed onto, checked out, reset).
+
+    This is deliberately NOT the tip commit's committer date (which can be
+    ancient for a branch cut from an old commit, so it would defeat the grace
+    period) and NOT a directory mtime (which misses in-place edits and only
+    moves on dir-entry changes). For a worktree, pass ``ref="HEAD"`` with
+    ``repo_path`` set to the worktree dir to read its per-worktree HEAD reflog;
+    for a free branch, pass the branch name against the clone.
+
+    Returns ``None`` when the ref has no reachable reflog entry (reflog disabled
+    or expired, or the ref is absent), which the caller treats as "staleness
+    unknown → keep" (bias safe). Read-only.
     """
     completed = _git_run(
-        repo_path, "log", "-1", "--format=%cI", branch, check=False
+        repo_path, "log", "-g", "-1", "--date=unix", "--format=%gd", ref,
+        check=False,
     )
     if completed.returncode != 0:
         return None
-    raw = completed.stdout.strip()
-    if not raw:
+    match = _REFLOG_UNIX.search(completed.stdout)
+    if not match:
         return None
-    try:
-        tip = datetime.fromisoformat(raw)
-    except ValueError:
-        return None
-    if tip.tzinfo is None:
-        tip = tip.replace(tzinfo=timezone.utc)
-    return (now - tip).total_seconds() / 86400.0
+    moved = datetime.fromtimestamp(int(match.group(1)), tz=timezone.utc)
+    return (now - moved).total_seconds() / 86400.0
 
 
 def delete_branch_trusting_local_default(
@@ -601,7 +595,6 @@ __all__ = [
     "WorktreeEntry",
     "WorktreeError",
     "branch_ahead_behind",
-    "branch_committer_age_days",
     "branch_contained_in",
     "branch_unpushed_commit_count",
     "create_worktree",
@@ -610,9 +603,9 @@ __all__ = [
     "is_worktree_in_conflict",
     "list_worktrees",
     "local_branch_upstreams",
+    "ref_last_update_age_days",
     "remove_linked_worktree",
     "remove_worktree",
     "worktree_change_summary",
     "worktree_in_progress_op",
-    "worktree_mtime_age_days",
 ]
