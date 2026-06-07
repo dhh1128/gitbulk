@@ -298,14 +298,23 @@ def local_branch_upstreams(repo_path: Path) -> list[tuple[str, str | None]]:
     """Return ``(local_branch, upstream_remote_branch)`` for every local branch.
 
     The second element is the branch NAME on the remote that the local branch
-    tracks (``%(upstream:remoteref)`` with the ``refs/heads/`` prefix stripped),
-    or ``None`` when the branch tracks nothing. prune-worktrees (node prnwlb7q)
-    decides protection by the REMOTE's notion of default/protected applied to
-    this upstream — never by the local branch's name, which is unreliable (a
-    branch named ``main`` need not track ``origin/main``, and an integration
-    branch can be named anything). Read-only; honours the local-git safety
-    contract. Raises :class:`WorktreeError` on git failure so the caller treats
-    a clone whose branches can't be enumerated as "skip with reason".
+    tracks, or ``None`` when the branch tracks nothing. We read
+    ``%(upstream:remoteref)``, which is the ref name ON THE REMOTE —
+    ``refs/heads/<branch>`` — deliberately NOT bare ``%(upstream)`` /
+    ``:short``, which give the LOCAL tracking ref (``refs/remotes/<remote>/
+    <branch>`` / ``<remote>/<branch>``). We strip the ``refs/heads/`` prefix to
+    the bare branch name. As defence in depth on this safety-critical path we
+    ALSO strip a ``refs/remotes/<remote>/`` prefix, so the parser still yields
+    the bare branch name even if the format is ever changed to the tracking-ref
+    form (a wrong result here could delete a protected/default-tracking branch).
+
+    prune-worktrees (node prnwlb7q) decides protection by the REMOTE's notion of
+    default/protected applied to this upstream — never by the local branch's
+    name, which is unreliable (a branch named ``main`` need not track
+    ``origin/main``, and an integration branch can be named anything).
+    Read-only; honours the local-git safety contract. Raises
+    :class:`WorktreeError` on git failure so the caller treats a clone whose
+    branches can't be enumerated as "skip with reason".
     """
     completed = _git_run(
         repo_path,
@@ -324,6 +333,10 @@ def local_branch_upstreams(repo_path: Path) -> list[tuple[str, str | None]]:
         remoteref = remoteref.strip()
         if remoteref.startswith("refs/heads/"):
             upstream: str | None = remoteref[len("refs/heads/"):]
+        elif remoteref.startswith("refs/remotes/"):
+            # Defensive: strip refs/remotes/<remote>/ to the bare branch name.
+            _remote, _, branch = remoteref[len("refs/remotes/"):].partition("/")
+            upstream = branch or None
         else:
             upstream = remoteref or None
         out.append((name, upstream))

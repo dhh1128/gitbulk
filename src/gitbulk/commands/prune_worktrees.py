@@ -647,7 +647,10 @@ def _run_under_lock(
                 f"local branch {cand['branch']} "
                 f"{'deleted' if branch_deleted else 'kept (not fully merged)'}"
             )
-            action = "deleted-branch"
+            # Reflect the ACTUAL outcome: git branch -d may refuse (unmerged),
+            # leaving the branch in place, so the audit action must not claim a
+            # deletion that did not happen (Copilot PR #17 review).
+            action = "deleted-branch" if branch_deleted else "kept-branch"
         rs.record_error(
             msg, level="WARNING",
             context={

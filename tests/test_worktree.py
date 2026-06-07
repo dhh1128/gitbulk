@@ -500,6 +500,11 @@ def test_local_branch_upstreams_parses_and_strips():
         "orphan\t\n"
         "\n"
         "\trefs/heads/x\n"  # defensive: non-blank line with empty name -> skip
+        # Defensive: a tracking-ref form (refs/remotes/<remote>/<branch>) is
+        # NOT what :remoteref emits, but the parser strips it to the bare name
+        # so a format regression can't break the protection guard. Branch names
+        # with slashes survive the remote-prefix strip.
+        "tracked\trefs/remotes/origin/feature/x\n"
         "weird\tsomething-else\n"
     )
     with patch(
@@ -510,6 +515,7 @@ def test_local_branch_upstreams_parses_and_strips():
             ("main", "main"),
             ("feature/foo", "dev"),
             ("orphan", None),
+            ("tracked", "feature/x"),
             ("weird", "something-else"),
         ]
     argv = mock_run.call_args[0][0]

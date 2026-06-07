@@ -614,6 +614,23 @@ def _summary():
     return (paths.latest_run_symlink("prune-worktrees").resolve() / "summary.md").read_text()
 
 
+def _recorded_actions():
+    """The ``context.action`` values recorded to the run's errors.log (the
+    apply-mode audit trail), in order."""
+    import json
+    log = paths.latest_run_symlink("prune-worktrees").resolve() / "errors.log"
+    if not log.exists():
+        return []
+    out = []
+    for line in log.read_text().splitlines():
+        if not line.strip():
+            continue
+        ctx = json.loads(line).get("context", {})
+        if "action" in ctx:
+            out.append(ctx["action"])
+    return out
+
+
 def test_universal_failure_exits_structural(
     monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
 ):
@@ -828,6 +845,7 @@ def test_local_branch_swept_apply_deletes(
     assert "deleted 1 of 1 local branches" in capsys.readouterr().out
     summary = _summary()
     assert "branch `stale`" in summary and "branch deleted" in summary
+    assert _recorded_actions() == ["deleted-branch"]  # audit reflects reality
 
 
 def test_local_branch_apply_kept_when_unmerged(
@@ -853,6 +871,8 @@ def test_local_branch_apply_kept_when_unmerged(
     assert "deleted 0 of 1 local branches" in capsys.readouterr().out
     summary = _summary()
     assert "branch `stale`" in summary and "branch kept" in summary
+    # Audit action must reflect the kept outcome, not a deletion (Copilot #17).
+    assert _recorded_actions() == ["kept-branch"]
 
 
 def test_no_prune_local_branches_opt_out(
