@@ -14,9 +14,10 @@ defaults:
   stale_cooloff_days: 7          # close-stale: must have been warned at least this long ago
   stale_policy: warn-and-close   # warn-and-close | warn-only | never
   prune_min_age_days: 7          # prune-branches/-worktrees: grace period since a PR merged/closed
-  # sacred_branches: []          # prune-worktrees: extra branch names NEVER auto-pruned,
-  #                              # alongside the always-sacred main/master and each repo's
-  #                              # GitHub default branch (e.g. [develop, trunk]). Exact match.
+  # sacred_branches: []          # prune-branches/-worktrees: extra branch names NEVER
+  #                              # auto-pruned (local OR remote), alongside the always-sacred
+  #                              # main/master and each repo's GitHub default branch
+  #                              # (e.g. [develop, trunk]). Exact, case-sensitive match.
   # skip_checks: []              # invariants suppressed for every repo
   # extra_checks: []             # extra invariants enabled for every repo
 

@@ -558,6 +558,32 @@ def delete_branch_trusting_local_default(
     return True
 
 
+def delete_branch_all_commits_remote(repo_path: Path, branch: str) -> bool:
+    """Force-delete ``branch`` IFF every commit on it is already on a remote.
+
+    The apply-time mechanism for a candidate whose data-loss guard is "no
+    unpushed commits" (node prdls2nq): the PR-merged path and State-2a, both of
+    which classify a branch as deletable only when
+    :func:`branch_unpushed_commit_count` is 0. ``git branch -d`` is the WRONG
+    gate for these — it permits deletion only when the branch is an ancestor of
+    its configured ``@{upstream}`` or of ``HEAD``, so it silently refuses a
+    branch whose commits all live on a DIFFERENT remote ref (squash/rebase
+    merge, an auto-deleted remote head, or a stale local default) even though
+    deleting it loses nothing (node prnfd8kq). RE-verifies that count is still 0
+    at delete time (defense in depth against a push racing in since
+    classification, mirroring :func:`delete_branch_trusting_local_default`'s
+    containment re-check) and only then uses ``git branch -D``. Returns True if
+    deleted, False if the re-check now finds unpushed commits (branch kept —
+    work would be lost). Raises :class:`WorktreeError` on git failure (the
+    re-check's git error propagates, so the caller records a real failure rather
+    than a silent keep).
+    """
+    if branch_unpushed_commit_count(repo_path, branch) != 0:
+        return False
+    _git_run(repo_path, "branch", "-D", branch)
+    return True
+
+
 def remove_linked_worktree(repo_path: Path, worktree_path: Path) -> None:
     """Remove a LINKED worktree via ``git worktree remove`` (no --force).
 
@@ -598,6 +624,7 @@ __all__ = [
     "branch_contained_in",
     "branch_unpushed_commit_count",
     "create_worktree",
+    "delete_branch_all_commits_remote",
     "delete_branch_trusting_local_default",
     "delete_merged_local_branch",
     "is_worktree_in_conflict",

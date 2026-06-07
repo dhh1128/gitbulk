@@ -984,6 +984,56 @@ Gitbulk Triage Tool = goal:
             removal from a bare local-branch deletion.
           approved-by: daniel, 2026-06-06
 
+        Prune Force-Delete When All Commits Are On A Remote = decision:
+          id: prnfd8kq
+          why: >
+            Gap the user observed 2026-06-06 on a real run (gitbulk 0.7.3): a
+            dry-run promised "50 local branches would be removed" but --apply
+            "deleted 47 of 50 local branches; 0 failed" — 3 vanished silently,
+            counted neither as deletions nor as failures. Root cause: the
+            CLASSIFY gate and the APPLY gate used different, non-equivalent
+            tests for "safe to delete". A branch becomes a delete candidate
+            (PR-merged path in _classify_branch_by_pr, and State-2a in
+            _classify_no_pr) only when branch_unpushed_commit_count == 0, i.e.
+            EVERY commit is reachable from SOME remote-tracking ref
+            (``git rev-list --count <branch> --not --remotes`` == 0) — that IS
+            the prdls2nq data-loss guard. But apply deleted via
+            ``git branch -d`` (delete_merged_local_branch), and ``-d`` is a
+            DIFFERENT test: git allows it only when the branch is an ancestor
+            of its configured @{upstream} OR of HEAD. The two diverge exactly
+            when the work landed on a remote ref OTHER than the branch's own
+            upstream — squash/rebase merge, an auto-deleted remote head, or a
+            stale LOCAL default branch that hasn't pulled the merge — so ``-d``
+            refused branches whose deletion loses nothing. delete_merged_local_
+            branch treats a refusal as a benign "kept", so the loss was
+            invisible in the headline.
+
+            Resolution (two parts):
+            (1) HONEST REPORTING — a delete candidate whose branch the apply
+            step does NOT delete is now counted in a distinct "kept: git
+            refused" bucket and surfaced in the summary line, so the headline
+            "deleted N of M" never silently drops the difference.
+            (2) MATCH THE GATES — a candidate decided on the "no unpushed
+            commits" basis (PR-merged path and State-2a) is flagged
+            ``all_commits_remote`` and applied via a new
+            delete_branch_all_commits_remote helper, which RE-verifies
+            branch_unpushed_commit_count == 0 at delete time (defense in depth
+            against a push racing in since classification, mirroring how the
+            State-2b path re-verifies containment) and then force-deletes with
+            ``git branch -D``. This does NOT weaken prdls2nq: the authoritative
+            data-loss guard remains "every commit is on a remote", re-checked
+            at apply time; ``-d`` was only ever a redundant — and, as found,
+            wrongly-shaped — secondary check. State-1 (empty worktree contained
+            in its local default) does NOT prove unpushed==0 and so KEEPS
+            ``git branch -d`` (a genuine "merged into base" test); any residual
+            ``-d`` refusal there now shows up via the part-(1) honest count.
+            A genuine git error during the apply-time re-check raises
+            WorktreeError and is recorded as a real failure, never a silent
+            keep. Supersedes the prnpf8nq note that ``git branch -d`` lets git
+            "re-check the governing facts at apply time" — for the all-commits-
+            remote candidates that re-check is now ours.
+          approved-by: daniel, 2026-06-06
+
     Prune Grace Period = decision:
       id: prgrc3kp
       why: >

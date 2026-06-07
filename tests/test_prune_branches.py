@@ -183,6 +183,56 @@ def test_classify_skips_open_base_stacked():
     assert out["decision"] == "skip" and "base of an open PR" in out["reason"]
 
 
+def test_classify_skips_sacred_main_when_not_default():
+    # A remote branch literally named `main` in a repo whose default is
+    # something else, with no GitHub protection, is kept by the sacred backstop
+    # (mirrors prune-worktrees; the set is shared via _common).
+    out = _classify_branch(
+        FakeGHClient(), _policy(), "o/r", "trunk", _br(name="main"),
+        set(), set(), NOW,
+    )
+    assert out["decision"] == "skip"
+    assert "sacred branch name 'main'" in out["reason"]
+
+
+def test_classify_skips_configured_sacred_branch():
+    from gitbulk.config.policy import Defaults, Policy
+    policy = Policy(defaults=Defaults(sacred_branches=("develop",)))
+    out = _classify_branch(
+        FakeGHClient(), policy, "o/r", "main", _br(name="develop"),
+        set(), set(), NOW,
+    )
+    assert out["decision"] == "skip"
+    assert "never auto-pruned" in out["reason"]
+
+
+def test_classify_sacred_per_repo_override():
+    from gitbulk.config.policy import Defaults, Policy, RepoOverride
+    policy = Policy(
+        defaults=Defaults(sacred_branches=("develop",)),
+        repos={"o/r": RepoOverride(sacred_branches=("release",))},
+    )
+    out = _classify_branch(
+        FakeGHClient(), policy, "o/r", "main", _br(name="release"),
+        set(), set(), NOW,
+    )
+    assert out["decision"] == "skip" and "never auto-pruned" in out["reason"]
+
+
+def test_classify_non_sacred_branch_still_deletes():
+    # A branch NOT in the configured set is unaffected: a merged PR past grace
+    # still deletes, so the sacred config doesn't blanket-protect everything.
+    from gitbulk.config.policy import Defaults, Policy
+    policy = Policy(defaults=Defaults(sacred_branches=("develop",)))
+    pr = _closed("o/r", 1, head_ref="feat", head_sha="a" * 40, days_ago=30)
+    fake = FakeGHClient(closed_prs_for_head={("o/r", "feat"): [pr]})
+    out = _classify_branch(
+        fake, policy, "o/r", "main", _br(name="feat", sha="a" * 40),
+        set(), set(), NOW,
+    )
+    assert out["decision"] == "delete"
+
+
 def test_classify_skips_when_closed_lookup_errors():
     fake = FakeGHClient(closed_prs_for_head={("o/r", "feat"): GHError("boom")})
     out = _classify_branch(fake, _policy(), "o/r", "main", _br(), set(), set(), NOW)

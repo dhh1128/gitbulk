@@ -123,12 +123,18 @@ run first.
       merged PR's recorded head SHA *or* it is fully contained in the default
       branch; a worktree's branch is removed only when it has no unpushed
       commits. Anything with unique work is kept, with a reason.
+    - **Sacred branch names** — neither command will ever delete a branch named
+      `main`/`master`, one matching a repo's GitHub default branch, or any name
+      in [`sacred_branches`](configuration.md#sacred_branches--branches-the-prune-commands-must-never-delete).
+      The same set guards local *and* remote deletion.
 
 ### `prune-branches`
 
 Deletes remote branches whose only PRs are merged or closed. It **never
-deletes** the default branch, a protected branch, the head of an open PR, or
-the base of an open PR (the stacked-PR case), and never touches fork branches.
+deletes** the default branch, a protected branch, a [sacred-named
+branch](configuration.md#sacred_branches--branches-the-prune-commands-must-never-delete)
+(`main`/`master` or a configured name), the head of an open PR, or the base of
+an open PR (the stacked-PR case), and never touches fork branches.
 Deletion goes through the GitHub ref API (not `git push --delete`), and the
 deleted SHA is recorded for recovery.
 

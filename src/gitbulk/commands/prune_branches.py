@@ -46,7 +46,11 @@ from gitbulk.org_members_cache import (
     OrgMembersRefreshError,
     ensure_org_members_fresh,
 )
-from gitbulk.commands._common import dc_to_dict, read_repos_text
+from gitbulk.commands._common import (
+    dc_to_dict,
+    read_repos_text,
+    sacred_branch_names,
+)
 from gitbulk.invariants import InvariantContext, get, run_chain
 from gitbulk.invariants.base import Invariant, InvariantKind
 from gitbulk.locks import (
@@ -149,22 +153,27 @@ def _classify_branch(
 
       1. not the default branch
       2. not protected
-      3. not the head of any OPEN PR
-      4. not the base of any OPEN PR (stacked-PR dependency)
-      5. there IS a closed/merged PR for it on the UPSTREAM (not a fork)
-      6. that PR is older than the grace period (node prgrc3kp)
-      7. no commit loss (node prdls2nq): the branch tip equals the merged
+      3. not a sacred branch name — ``main``/``master`` or a configured
+         ``sacred_branches`` entry (shared with prune-worktrees via _common)
+      4. not the head of any OPEN PR
+      5. not the base of any OPEN PR (stacked-PR dependency)
+      6. there IS a closed/merged PR for it on the UPSTREAM (not a fork)
+      7. that PR is older than the grace period (node prgrc3kp)
+      8. no commit loss (node prdls2nq): the branch tip equals the merged
          PR's recorded head SHA, OR the branch is fully contained in the
          default branch
 
     Any gh error or inconclusive check biases to ``skip`` (fail safe).
 
-    Guards 1-4 are *cheap* (no network) and 5-7 are *deep* (per-branch gh
+    Guards 1-5 are *cheap* (no network) and 6-8 are *deep* (per-branch gh
     calls). The parallel scan (node prnpf8nq) runs them as two passes via
     :func:`_classify_cheap` / :func:`_classify_deep`; this wrapper preserves
     the original single-call semantics for direct callers and unit tests.
     """
-    cheap = _classify_cheap(slug, default_branch, branch, open_heads, open_bases)
+    sacred = sacred_branch_names(policy, slug)
+    cheap = _classify_cheap(
+        slug, default_branch, branch, open_heads, open_bases, sacred
+    )
     if cheap is not None:
         return cheap
     return _classify_deep(gh, policy, slug, default_branch, branch, now)
@@ -176,17 +185,29 @@ def _classify_cheap(
     branch,
     open_heads: set[str],
     open_bases: set[str],
+    sacred: frozenset[str],
 ) -> dict | None:
-    """Network-free guards 1-4 (node prnbr4kq). Returns a terminal ``skip``
-    dict when one fires, or ``None`` when the branch needs deep
-    classification (guards 5-7). These never surface a delete on their own,
-    so a cheap-skipped branch is dropped from the report just as before."""
+    """Network-free guards 1-4 (node prnbr4kq) plus the sacred-name backstop.
+    Returns a terminal ``skip`` dict when one fires, or ``None`` when the branch
+    needs deep classification (guards 5-7). These never surface a delete on their
+    own, so a cheap-skipped branch is dropped from the report just as before.
+
+    ``sacred`` is the union of the always-sacred ``main``/``master`` and the
+    operator-configured ``sacred_branches`` (see _common). It is the SAME set
+    prune-worktrees uses, so a branch a user protects from local deletion is
+    equally protected from remote deletion — even when it is not the repo's
+    default and carries no GitHub branch protection."""
     name = branch.name
     base = {"slug": slug, "branch": name, "sha": branch.sha}
     if name == default_branch:
         return {**base, "decision": "skip", "reason": "default branch"}
     if branch.protected:
         return {**base, "decision": "skip", "reason": "branch is protected"}
+    if name in sacred:
+        return {
+            **base, "decision": "skip",
+            "reason": f"sacred branch name '{name}' (never auto-pruned)",
+        }
     if name in open_heads:
         return {**base, "decision": "skip", "reason": "head of an open PR"}
     if name in open_bases:
@@ -286,7 +307,9 @@ def _resolve_concurrency(args: argparse.Namespace, policy: Policy) -> int:
     return max(1, int(val))
 
 
-def _scan_repo_cheap(gh, slug: str, prior_entry: dict | None) -> dict:
+def _scan_repo_cheap(
+    gh, policy: Policy, slug: str, prior_entry: dict | None
+) -> dict:
     """Pass A for one repo: read-only fetch + network-free cheap triage.
 
     Returns a dict with ``error`` set (the fetch failed) OR ``default_branch``
@@ -306,6 +329,7 @@ def _scan_repo_cheap(gh, slug: str, prior_entry: dict | None) -> dict:
         return {"slug": slug, "error": str(e)}
     open_heads = {pr.head_ref for pr in open_prs}
     open_bases = {pr.base_ref for pr in open_prs}
+    sacred = sacred_branch_names(policy, slug)
     prior_by_name = {
         b.get("branch"): b for b in (prior_entry or {}).get("branches", [])
     }
@@ -313,7 +337,7 @@ def _scan_repo_cheap(gh, slug: str, prior_entry: dict | None) -> dict:
     needs_deep = []
     for branch in branches:
         if _classify_cheap(
-            slug, default_branch, branch, open_heads, open_bases
+            slug, default_branch, branch, open_heads, open_bases, sacred
         ) is not None:
             continue  # cheap skip — dropped, never stored
         prior_row = prior_by_name.get(branch.name)
@@ -380,7 +404,7 @@ def _scan_branches(
     # Pass A — over the repos that actually need scanning.
     prog_a = Progress(len(to_scan), prefix="scanning repos: ")
     repo_scans = parallel_map(
-        lambda item: _scan_repo_cheap(gh, item[0].slug, item[1]),
+        lambda item: _scan_repo_cheap(gh, policy, item[0].slug, item[1]),
         to_scan,
         concurrency=concurrency,
         on_progress=lambda done, total: prog_a.update(done),

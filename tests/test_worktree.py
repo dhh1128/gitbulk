@@ -310,6 +310,7 @@ from gitbulk.worktree import (  # noqa: E402
     branch_ahead_behind,
     branch_contained_in,
     branch_unpushed_commit_count,
+    delete_branch_all_commits_remote,
     delete_branch_trusting_local_default,
     delete_merged_local_branch,
     list_worktrees,
@@ -576,6 +577,43 @@ def test_delete_merged_local_branch_refused_returns_false():
         ),
     ):
         assert delete_merged_local_branch(Path("/r"), "feat") is False
+
+
+def test_delete_branch_all_commits_remote_force_deletes_when_zero_unpushed():
+    # Re-check finds 0 unpushed (all commits on a remote) → force-delete -D.
+    calls = []
+
+    def fake_run(argv, **k):
+        calls.append(list(argv))
+        if "rev-list" in argv:
+            return _completed(stdout="0\n")  # unpushed == 0
+        return _completed(returncode=0)
+
+    with patch("gitbulk.worktree.subprocess.run", side_effect=fake_run):
+        assert delete_branch_all_commits_remote(Path("/r"), "feat") is True
+    assert calls[-1][-3:] == ["branch", "-D", "feat"]
+
+
+def test_delete_branch_all_commits_remote_keeps_when_unpushed_present():
+    # Re-check finds unpushed commits now (a race since classification) →
+    # branch kept, no delete attempted.
+    def fake_run(argv, **k):
+        assert "branch" not in argv, "must not delete when work would be lost"
+        return _completed(stdout="3\n")  # unpushed == 3
+
+    with patch("gitbulk.worktree.subprocess.run", side_effect=fake_run):
+        assert delete_branch_all_commits_remote(Path("/r"), "feat") is False
+
+
+def test_delete_branch_all_commits_remote_propagates_git_error():
+    # A genuine git failure in the re-check propagates (recorded as a real
+    # failure by the caller, never a silent keep).
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(returncode=128, stderr="boom"),
+    ):
+        with pytest.raises(WorktreeError):
+            delete_branch_all_commits_remote(Path("/r"), "feat")
 
 
 def test_list_worktrees_skips_blank_blocks_and_unknown_keys():

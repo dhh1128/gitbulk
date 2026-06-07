@@ -21,8 +21,30 @@ from dataclasses import asdict
 from typing import Iterable
 
 from gitbulk import paths
+from gitbulk.config.policy import Policy, policy_for
 from gitbulk.invariants import get
 from gitbulk.invariants.base import Invariant, InvariantKind
+
+
+#: Branch names ALWAYS treated as SACRED — never auto-pruned by either
+#: ``prune-branches`` (remote branch deletion) or ``prune-worktrees`` (local
+#: branch/worktree removal), independent of config. The user's rule: a name
+#: that is a backstop against LOCAL deletion must be an equal backstop against
+#: REMOTE deletion. These are unioned with the operator-configured
+#: ``sacred_branches`` (defaults + per-repo override) by
+#: :func:`sacred_branch_names`. Each command additionally protects the repo's
+#: own default branch (and ``prune-branches`` also honours GitHub branch
+#: protection), so this set is purely additive — it only ever keeps MORE
+#: branches and can never cause a deletion.
+SACRED_BRANCH_NAMES: frozenset[str] = frozenset({"main", "master"})
+
+
+def sacred_branch_names(policy: Policy, slug: str) -> frozenset[str]:
+    """The effective sacred-branch set for ``slug``: the always-sacred
+    ``main``/``master`` unioned with the configured ``sacred_branches`` (the
+    ``defaults`` list plus any per-repo override). Matching is exact and
+    case-sensitive, mirroring git's own branch-name semantics."""
+    return SACRED_BRANCH_NAMES.union(policy_for(policy, slug).sacred_branches)
 
 
 def partition_chain(

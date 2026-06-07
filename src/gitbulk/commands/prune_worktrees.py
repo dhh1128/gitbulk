@@ -33,7 +33,11 @@ from gitbulk.org_members_cache import (
     OrgMembersRefreshError,
     ensure_org_members_fresh,
 )
-from gitbulk.commands._common import dc_to_dict, read_repos_text
+from gitbulk.commands._common import (
+    dc_to_dict,
+    read_repos_text,
+    sacred_branch_names,
+)
 from gitbulk.invariants import InvariantContext, get, run_chain
 from gitbulk.invariants.base import Invariant, InvariantKind
 from gitbulk.locks import (
@@ -52,6 +56,7 @@ from gitbulk.worktree import (
     branch_ahead_behind,
     branch_contained_in,
     branch_unpushed_commit_count,
+    delete_branch_all_commits_remote,
     delete_branch_trusting_local_default,
     delete_merged_local_branch,
     list_worktrees,
@@ -69,21 +74,6 @@ EXIT_INVARIANT_SKIPPED = 3
 EXIT_OVERRIDES_APPLIED = 4
 
 _LOCK_TIMEOUT_SECONDS: float = 1800.0
-
-#: Branch names ALWAYS treated as sacred (never auto-pruned) regardless of
-#: upstream/PR state. A name-based backstop to the remote-driven protection
-#: guard: the remote-driven check keys entirely off the branch's UPSTREAM, so it
-#: silently fails to protect a default-ish branch that has no upstream
-#: configured, or that tracks a remote branch which is not the repo's *current*
-#: GitHub default (e.g. a legacy ``main`` in a repo whose default has since
-#: moved). Deleting a branch literally named ``main``/``master`` is exactly what
-#: a fleet-cleanup tool must refuse to do unattended, so we keep these
-#: unconditionally. The repo's actual GitHub default branch (whatever its name)
-#: is protected too, in :func:`_classify_branch_by_pr`, as are any operator-
-#: configured names from ``defaults.sacred_branches`` (and per-repo overrides),
-#: which are UNIONED with this built-in set. This guard only ever KEEPS more
-#: branches, so it can never introduce an unsafe deletion.
-_SACRED_BRANCH_NAMES: frozenset[str] = frozenset({"main", "master"})
 
 
 def _utc_now() -> datetime:
@@ -189,7 +179,8 @@ def _classify_branch_by_pr(
     unconditionally keeps any branch whose LOCAL name is the repo's GitHub
     default branch or a sacred default name (``main``/``master``), since the
     remote-driven guard keys off the upstream and silently misses default-ish
-    branches with no upstream or a stale one (see :data:`_SACRED_BRANCH_NAMES`).
+    branches with no upstream or a stale one (see
+    :func:`gitbulk.commands._common.sacred_branch_names`).
 
     Returns a ``delete`` when, after the protection/open-PR gates, the branch
     HAS a merged/closed upstream PR past the grace period and no unpushed
@@ -204,10 +195,11 @@ def _classify_branch_by_pr(
     # (``defaults.sacred_branches`` / per-repo override). The remote-driven guard
     # below keys off the UPSTREAM and so misses these when the branch has no
     # upstream configured, or tracks a remote branch that is not the repo's
-    # current default. This is additive — it can only ever keep a branch — so it
-    # closes the hole without weakening any existing protection (node prnwlb7q).
-    sacred = _SACRED_BRANCH_NAMES.union(policy_for(policy, slug).sacred_branches)
-    if branch in sacred or (
+    # current default. The sacred set is shared with prune-branches so a name is
+    # protected from local AND remote deletion alike (see _common). This is
+    # additive — it can only ever keep a branch — so it closes the hole without
+    # weakening any existing protection (node prnwlb7q).
+    if branch in sacred_branch_names(policy, slug) or (
         default_branch is not None and branch == default_branch
     ):
         return {
@@ -267,7 +259,13 @@ def _classify_branch_by_pr(
             **base, "decision": "skip",
             "reason": f"{unpushed} unpushed commit(s) — would lose work",
         }
-    return {**base, "decision": "delete", "reason": f"PR #{pr.number} {pr.state.lower()}"}
+    # unpushed == 0 here, so every commit is already on a remote: apply may
+    # safely force-delete via the all-commits-remote helper rather than
+    # ``git branch -d`` (node prnfd8kq).
+    return {
+        **base, "decision": "delete", "all_commits_remote": True,
+        "reason": f"PR #{pr.number} {pr.state.lower()}",
+    }
 
 
 def _classify_no_pr(

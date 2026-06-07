@@ -86,15 +86,19 @@ repos:
     sacred_branches: [release/prod]   # never let prune-worktrees sweep this one
 ```
 
-### `sacred_branches` — branches `prune-worktrees` must never sweep
+### `sacred_branches` — branches the prune commands must never delete
 
-`prune-worktrees` already refuses to delete a branch named `main`/`master` or
-one matching a repo's GitHub **default branch**, even when it has no upstream
-configured. Set `defaults.sacred_branches` (or a per-repo override) to extend
-that always-protected set with your own conventions — `develop`, `trunk`,
-`release`, integration branches, etc. Matching is exact and case-sensitive, and
-the configured names are *unioned* with the built-in protections, so this can
-only ever keep more branches.
+Both prune commands already refuse to delete a branch named `main`/`master` or
+one matching a repo's GitHub **default branch** (`prune-branches` also honours
+GitHub branch protection). Set `defaults.sacred_branches` (or a per-repo
+override) to extend that always-protected set with your own conventions —
+`develop`, `trunk`, `release`, integration branches, etc.
+
+The same set applies to **both** `prune-worktrees` (local branch/worktree
+removal) and `prune-branches` (remote branch deletion): a name you protect from
+local deletion is equally protected from remote deletion. Matching is exact and
+case-sensitive, and the configured names are *unioned* with the built-in
+protections, so this can only ever keep more branches.
 
 ```yaml
 defaults:
