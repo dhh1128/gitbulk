@@ -258,57 +258,52 @@ same file concurrently.
 
 ---
 
-## Defect management (GitHub Issues)
+## Defect & task management (tick)
 
-This repo tracks defects as **GitHub Issues** on `dhh1128/gitbulk`, managed
-with the `gh` CLI (no issue tracker MCP server is used). Issues are enabled
-and the standard `bug` label exists.
+This repo tracks defects, tech debt, and ideas in a local
+[`tick`](https://github.com/dhh1128/tick) ledger (an orphan `tick` branch; the
+`tick` CLI is the interface), **not** GitHub Issues. Reads are plain files — do
+**not** use GitHub Issues or any external tracker/API for this.
+
+- **A tick mark is `~` + a digit-first 4-char id**, e.g. `~4mz3`. It pins a tick
+  to a code location.
+- **Before editing a file**, grep it for marks and read what they reference:
+  `rg '~[2-7][a-z2-7]{3}' <file>` then `tick show <id>`. A mark means recorded
+  context exists for that spot — read it first.
+- **Search** existing ticks with `tick grep <text>`; **list** the open backlog
+  with `tick ls` (filter with `--tag bug`, `--kind todo|debt|idea`).
+- The id is the durable join key (tick files never cite line numbers): find a
+  tick's code with `tick refs <id>`, find a tick from a mark with `tick show <id>`.
 
 **Logging a bug.** When a maintainer says "log a bug about X" (or an agent
-discovers a defect worth tracking), create the issue immediately — do not
-wait for further confirmation — and report the issue number and URL:
+discovers a defect worth tracking), capture it immediately — do not wait for
+further confirmation — and report the printed `~<id>`:
 
 ```
-gh issue create --repo dhh1128/gitbulk --label bug \
-  --title "<concise summary of the defect>" \
-  --body "$(cat <<'EOF'
-## Summary
-<one-paragraph description>
-
-## Steps to reproduce
-1. ...
-
-## Expected
-<what should happen>
-
-## Actual
-<what happens instead>
-
-## Environment
-<version / OS / config relevant to the bug, if any>
-
-## Notes
-<logs, stack traces, suspected cause, related issues>
-EOF
-)"
+tick add "<concise summary of the defect>" --kind todo --tag bug
 ```
 
-Fill in every section you can; omit a section's body only when it genuinely
-does not apply. The only triage label is `bug` — no severity/priority labels.
-Use milestones or comments if prioritization is needed later.
+Then fill in the detail. Use `tick edit <id>` to open the tick and write a
+structured body (Summary / Steps to reproduce / Expected / Actual / Environment
+/ Notes — logs, stack traces, suspected cause), or append dated detail with
+`tick note <id> "<text>"`. Omit a section only when it genuinely does not apply.
+`bug` is the only triage tag — no severity/priority tags. If the defect has an
+obvious code location, drop its mark there: `tick mark <id> <file:line>`.
 
 **Fixing a bug.** When a maintainer says "let's fix bug X":
 
-1. Resolve X to an issue: `gh issue list --repo dhh1128/gitbulk --label bug
-   --state open --search "X"`, or `gh issue view <n>` if given a number.
+1. Resolve X to a tick: `tick grep "X"` (or `tick show <id>` if given an id).
    Confirm the match before proceeding.
-2. Branch `fix/<issue#>-<short-slug>` off the default branch.
+2. Branch `fix/<id>-<short-slug>` off the default branch — the tick id is the
+   durable join key, replacing the old issue number.
 3. Fix it TDD-style per the rules above (failing test first).
-4. Reference `Fixes #<n>` in the commit message and/or PR body so the issue
-   auto-closes when the change merges to the default branch.
+4. Reference the mark `~<id>` in the commit message and/or PR body.
+5. When the change merges, `tick off <id>` and **delete the `~<id>` mark(s)** it
+   reports still in the code. A tick that turns out to be a real design decision
+   should graduate into `this.i` / the design docs when closed.
 
-**Finding bugs.** `gh issue list --repo dhh1128/gitbulk --label bug
---state open` lists the open defect backlog; `gh issue view <n>` shows one.
+**Finding bugs.** `tick ls --tag bug` lists the open defect backlog; `tick show
+<id>` shows one; `tick refs <id>` finds every code site that references it.
 
 ## Testing Protocol
 
