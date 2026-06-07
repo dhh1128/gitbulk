@@ -369,8 +369,11 @@ def _classify_no_pr(
                 ),
             }
         if age >= grace_days:
+            # Every commit is already on a remote (re-verified at apply time),
+            # so apply force-deletes via the all-commits-remote helper rather
+            # than ``git branch -d`` (node prnfd8kq).
             return {
-                **base, "decision": "delete",
+                **base, "decision": "delete", "all_commits_remote": True,
                 "reason": (
                     f"no PR, but every commit is already on a remote; "
                     f"{int(age)}d stale"
@@ -544,13 +547,26 @@ def _delete_branch_for(clone: Path, cand: dict) -> bool:
     local default branch with no PR; ``git branch -d`` would refuse it even
     though the work is preserved there, so it is force-deleted via
     :func:`delete_branch_trusting_local_default` (which re-verifies containment).
-    Every other candidate uses ``git branch -d`` (merged-only), so an unmerged
-    branch is kept. Returns True iff the branch was actually deleted.
+
+    An ``all_commits_remote`` candidate (the PR-merged path and State-2a) was
+    classified deletable because every commit is already on a remote — the
+    prdls2nq guard — but ``git branch -d`` keys off ancestry into the branch's
+    own upstream/HEAD and would silently refuse it when the work landed on a
+    different remote ref (squash merge, deleted remote head, stale local
+    default). It is force-deleted via :func:`delete_branch_all_commits_remote`,
+    which re-verifies the no-unpushed-commits invariant at delete time
+    (node prnfd8kq).
+
+    Every other candidate (State-1, an empty worktree contained in its local
+    default) uses ``git branch -d`` (merged-only), so an unmerged branch is
+    kept. Returns True iff the branch was actually deleted.
     """
     if cand.get("trust_local_default"):
         return delete_branch_trusting_local_default(
             clone, cand["branch"], cand["local_default"]
         )
+    if cand.get("all_commits_remote"):
+        return delete_branch_all_commits_remote(clone, cand["branch"])
     return delete_merged_local_branch(clone, cand["branch"])
 
 
@@ -810,8 +826,9 @@ def _run_under_lock(
     # ── --apply: remove each candidate worktree (then its merged branch), and
     # delete each worktree-less candidate branch (node prnwlb7q). ──
     failure_count = 0
-    removed_count = 0  # worktrees removed
-    branch_count = 0   # standalone local branches deleted
+    removed_count = 0   # worktrees removed
+    branch_count = 0    # standalone local branches deleted
+    branch_refused = 0  # standalone candidates git declined to delete (kept)
     wt_cands = sum(1 for c in delete_candidates if c["kind"] == "worktree")
     br_cands = len(delete_candidates) - wt_cands
     for cand in delete_candidates:
@@ -835,6 +852,12 @@ def _run_under_lock(
                     branch_deleted = _delete_branch_for(clone, cand)
                     if branch_deleted:
                         branch_count += 1
+                    else:
+                        # git declined (e.g. -d not-merged, or the apply-time
+                        # re-check found work that would be lost). A kept branch
+                        # is safe, but it must be surfaced so the headline does
+                        # not silently drop the difference (node prnfd8kq).
+                        branch_refused += 1
         except WorktreeError as e:
             failure_count += 1
             cand["error"] = str(e)
@@ -884,8 +907,9 @@ def _run_under_lock(
 
     summary_text = (
         f"removed {removed_count} of {wt_cands} worktrees; "
-        f"deleted {branch_count} of {br_cands} local branches; "
-        f"{failure_count} failed; {len(skipped_repos)} repos skipped; "
+        f"deleted {branch_count} of {br_cands} local branches"
+        + (f" ({branch_refused} kept: git refused)" if branch_refused else "")
+        + f"; {failure_count} failed; {len(skipped_repos)} repos skipped; "
         f"{len(skipped_entries)} entries skipped"
         + (f"; {filter_line}" if filter_line else "")
     )

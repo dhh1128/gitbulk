@@ -285,6 +285,8 @@ def test_classify_deletes_clean_merged(clean_helpers):
     })
     out = _classify(fake, _entry("/wt"))
     assert out["decision"] == "delete" and out["pr_number"] == 1
+    # PR-merged path proved unpushed==0, so apply may force-delete (prnfd8kq).
+    assert out["all_commits_remote"] is True
 
 
 # ─── no-PR safe paths: State 1 (empty worktree behind its local base) ───────
@@ -303,6 +305,9 @@ def test_state1_empty_behind_stale_deletes(monkeypatch, clean_helpers):
     out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
     assert out["decision"] == "delete"
     assert "empty worktree behind local 'main' by 3" in out["reason"]
+    # State-1 does NOT prove unpushed==0, so it keeps ``git branch -d`` and is
+    # NOT flagged for force-delete (prnfd8kq).
+    assert "all_commits_remote" not in out
 
 
 def test_state1_empty_not_behind_kept(monkeypatch, clean_helpers):
@@ -357,6 +362,8 @@ def test_state2a_on_remote_stale_deletes(monkeypatch, clean_helpers):
     out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
     assert out["decision"] == "delete"
     assert "every commit is already on a remote" in out["reason"]
+    # State-2a also proved unpushed==0 → force-delete eligible (prnfd8kq).
+    assert out["all_commits_remote"] is True
 
 
 def test_state2a_fresh_kept(monkeypatch, clean_helpers):
@@ -497,8 +504,10 @@ def test_apply_removes_worktree_and_deletes_branch(
     ])
     removed, deleted = [], []
     monkeypatch.setattr(pw, "remove_linked_worktree", lambda r, p: removed.append(p))
+    # A PR-merged candidate proves unpushed==0, so it is flagged
+    # ``all_commits_remote`` and applied via the force-delete helper (prnfd8kq).
     monkeypatch.setattr(
-        pw, "delete_merged_local_branch",
+        pw, "delete_branch_all_commits_remote",
         lambda r, b: (deleted.append(b) or True),
     )
     fake = FakeGHClient(
@@ -563,8 +572,9 @@ def test_apply_keeps_unmerged_branch(
         _entry(clone, branch="main", is_main=True), _entry(wt, branch="feat"),
     ])
     monkeypatch.setattr(pw, "remove_linked_worktree", lambda r, p: None)
-    # git branch -d refuses (not fully merged) → returns False.
-    monkeypatch.setattr(pw, "delete_merged_local_branch", lambda r, b: False)
+    # The apply-time re-check finds work that would be lost → helper returns
+    # False, branch is kept (prnfd8kq).
+    monkeypatch.setattr(pw, "delete_branch_all_commits_remote", lambda r, b: False)
     fake = FakeGHClient(
         user={"login": "dhh1128"},
         org_members={"provenant-dev": ["dhh1128"]},
@@ -940,6 +950,33 @@ def test_classify_local_branch_skip_open_head(clean_helpers):
     assert out["decision"] == "skip" and "open PR" in out["reason"]
 
 
+def test_delete_branch_for_routes_by_flag(monkeypatch):
+    """``_delete_branch_for`` picks the safe mechanism per candidate flag
+    (node prnfd8kq): State-2b → trusting-local-default force-delete;
+    all-commits-remote → re-verified force-delete; otherwise ``git branch -d``.
+    """
+    calls = []
+    monkeypatch.setattr(
+        pw, "delete_branch_trusting_local_default",
+        lambda r, b, d: (calls.append(("trust", b, d)) or True),
+    )
+    monkeypatch.setattr(
+        pw, "delete_branch_all_commits_remote",
+        lambda r, b: (calls.append(("remote", b)) or True),
+    )
+    monkeypatch.setattr(
+        pw, "delete_merged_local_branch",
+        lambda r, b: (calls.append(("merged", b)) or True),
+    )
+    clone = Path("/clone")
+    pw._delete_branch_for(
+        clone, {"branch": "b1", "trust_local_default": True, "local_default": "main"}
+    )
+    pw._delete_branch_for(clone, {"branch": "b2", "all_commits_remote": True})
+    pw._delete_branch_for(clone, {"branch": "b3"})
+    assert calls == [("trust", "b1", "main"), ("remote", "b2"), ("merged", "b3")]
+
+
 def _sweep_fake(*, closed):
     return FakeGHClient(
         user={"login": "dhh1128"},
@@ -1014,8 +1051,9 @@ def test_local_branch_swept_apply_deletes(
                         lambda r: [("main", "main"), ("stale", "stale")])
     removed, deleted = [], []
     monkeypatch.setattr(pw, "remove_linked_worktree", lambda r, p: removed.append(p))
+    # PR-merged candidate → all_commits_remote → force-delete helper (prnfd8kq).
     monkeypatch.setattr(
-        pw, "delete_merged_local_branch", lambda r, b: (deleted.append(b) or True)
+        pw, "delete_branch_all_commits_remote", lambda r, b: (deleted.append(b) or True)
     )
     fake = _sweep_fake(closed={
         ("dhh1128/alpha", "stale"): [_closed("dhh1128/alpha", 7, head_ref="stale")]
@@ -1043,15 +1081,19 @@ def test_local_branch_apply_kept_when_unmerged(
     ])
     monkeypatch.setattr(pw, "local_branch_upstreams",
                         lambda r: [("main", "main"), ("stale", "stale")])
-    # git branch -d refuses (unmerged) → returns False; branch is kept.
-    monkeypatch.setattr(pw, "delete_merged_local_branch", lambda r, b: False)
+    # The apply-time re-check declines (work would be lost) → returns False;
+    # branch is kept and surfaced as "git refused" (prnfd8kq).
+    monkeypatch.setattr(pw, "delete_branch_all_commits_remote", lambda r, b: False)
     fake = _sweep_fake(closed={
         ("dhh1128/alpha", "stale"): [_closed("dhh1128/alpha", 7, head_ref="stale")]
     })
     _install(monkeypatch, fake)
     rc = prune_worktrees_handler(_args(apply=True, code_root=code_root))
     assert rc == EXIT_OK
-    assert "deleted 0 of 1 local branches" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    # The headline now surfaces the kept-difference instead of silently
+    # dropping it (the 47-of-50 gap the user observed).
+    assert "deleted 0 of 1 local branches (1 kept: git refused)" in out
     summary = _summary()
     assert "branch `stale`" in summary and "branch kept" in summary
     # Audit action must reflect the kept outcome, not a deletion (Copilot #17).
@@ -1100,7 +1142,8 @@ def test_branch_with_worktree_not_double_swept(
     monkeypatch.setattr(pw, "local_branch_upstreams",
                         lambda r: [("main", "main"), ("feat", "feat")])
     monkeypatch.setattr(pw, "remove_linked_worktree", lambda r, p: None)
-    monkeypatch.setattr(pw, "delete_merged_local_branch", lambda r, b: True)
+    # PR-merged candidate → all_commits_remote → force-delete helper (prnfd8kq).
+    monkeypatch.setattr(pw, "delete_branch_all_commits_remote", lambda r, b: True)
     fake = _sweep_fake(closed={
         ("dhh1128/alpha", "feat"): [_closed("dhh1128/alpha", 5, head_ref="feat")]
     })
