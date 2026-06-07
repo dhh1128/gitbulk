@@ -26,7 +26,7 @@ from gitbulk.commands.prune_worktrees import (
 )
 from gitbulk.config.policy import Policy
 from gitbulk.gh import FakeGHClient, GHError
-from gitbulk.pr_info import ClosedPRRef, PRInfo
+from gitbulk.pr_info import BranchRef, ClosedPRRef, PRInfo
 from gitbulk.worktree import WorktreeEntry, WorktreeError
 
 
@@ -38,7 +38,7 @@ from gitbulk.worktree import WorktreeEntry, WorktreeError
 # materializes REAL git repos with an origin remote (not empty dirs).
 @pytest.fixture
 def write_config(isolated_xdg, code_root):
-    def _write(*, repos_slugs):
+    def _write(*, repos_slugs, remote="match"):
         cfg_dir = paths.config_dir()
         cfg_dir.mkdir(parents=True, exist_ok=True)
         policy_yaml = {
@@ -48,18 +48,23 @@ def write_config(isolated_xdg, code_root):
         (cfg_dir / "gitbulk.yaml").write_text(yaml.safe_dump(policy_yaml))
         (cfg_dir / "repos.txt").write_text("\n".join(repos_slugs) + "\n")
         # Materialize clones AS git repos so local.exists / local.remote_matches
-        # pass. We give each an origin remote matching the slug.
+        # pass. ``remote`` controls origin: "match" => git@github.com:<slug>
+        # (the default, makes remote_matches pass); None => NO origin remote;
+        # any other string => that literal URL (e.g. a wrong-slug remote).
         import subprocess
         for slug in repos_slugs:
             owner, name = slug.split("/", 1)
             clone = code_root / name
             clone.mkdir(parents=True, exist_ok=True)
             subprocess.run(["git", "init", "-q", str(clone)], check=True)
-            subprocess.run(
-                ["git", "-C", str(clone), "remote", "add", "origin",
-                 f"git@github.com:{slug}.git"],
-                check=True, capture_output=True,
-            )
+            if remote is not None:
+                url = (
+                    f"git@github.com:{slug}.git" if remote == "match" else remote
+                )
+                subprocess.run(
+                    ["git", "-C", str(clone), "remote", "add", "origin", url],
+                    check=True, capture_output=True,
+                )
         return cfg_dir
 
     return _write
@@ -67,7 +72,8 @@ def write_config(isolated_xdg, code_root):
 
 def _args(*, apply=False, code_root=None, skip_check=None,
           refresh_org_members=False, include_untracked=False, org=None,
-          repo=None, base=None, mergeable_state=None, author=None, filter=None):
+          repo=None, base=None, mergeable_state=None, author=None, filter=None,
+          concurrency=None, no_prune_local_branches=False):
     return argparse.Namespace(
         subcommand="prune-worktrees", apply=apply,
         code_root=str(code_root) if code_root else None,
@@ -76,6 +82,8 @@ def _args(*, apply=False, code_root=None, skip_check=None,
         include_untracked=include_untracked,
         org=org, repo=repo, base=base, mergeable_state=mergeable_state,
         author=author, filter=filter,
+        concurrency=concurrency,
+        no_prune_local_branches=no_prune_local_branches,
     )
 
 
@@ -279,6 +287,7 @@ def test_dry_run_lists_candidate(
         user={"login": "dhh1128"},
         org_members={"provenant-dev": ["dhh1128"]},
         default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": []},
         my_open_prs={"dhh1128/alpha": []},
         closed_prs_for_head={
             ("dhh1128/alpha", "feat"): [_closed("dhh1128/alpha", 5, head_ref="feat")]
@@ -313,6 +322,7 @@ def test_apply_removes_worktree_and_deletes_branch(
         user={"login": "dhh1128"},
         org_members={"provenant-dev": ["dhh1128"]},
         default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": []},
         my_open_prs={"dhh1128/alpha": []},
         closed_prs_for_head={
             ("dhh1128/alpha", "feat"): [_closed("dhh1128/alpha", 5, head_ref="feat")]
@@ -346,6 +356,7 @@ def test_apply_removal_failure_raises_attention(
         user={"login": "dhh1128"},
         org_members={"provenant-dev": ["dhh1128"]},
         default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": []},
         my_open_prs={"dhh1128/alpha": []},
         closed_prs_for_head={
             ("dhh1128/alpha", "feat"): [_closed("dhh1128/alpha", 5, head_ref="feat")]
@@ -375,6 +386,7 @@ def test_apply_keeps_unmerged_branch(
         user={"login": "dhh1128"},
         org_members={"provenant-dev": ["dhh1128"]},
         default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": []},
         my_open_prs={"dhh1128/alpha": []},
         closed_prs_for_head={
             ("dhh1128/alpha", "feat"): [_closed("dhh1128/alpha", 5, head_ref="feat")]
@@ -437,6 +449,7 @@ def test_handler_grace_boundary_honored_through_injected_clock(
         user={"login": "dhh1128"},
         org_members={"provenant-dev": ["dhh1128"]},
         default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": []},
         my_open_prs={"dhh1128/alpha": []},
         closed_prs_for_head={
             ("dhh1128/alpha", "inside"): [
@@ -478,6 +491,7 @@ def test_scan_error_recorded(
         user={"login": "dhh1128"},
         org_members={"provenant-dev": ["dhh1128"]},
         default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": []},
         my_open_prs={"dhh1128/alpha": []},
     )
     _install(monkeypatch, fake)
@@ -500,6 +514,7 @@ def test_open_head_worktree_kept(
         user={"login": "dhh1128"},
         org_members={"provenant-dev": ["dhh1128"]},
         default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": []},
         my_open_prs={"dhh1128/alpha": [_open_pr("dhh1128/alpha", 9, "active")]},
     )
     _install(monkeypatch, fake)
@@ -529,6 +544,7 @@ def test_skip_check_exit_4(
         user={"login": "dhh1128"},
         org_members={"provenant-dev": ["dhh1128"]},
         default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": []},
         my_open_prs={"dhh1128/alpha": []},
     )
     _install(monkeypatch, fake)
@@ -589,6 +605,7 @@ def _base_fake():
         user={"login": "dhh1128"},
         org_members={"provenant-dev": ["dhh1128"]},
         default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": []},
         my_open_prs={"dhh1128/alpha": []},
     )
 
@@ -699,3 +716,438 @@ def test_dry_run_skip_check_exits_4(
         _args(code_root=code_root, skip_check=["github.not_archived"])
     )
     assert rc == EXIT_OVERRIDES_APPLIED
+
+
+# ─── local-branch sweep + parallel-scan tests (nodes prnwlb7q, prnwpf9k) ────
+
+
+def test_classify_local_branch_delete(clean_helpers):
+    fake = FakeGHClient(closed_prs_for_head={
+        ("o/r", "stale"): [_closed("o/r", 7, head_ref="stale")]
+    })
+    out = pw._classify_local_branch(
+        fake, Policy(), "o/r", Path("/clone"), "stale", set(), NOW
+    )
+    assert out["decision"] == "delete"
+    assert out["kind"] == "branch"
+    assert out["path"] is None
+
+
+def test_classify_local_branch_skip_open_head(clean_helpers):
+    out = pw._classify_local_branch(
+        FakeGHClient(), Policy(), "o/r", Path("/clone"), "stale", {"stale"}, NOW
+    )
+    assert out["decision"] == "skip" and "open PR" in out["reason"]
+
+
+def _sweep_fake(*, closed):
+    return FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": []},
+        my_open_prs={"dhh1128/alpha": []},
+        closed_prs_for_head=closed,
+    )
+
+
+def test_local_branch_swept_dry_run(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    clean_helpers, capsys,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),
+    ])
+    monkeypatch.setattr(pw, "local_branch_upstreams",
+                        lambda r: [("main", "main"), ("stale", "stale")])
+    fake = _sweep_fake(closed={
+        ("dhh1128/alpha", "stale"): [_closed("dhh1128/alpha", 7, head_ref="stale")]
+    })
+    _install(monkeypatch, fake)
+    rc = prune_worktrees_handler(_args(code_root=code_root))
+    assert rc == EXIT_OK
+    summary = _summary()
+    assert "## Would remove" in summary
+    assert "branch `stale`" in summary
+    assert "0 worktrees + 1 local branches" in capsys.readouterr().out
+
+
+def test_local_branch_kept_grace_dry_run(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),
+    ])
+    monkeypatch.setattr(pw, "local_branch_upstreams",
+                        lambda r: [("main", "main"), ("fresh", "fresh")])
+    fake = _sweep_fake(closed={
+        ("dhh1128/alpha", "fresh"): [
+            _closed("dhh1128/alpha", 8, head_ref="fresh", days_ago=2)
+        ]
+    })
+    _install(monkeypatch, fake)
+    rc = prune_worktrees_handler(_args(code_root=code_root))
+    assert rc == EXIT_OK
+    summary = _summary()
+    assert "## Kept (guardrail)" in summary
+    kept = summary.split("## Kept (guardrail)")[1]
+    assert "branch `fresh`" in kept and "grace period" in kept
+
+
+def test_local_branch_swept_apply_deletes(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    clean_helpers, capsys,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),
+    ])
+    monkeypatch.setattr(pw, "local_branch_upstreams",
+                        lambda r: [("main", "main"), ("stale", "stale")])
+    removed, deleted = [], []
+    monkeypatch.setattr(pw, "remove_linked_worktree", lambda r, p: removed.append(p))
+    monkeypatch.setattr(
+        pw, "delete_merged_local_branch", lambda r, b: (deleted.append(b) or True)
+    )
+    fake = _sweep_fake(closed={
+        ("dhh1128/alpha", "stale"): [_closed("dhh1128/alpha", 7, head_ref="stale")]
+    })
+    _install(monkeypatch, fake)
+    rc = prune_worktrees_handler(_args(apply=True, code_root=code_root))
+    assert rc == EXIT_OK
+    assert removed == []          # no worktree candidate
+    assert deleted == ["stale"]   # the standalone branch was deleted
+    assert "deleted 1 of 1 local branches" in capsys.readouterr().out
+    summary = _summary()
+    assert "branch `stale`" in summary and "branch deleted" in summary
+
+
+def test_local_branch_apply_kept_when_unmerged(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    clean_helpers, capsys,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),
+    ])
+    monkeypatch.setattr(pw, "local_branch_upstreams",
+                        lambda r: [("main", "main"), ("stale", "stale")])
+    # git branch -d refuses (unmerged) → returns False; branch is kept.
+    monkeypatch.setattr(pw, "delete_merged_local_branch", lambda r, b: False)
+    fake = _sweep_fake(closed={
+        ("dhh1128/alpha", "stale"): [_closed("dhh1128/alpha", 7, head_ref="stale")]
+    })
+    _install(monkeypatch, fake)
+    rc = prune_worktrees_handler(_args(apply=True, code_root=code_root))
+    assert rc == EXIT_OK
+    assert "deleted 0 of 1 local branches" in capsys.readouterr().out
+    summary = _summary()
+    assert "branch `stale`" in summary and "branch kept" in summary
+
+
+def test_no_prune_local_branches_opt_out(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),
+    ])
+    # The helper IS still read (worktree branches need upstreams), but with the
+    # sweep off the free branch "stale" must NOT become a candidate.
+    monkeypatch.setattr(pw, "local_branch_upstreams",
+                        lambda r: [("main", "main"), ("stale", "stale")])
+    fake = _sweep_fake(closed={
+        ("dhh1128/alpha", "stale"): [_closed("dhh1128/alpha", 7, head_ref="stale")]
+    })
+    _install(monkeypatch, fake)
+    rc = prune_worktrees_handler(
+        _args(code_root=code_root, no_prune_local_branches=True)
+    )
+    assert rc == EXIT_OK
+    assert fake.call_count["closed_prs_for_head"] == 0  # "stale" never classified
+    assert "stale" not in _summary()
+
+
+def test_branch_with_worktree_not_double_swept(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+    clean_helpers, capsys,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    wt = clone.parent / "alpha-feat"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),
+        _entry(wt, branch="feat"),
+    ])
+    # "feat" is both checked out in a worktree AND a local branch → it must be
+    # classified ONCE (by the worktree pass), never also as a free branch.
+    monkeypatch.setattr(pw, "local_branch_upstreams",
+                        lambda r: [("main", "main"), ("feat", "feat")])
+    monkeypatch.setattr(pw, "remove_linked_worktree", lambda r, p: None)
+    monkeypatch.setattr(pw, "delete_merged_local_branch", lambda r, b: True)
+    fake = _sweep_fake(closed={
+        ("dhh1128/alpha", "feat"): [_closed("dhh1128/alpha", 5, head_ref="feat")]
+    })
+    _install(monkeypatch, fake)
+    rc = prune_worktrees_handler(_args(apply=True, code_root=code_root))
+    assert rc == EXIT_OK
+    assert fake.call_count["closed_prs_for_head"] == 1  # not 2
+    out = capsys.readouterr().out
+    assert "removed 1 of 1 worktrees" in out
+    assert "deleted 0 of 0 local branches" in out
+
+
+def test_concurrency_one_sequential_scan(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),
+        _entry(clone.parent / "alpha-feat", branch="feat"),
+    ])
+    monkeypatch.setattr(pw, "local_branch_upstreams",
+                        lambda r: [("main", "main"), ("feat", "feat")])
+    fake = _sweep_fake(closed={
+        ("dhh1128/alpha", "feat"): [_closed("dhh1128/alpha", 5, head_ref="feat")]
+    })
+    _install(monkeypatch, fake)
+    rc = prune_worktrees_handler(_args(code_root=code_root, concurrency=1))
+    assert rc == EXIT_OK
+    assert "alpha-feat" in _summary()
+
+
+def test_open_pr_fetch_failure_aborts_structural(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),
+    ])
+    fake = _base_fake()
+
+    def _boom(*a, **k):
+        raise GHError("search rate-limited")
+    monkeypatch.setattr(fake, "my_open_prs", _boom)
+    _install(monkeypatch, fake)
+    rc = prune_worktrees_handler(_args(code_root=code_root))
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    assert "open-PR fetch failed" in _summary()
+
+
+# ─── remote-driven protection guard (node prnwlb7q) ────────────────────────
+
+
+def _classify_lb(fake, branch, *, default_branch="main",
+                 protected_upstreams=frozenset(), upstream=None, open_heads=()):
+    return pw._classify_local_branch(
+        fake, Policy(), "o/r", Path("/clone"), branch, set(open_heads), NOW,
+        default_branch=default_branch, protected_upstreams=protected_upstreams,
+        upstream=upstream,
+    )
+
+
+def test_classify_skips_when_upstream_is_default(clean_helpers):
+    # Name differs from the default ("mydev"), but it TRACKS the default
+    # branch upstream → kept. Proves the decision is remote-driven, not by name.
+    out = _classify_lb(FakeGHClient(), "mydev", default_branch="dev", upstream="dev")
+    assert out["decision"] == "skip"
+    assert "protected/default upstream 'dev'" in out["reason"]
+
+
+def test_classify_skips_when_upstream_is_protected(clean_helpers):
+    out = _classify_lb(
+        FakeGHClient(), "release",
+        protected_upstreams=frozenset({"release"}), upstream="release",
+    )
+    assert out["decision"] == "skip" and "protected/default upstream 'release'" in out["reason"]
+
+
+def test_classify_refuses_when_protection_unknown(clean_helpers):
+    out = _classify_lb(FakeGHClient(), "stale", protected_upstreams=None, upstream="stale")
+    assert out["decision"] == "skip"
+    assert "could not verify remote branch protection" in out["reason"]
+
+
+def test_classify_deletes_when_upstream_not_protected(clean_helpers):
+    fake = FakeGHClient(closed_prs_for_head={
+        ("o/r", "stale"): [_closed("o/r", 7, head_ref="stale")]
+    })
+    out = _classify_lb(
+        fake, "stale", default_branch="main",
+        protected_upstreams=frozenset({"main"}), upstream="stale",
+    )
+    assert out["decision"] == "delete"
+
+
+def test_local_branch_kept_when_tracks_default_upstream(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="feature", is_main=True),  # clone checked out elsewhere
+    ])
+    # "mydev" tracks the remote default (dev) though its local name differs.
+    monkeypatch.setattr(pw, "local_branch_upstreams",
+                        lambda r: [("feature", "feature"), ("mydev", "dev")])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "dev"},
+        branches={"dhh1128/alpha": []},
+        my_open_prs={"dhh1128/alpha": []},
+        closed_prs_for_head={
+            ("dhh1128/alpha", "mydev"): [_closed("dhh1128/alpha", 9, head_ref="mydev")]
+        },
+    )
+    _install(monkeypatch, fake)
+    rc = prune_worktrees_handler(_args(code_root=code_root))
+    assert rc == EXIT_OK
+    # Guard fires BEFORE the PR lookup, so closed_prs is never consulted.
+    assert fake.call_count["closed_prs_for_head"] == 0
+    summary = _summary()
+    assert "tracks protected/default upstream 'dev'" in summary
+    assert "## Would remove" not in summary
+
+
+def test_local_branch_kept_when_tracks_protected_upstream(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="feature", is_main=True),
+    ])
+    monkeypatch.setattr(pw, "local_branch_upstreams",
+                        lambda r: [("feature", "feature"), ("release", "release")])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": [
+            BranchRef(name="release", sha="r" * 40, protected=True),
+        ]},
+        my_open_prs={"dhh1128/alpha": []},
+        closed_prs_for_head={
+            ("dhh1128/alpha", "release"): [_closed("dhh1128/alpha", 9, head_ref="release")]
+        },
+    )
+    _install(monkeypatch, fake)
+    rc = prune_worktrees_handler(_args(code_root=code_root))
+    assert rc == EXIT_OK
+    assert fake.call_count["closed_prs_for_head"] == 0
+    assert "tracks protected/default upstream 'release'" in _summary()
+
+
+def test_protection_fetch_failure_refuses_candidate(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="feature", is_main=True),
+    ])
+    monkeypatch.setattr(pw, "local_branch_upstreams",
+                        lambda r: [("feature", "feature"), ("stale", "stale")])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": GHError("branches API down")},
+        my_open_prs={"dhh1128/alpha": []},
+        closed_prs_for_head={
+            ("dhh1128/alpha", "stale"): [_closed("dhh1128/alpha", 9, head_ref="stale")]
+        },
+    )
+    _install(monkeypatch, fake)
+    rc = prune_worktrees_handler(_args(code_root=code_root))
+    assert rc == EXIT_OK
+    assert fake.call_count["closed_prs_for_head"] == 0
+    summary = _summary()
+    assert "could not verify remote branch protection" in summary
+    assert "## Would remove" not in summary
+
+
+# ─── remote-less / wrong-remote clones are out of scope (local.remote_matches)
+
+
+def test_remoteless_clone_skipped_no_deletions(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
+):
+    """A clone with NO origin remote is skipped by local.remote_matches before
+    the scan, so none of its branches are even classified — let alone deleted.
+    Uses the REAL invariant chain (run_chain is not faked)."""
+    write_config(repos_slugs=["dhh1128/alpha"], remote=None)
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    # Stand-in branches/worktrees that WOULD be swept if the repo were scanned.
+    monkeypatch.setattr(pw, "local_branch_upstreams",
+                        lambda r: [("feature", None), ("stale", "stale")])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": []},
+        my_open_prs={"dhh1128/alpha": []},
+        closed_prs_for_head={
+            ("dhh1128/alpha", "stale"): [_closed("dhh1128/alpha", 9, head_ref="stale")]
+        },
+    )
+    _install(monkeypatch, fake)
+    rc = prune_worktrees_handler(_args(apply=True, code_root=code_root))
+    assert rc == EXIT_INVARIANT_SKIPPED
+    summary = _summary()
+    assert "Skipped repos" in summary
+    assert "origin remote not configured" in summary
+    # Never scanned: no classification, no protection fetch.
+    assert fake.call_count["closed_prs_for_head"] == 0
+    assert fake.call_count["list_branches"] == 0
+
+
+def test_wrong_remote_clone_skipped_no_deletions(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
+):
+    """A clone whose origin points at a DIFFERENT slug is likewise skipped."""
+    write_config(
+        repos_slugs=["dhh1128/alpha"], remote="git@github.com:someone/else.git"
+    )
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    monkeypatch.setattr(pw, "local_branch_upstreams",
+                        lambda r: [("stale", "stale")])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": []},
+        my_open_prs={"dhh1128/alpha": []},
+        closed_prs_for_head={
+            ("dhh1128/alpha", "stale"): [_closed("dhh1128/alpha", 9, head_ref="stale")]
+        },
+    )
+    _install(monkeypatch, fake)
+    rc = prune_worktrees_handler(_args(apply=True, code_root=code_root))
+    assert rc == EXIT_INVARIANT_SKIPPED
+    summary = _summary()
+    assert "Skipped repos" in summary
+    assert "origin points at" in summary
+    assert fake.call_count["closed_prs_for_head"] == 0
+    assert fake.call_count["list_branches"] == 0

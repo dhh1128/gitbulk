@@ -899,6 +899,90 @@ Gitbulk Triage Tool = goal:
         per the 2026-06-03 decision — symmetric with guard (e); a branch
         with unique commits is kept.
       approved-by: daniel, 2026-06-03
+      children:
+
+        Prune Worktrees Parallel Scan = decision:
+          id: prnwpf9k
+          why: >
+            prune-worktrees had the same sequential-scan shape that made
+            prune-branches slow (prnpf8nq), but a DIFFERENT dominant cost.
+            Linked worktrees are few (most of the ~150 clones have zero), so
+            the per-worktree ``closed_prs_for_head`` that dominated
+            prune-branches is small here in aggregate. The actual hot spot
+            was the PER-REPO ``my_open_prs([slug])`` call issued ONE REPO AT
+            A TIME inside the scan loop — ~150 serial search round-trips —
+            plus a serial ``git worktree list`` per clone.
+
+            Two fixes, both mirroring existing patterns: (1) HOIST
+            my_open_prs to a SINGLE batched call over all in-scope slugs
+            before the loop (the gh client already chunks repo: qualifiers,
+            50/search, gh.py _OPEN_PRS_REPO_CHUNK) — collapsing ~150 searches
+            into ~3; (2) PARALLELIZE the scan with the same parallel_map
+            fan-out prnpf8nq uses, in two passes: Pass A over repos
+            (list_worktrees + list_local_branches, each under
+            repo_lock(slug,"shared") per rsclk7nq res #6 — fcntl.flock opens
+            a fresh fd per call so shared reads across worker threads are
+            safe), Pass B FLATTENED over every linked worktree AND every
+            worktree-less local branch (closed_prs_for_head + the local
+            status/in-progress/unpushed reads, run lock-free exactly as the
+            original per-worktree classification did). Knob ``--concurrency
+            N`` reuses policy prune_scan_concurrency (12), shared with
+            prune-branches. NOT ported from prune-branches: the reusable
+            PLAN / freshness / SHA-cache machinery (prnpl3kq/prnsh5kp) —
+            a worktree's verdict turns on VOLATILE local working-tree state
+            (uncommitted edits, untracked files, mid-rebase) that no tip SHA
+            captures, so a cached "clean" verdict would be unsafe to reuse;
+            those checks are cheap and MUST be fresh. The prnrv6kq pre-delete
+            re-validation is likewise unnecessary: removal already uses
+            ``git worktree remove`` (no --force) and ``git branch -d``
+            (merged-only), so git itself re-checks the governing facts at
+            apply time. Apply stays SEQUENTIAL (local + fast; avoids parallel
+            git mutation on one clone).
+          approved-by: daniel, 2026-06-06
+
+        Prune Worktrees Local Branch Sweep = decision:
+          id: prnwlb7q
+          why: >
+            Gap the user identified 2026-06-06: a local branch created in a
+            clone, pushed, merged, and switched away from accumulates forever
+            — prune-worktrees only deleted a branch that was ATTACHED to a
+            worktree it removed (the wtrm6kpq orphan-branch step), and
+            prune-branches deletes only REMOTE refs. Neither swept a
+            worktree-less local branch. Resolution: extend prune-worktrees so
+            that, after the worktree pass, it also classifies every LOCAL
+            branch (``git for-each-ref refs/heads``) that is NOT checked out
+            in any worktree, applying the SAME PR/grace/unpushed guardrails as
+            the worktree branch (open-PR head -> keep; needs a merged/closed
+            upstream PR past prgrc3kp; no unpushed commits per prdls2nq) and
+            deleting via ``git branch -d`` (merged-only — git refuses an
+            unmerged branch AND the current branch, so the local-git safety
+            contract holds; a kept branch is a valid outcome, never an error).
+
+            PROTECTION IS REMOTE-DRIVEN, NEVER NAME-BASED (corrected
+            2026-06-06 after a live dry-run proposed deleting local ``main``
+            and ``dev`` in 17 repos): a first attempt guarded a hardcoded
+            {main,master,dev} set, which is both unsafe (an integration branch
+            can have any name) and wrong (a local ``main`` need not track
+            origin/main). The guard instead resolves each local branch's
+            UPSTREAM (``%(upstream:remoteref)``) and keeps the branch when that
+            upstream is the repo's DEFAULT branch (cached from the prefetch) OR
+            is PROTECTED on GitHub (the ``protected`` flag from list_branches,
+            one call per candidate repo, mirroring prune-branches guard a/b in
+            prnbr4kq). This guard applies to BOTH worktree branches and free
+            branches via the shared classifier. If the remote protection can't
+            be fetched for a repo, every candidate there is REFUSED (bias to
+            safe). A branch with no upstream is not protected by this rule but
+            still faces the PR/grace/data-loss gates.
+            Branches checked out in a worktree are EXCLUDED from this pass
+            because they are handled by the worktree pass (or kept with that
+            worktree); this avoids double-processing and never touches the
+            primary clone's current branch. DEFAULT-ON (still --apply-gated,
+            still merged-only) per the user's choice — maximally useful for
+            the unattended cron path — with ``--no-prune-local-branches`` as
+            the opt-out for a worktrees-only run. Report rows carry a ``kind``
+            ("worktree" | "branch") so the summary distinguishes a worktree
+            removal from a bare local-branch deletion.
+          approved-by: daniel, 2026-06-06
 
     Prune Grace Period = decision:
       id: prgrc3kp

@@ -294,6 +294,42 @@ def list_worktrees(repo_path: Path) -> list[WorktreeEntry]:
     return entries
 
 
+def local_branch_upstreams(repo_path: Path) -> list[tuple[str, str | None]]:
+    """Return ``(local_branch, upstream_remote_branch)`` for every local branch.
+
+    The second element is the branch NAME on the remote that the local branch
+    tracks (``%(upstream:remoteref)`` with the ``refs/heads/`` prefix stripped),
+    or ``None`` when the branch tracks nothing. prune-worktrees (node prnwlb7q)
+    decides protection by the REMOTE's notion of default/protected applied to
+    this upstream — never by the local branch's name, which is unreliable (a
+    branch named ``main`` need not track ``origin/main``, and an integration
+    branch can be named anything). Read-only; honours the local-git safety
+    contract. Raises :class:`WorktreeError` on git failure so the caller treats
+    a clone whose branches can't be enumerated as "skip with reason".
+    """
+    completed = _git_run(
+        repo_path,
+        "for-each-ref",
+        "--format=%(refname:short)%09%(upstream:remoteref)",
+        "refs/heads",
+    )
+    out: list[tuple[str, str | None]] = []
+    for line in completed.stdout.splitlines():
+        if not line.strip():
+            continue
+        name, _, remoteref = line.partition("\t")
+        name = name.strip()
+        if not name:
+            continue
+        remoteref = remoteref.strip()
+        if remoteref.startswith("refs/heads/"):
+            upstream: str | None = remoteref[len("refs/heads/"):]
+        else:
+            upstream = remoteref or None
+        out.append((name, upstream))
+    return out
+
+
 def worktree_change_summary(worktree_path: Path) -> tuple[bool, bool, bool]:
     """Return ``(tracked_dirty, has_untracked, conflicted)`` for a worktree.
 
@@ -430,6 +466,7 @@ __all__ = [
     "delete_merged_local_branch",
     "is_worktree_in_conflict",
     "list_worktrees",
+    "local_branch_upstreams",
     "remove_linked_worktree",
     "remove_worktree",
     "worktree_change_summary",
