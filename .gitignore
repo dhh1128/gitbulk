@@ -26,3 +26,6 @@ dist/
 # OS cruft
 .DS_Store
 Thumbs.db
+
+/.tick
+.tick.lock
