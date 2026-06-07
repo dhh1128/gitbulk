@@ -18,8 +18,10 @@ the main clone, that would breach the local-git safety contract. The
 
 from __future__ import annotations
 
+import re
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from gitbulk import paths
@@ -438,6 +440,124 @@ def branch_unpushed_commit_count(repo_path: Path, branch: str) -> int:
         ) from exc
 
 
+def branch_ahead_behind(
+    repo_path: Path, branch: str, base: str
+) -> tuple[int, int] | None:
+    """Return ``(ahead, behind)`` of ``branch`` relative to a LOCAL ``base``.
+
+    ``ahead`` = commits on ``branch`` not reachable from ``base``; ``behind`` =
+    commits on ``base`` not reachable from ``branch``. ``base`` is resolved as
+    ``refs/heads/<base>`` — deliberately the LOCAL branch, not the remote
+    ``@{upstream}`` — because prune-worktrees measures "empty" and "behind"
+    against the local branch the worktree was created from (typically the local
+    default branch), which always exists and does not depend on an upstream
+    being configured. Returns ``None`` when git cannot resolve the comparison
+    (e.g. the local base branch is absent), so the caller treats "base unknown"
+    as "can't establish empty/behind" and bias-skips. Read-only.
+
+    prune-worktrees' State-1 path keys on this: an EMPTY worktree has
+    ``ahead == 0`` (nothing unique to the branch), and a SUPERSEDED one has
+    ``behind > 0`` (the local base moved on past it).
+    """
+    completed = _git_run(
+        repo_path,
+        "rev-list",
+        "--left-right",
+        "--count",
+        f"{branch}...refs/heads/{base}",
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    parts = completed.stdout.split()
+    if len(parts) != 2:
+        return None
+    try:
+        return (int(parts[0]), int(parts[1]))
+    except ValueError:
+        return None
+
+
+def branch_contained_in(repo_path: Path, base: str, branch: str) -> bool:
+    """True if every commit on ``branch`` is already reachable from LOCAL ``base``.
+
+    ``git rev-list --count refs/heads/<base>..<branch> == 0`` — i.e. ``branch``
+    has been fully merged into the local ``base`` (e.g. a local default branch
+    the user merged into directly instead of opening a PR). Raises
+    :class:`WorktreeError` on git failure (e.g. ``base`` does not exist locally)
+    so the caller treats an unverifiable containment as "skip with reason".
+    Read-only. Backs prune-worktrees' opt-in State-2b path.
+    """
+    completed = _git_run(
+        repo_path, "rev-list", "--count", f"refs/heads/{base}..{branch}"
+    )
+    try:
+        return int(completed.stdout.strip()) == 0
+    except ValueError as exc:
+        raise WorktreeError(
+            f"branch_contained_in({base!r}, {branch!r}): unexpected output "
+            f"{completed.stdout.strip()!r}"
+        ) from exc
+
+
+#: Extracts the ``@{<unixtime>}`` suffix from a ``%gd`` reflog selector.
+_REFLOG_UNIX = re.compile(r"@\{(\d+)\}")
+
+
+def ref_last_update_age_days(
+    repo_path: Path, ref: str, now: datetime
+) -> float | None:
+    """Age in days since ``ref`` last moved locally (by its reflog), or ``None``.
+
+    The staleness signal for the no-PR safe paths. Reads the MOST RECENT reflog
+    entry's timestamp via ``git log -g -1 --date=unix --format=%gd <ref>`` —
+    which renders as ``<ref>@{<unixtime>}`` — i.e. when the ref was last updated
+    in THIS clone/worktree (created, committed onto, checked out, reset).
+
+    This is deliberately NOT the tip commit's committer date (which can be
+    ancient for a branch cut from an old commit, so it would defeat the grace
+    period) and NOT a directory mtime (which misses in-place edits and only
+    moves on dir-entry changes). For a worktree, pass ``ref="HEAD"`` with
+    ``repo_path`` set to the worktree dir to read its per-worktree HEAD reflog;
+    for a free branch, pass the branch name against the clone.
+
+    Returns ``None`` when the ref has no reachable reflog entry (reflog disabled
+    or expired, or the ref is absent), which the caller treats as "staleness
+    unknown → keep" (bias safe). Read-only.
+    """
+    completed = _git_run(
+        repo_path, "log", "-g", "-1", "--date=unix", "--format=%gd", ref,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    match = _REFLOG_UNIX.search(completed.stdout)
+    if not match:
+        return None
+    moved = datetime.fromtimestamp(int(match.group(1)), tz=timezone.utc)
+    return (now - moved).total_seconds() / 86400.0
+
+
+def delete_branch_trusting_local_default(
+    repo_path: Path, branch: str, local_default: str
+) -> bool:
+    """Force-delete ``branch`` IFF it is fully contained in ``local_default``.
+
+    The State-2b path (opt-in ``--trust-local-default``): the branch was merged
+    into the local default branch directly (no PR), so ``git branch -d`` would
+    refuse it — it is not merged into the clone's HEAD or its own upstream even
+    though the work is preserved in the local default. RE-verifies containment
+    at delete time (defense in depth against a change racing in since
+    classification) and only then uses ``git branch -D``. Returns True if
+    deleted, False if containment no longer holds (branch kept). Raises
+    :class:`WorktreeError` on git failure.
+    """
+    if not branch_contained_in(repo_path, local_default, branch):
+        return False
+    _git_run(repo_path, "branch", "-D", branch)
+    return True
+
+
 def remove_linked_worktree(repo_path: Path, worktree_path: Path) -> None:
     """Remove a LINKED worktree via ``git worktree remove`` (no --force).
 
@@ -474,12 +594,16 @@ def delete_merged_local_branch(repo_path: Path, branch: str) -> bool:
 __all__ = [
     "WorktreeEntry",
     "WorktreeError",
+    "branch_ahead_behind",
+    "branch_contained_in",
     "branch_unpushed_commit_count",
     "create_worktree",
+    "delete_branch_trusting_local_default",
     "delete_merged_local_branch",
     "is_worktree_in_conflict",
     "list_worktrees",
     "local_branch_upstreams",
+    "ref_last_update_age_days",
     "remove_linked_worktree",
     "remove_worktree",
     "worktree_change_summary",

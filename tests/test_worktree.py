@@ -307,9 +307,13 @@ def test_is_worktree_in_conflict_git_failure_treated_as_conflict(tmp_path):
 
 from gitbulk.worktree import (  # noqa: E402
     WorktreeEntry,
+    branch_ahead_behind,
+    branch_contained_in,
     branch_unpushed_commit_count,
+    delete_branch_trusting_local_default,
     delete_merged_local_branch,
     list_worktrees,
+    ref_last_update_age_days,
     remove_linked_worktree,
     worktree_change_summary,
     worktree_in_progress_op,
@@ -595,3 +599,163 @@ def test_list_worktrees_skips_blank_blocks_and_unknown_keys():
         entries = list_worktrees(Path("/x"))
     assert [e.branch for e in entries] == ["main", "feat"]
     assert entries[0].is_main is True
+
+
+# ─── no-PR safe-path helpers (States 1 / 2a / 2b) ──────────────────────────
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+_T = datetime(2026, 6, 6, tzinfo=timezone.utc)
+
+
+def test_branch_ahead_behind_parses_left_right():
+    # `git rev-list --left-right --count <branch>...refs/heads/<base>` emits
+    # "<ahead>\t<behind>" (left=branch, right=base).
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout="0\t3\n"),
+    ) as mock_run:
+        assert branch_ahead_behind(Path("/r"), "feat", "main") == (0, 3)
+    argv = mock_run.call_args[0][0]
+    assert argv[-4:] == [
+        "rev-list", "--left-right", "--count", "feat...refs/heads/main",
+    ]
+
+
+def test_branch_ahead_behind_none_on_git_error():
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(returncode=128, stderr="bad rev"),
+    ):
+        assert branch_ahead_behind(Path("/r"), "feat", "nope") is None
+
+
+def test_branch_ahead_behind_none_on_unexpected_output():
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout="garbage"),
+    ):
+        assert branch_ahead_behind(Path("/r"), "feat", "main") is None
+
+
+def test_branch_ahead_behind_none_on_two_nonint_tokens():
+    # Two tokens but not integers → the int() parse fails (defensive).
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout="a\tb\n"),
+    ):
+        assert branch_ahead_behind(Path("/r"), "feat", "main") is None
+
+
+def test_branch_contained_in_true_when_zero():
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout="0\n"),
+    ) as mock_run:
+        assert branch_contained_in(Path("/r"), "main", "feat") is True
+    argv = mock_run.call_args[0][0]
+    assert argv[-3:] == ["rev-list", "--count", "refs/heads/main..feat"]
+
+
+def test_branch_contained_in_false_when_nonzero():
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout="2\n"),
+    ):
+        assert branch_contained_in(Path("/r"), "main", "feat") is False
+
+
+def test_branch_contained_in_raises_on_git_failure():
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(returncode=1, stderr="no base"),
+    ):
+        with pytest.raises(WorktreeError):
+            branch_contained_in(Path("/r"), "missing", "feat")
+
+
+def test_branch_contained_in_raises_on_nonnumeric_output():
+    # rev-list "succeeds" but emits non-numeric output (defensive parse guard).
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout="weird\n"),
+    ):
+        with pytest.raises(WorktreeError, match="unexpected output"):
+            branch_contained_in(Path("/r"), "main", "feat")
+
+
+def test_ref_last_update_age_days_parses_reflog_unix():
+    # `git log -g -1 --date=unix --format=%gd <ref>` renders as
+    # "<ref>@{<unixtime>}"; age is measured from that local-update time, NOT the
+    # tip commit's committer date.
+    ts = int((_T - timedelta(days=5)).timestamp())
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout=f"feat@{{{ts}}}\n"),
+    ) as mock_run:
+        age = ref_last_update_age_days(Path("/r"), "feat", _T)
+    assert age is not None and 4.9 < age < 5.1
+    argv = mock_run.call_args[0][0]
+    assert argv[-6:] == [
+        "log", "-g", "-1", "--date=unix", "--format=%gd", "feat",
+    ]
+
+
+def test_ref_last_update_age_days_head_for_worktree():
+    ts = int((_T - timedelta(days=2)).timestamp())
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout=f"HEAD@{{{ts}}}\n"),
+    ) as mock_run:
+        age = ref_last_update_age_days(Path("/wt"), "HEAD", _T)
+    assert age is not None and 1.9 < age < 2.1
+    assert mock_run.call_args[0][0][-1] == "HEAD"
+
+
+def test_ref_last_update_age_days_none_on_git_error():
+    # Absent ref → git exits nonzero.
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(returncode=128, stderr="bad rev"),
+    ):
+        assert ref_last_update_age_days(Path("/r"), "gone", _T) is None
+
+
+def test_ref_last_update_age_days_none_when_no_reflog():
+    # A ref with reflog disabled/expired emits no @{...} selector (empty stdout).
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout="\n"),
+    ):
+        assert ref_last_update_age_days(Path("/r"), "feat", _T) is None
+
+
+def test_delete_branch_trusting_local_default_force_deletes_when_contained():
+    calls = []
+
+    def fake_run(argv, capture_output, text, check):
+        del capture_output, text, check
+        calls.append(list(argv))
+        # First call is the containment rev-list (return 0 = contained); the
+        # second is the force delete.
+        if "rev-list" in argv:
+            return _completed(stdout="0\n")
+        return _completed(returncode=0)
+
+    with patch("gitbulk.worktree.subprocess.run", side_effect=fake_run):
+        assert delete_branch_trusting_local_default(
+            Path("/r"), "feat", "main"
+        ) is True
+    assert calls[-1][-3:] == ["branch", "-D", "feat"]
+
+
+def test_delete_branch_trusting_local_default_keeps_when_not_contained():
+    def fake_run(argv, capture_output, text, check):
+        del capture_output, text, check
+        assert "branch" not in argv, "must not delete when not contained"
+        return _completed(stdout="2\n")  # rev-list: 2 commits not in base
+
+    with patch("gitbulk.worktree.subprocess.run", side_effect=fake_run):
+        assert delete_branch_trusting_local_default(
+            Path("/r"), "feat", "main"
+        ) is False
