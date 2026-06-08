@@ -74,6 +74,16 @@ class InvariantContext:
     repo: RepoEntry | None = None
     pr: PRInfo | None = None
     gh: GHClient | None = None
+    # Org-members frozenset resolved ONCE per run and carried through every
+    # per-repo/per-PR ``replace(ctx_base, ...)`` so the hot per-PR
+    # ``pr.author_known`` invariant reads it from memory instead of
+    # re-parsing the cache file per PR (node 37ic / PERF-F2). ``org_members``
+    # is the resolved set (None = org configured but no cache, OR not seeded);
+    # ``org_members_seeded`` distinguishes "a command pre-loaded it" from the
+    # default — when False, consumers fall back to a direct cache read so
+    # directly-constructed contexts (tests) keep working.
+    org_members: frozenset[str] | None = None
+    org_members_seeded: bool = False
 
 
 class Invariant(ABC):

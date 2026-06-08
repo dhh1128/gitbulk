@@ -16,7 +16,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7.0", "pytest-cov>=4.0"]
+test = ["pytest>=7.0", "pytest-cov>=4.0", "pytest-benchmark>=4.0"]
 
 # Authoring/building the documentation site. Not a runtime or test dependency.
 # Build with `uv run --group docs zensical build` (or `... serve` to preview).
@@ -39,10 +39,16 @@ where = ["src"]
 gitbulk = ["manual-install-instructions.md"]
 
 [tool.pytest.ini_options]
+# Only tests/ is collected by default; benchmarks/ (node 5agg / PERF-F3) is
+# opt-in via an explicit path (`pytest benchmarks/`) so the perf baseline
+# never slows or destabilizes the hermetic coverage gate.
 testpaths = ["tests"]
 markers = [
     # Real-binary, no-network integration tests (real git + a local bare
     # origin + real bubblewrap). Excluded from the hermetic coverage gate
     # (`-m "not e2e"`); run in their own CI job. See this.i node agtste9k.
     "e2e: real-binary integration tests (git/bwrap); excluded from coverage",
+    # Perf baselines exercised with pytest-benchmark. Live under benchmarks/
+    # (outside testpaths) and are run on demand, not in the coverage gate.
+    "benchmark: pytest-benchmark perf baselines (node 5agg); run on demand",
 ]

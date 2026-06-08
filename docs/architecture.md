@@ -262,6 +262,9 @@ src/gitbulk/
 
 tests/                    — pytest tests; mirrors src/ layout. 100% branch
                             coverage enforced.
+benchmarks/               — pytest-benchmark perf baselines (node 5agg);
+                            outside testpaths, run on demand:
+                            `pytest benchmarks/ --benchmark-only`
 bin/gitbulk-cron          — cron wrapper (the only shell script in the repo)
 config/*.example          — example user config
 prompts/                  — pluggable prompts for summarize & dispatch
@@ -283,8 +286,8 @@ prompts/                  — pluggable prompts for summarize & dispatch
   worktrees/<runid>/<owner>__<repo>__pr<N>/  # disposable worktrees
   runs/
     <UTC-timestamp>-<subcommand>/
-      manifest.yaml                   # argv, config snapshot, version, actor, exit_code
-      state.yaml                      # full per-repo decisions (PR records)
+      manifest.yaml                   # argv, config snapshot, version, actor, exit_code, phase timings
+      state.yaml                      # full per-repo decisions (PR records); written once at finalization
       summary.md                      # human-readable digest
       invariants.log                  # JSONL: every pass/skip/fail with reason
       errors.log                      # JSONL: warnings + errors with context
@@ -355,8 +358,14 @@ the Phase-1A snapshot to make every stage testable in isolation:
    (audit signal only).
 7. **Coalesced GitHub fetch** (`gh.my_open_prs([surviving slugs])`) — one
    GraphQL round-trip across all surviving repos per `gd4kp7nz`.
-8. **For each PR**, run PER_PR invariants; record a PR record into
-   `state.yaml`. A PR is "attention" iff no Fail and no intrinsic Skip.
+8. **For each PR**, run PER_PR invariants; record a PR record into the
+   in-memory state. A PR is "attention" iff no Fail and no intrinsic Skip.
+   Per-repo records accumulate in memory and are written to `state.yaml`
+   once at finalization (a single O(n) write rather than a full-file
+   rewrite per repo, per `kp7nw4mq.c` / node 7gpd); the live audit of
+   mutating actions is appended to `errors.log`/`invariants.log` as it
+   happens. `report` also records each pipeline phase's wall-clock
+   duration into `manifest.yaml` under `timings` (node 5agg).
 9. **Subcommand-specific work** — `report` just emits `summary.md`;
    `summarize` pipes `state.yaml` through the agent; `dispatch` creates a
    worktree per attention-PR and feeds the executor; the mutating

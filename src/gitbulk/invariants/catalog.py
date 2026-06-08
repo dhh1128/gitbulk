@@ -40,11 +40,12 @@ invariants; this module never shells out to anything else.
 from __future__ import annotations
 
 import subprocess
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from gitbulk.classifier import Classification, classify_login
 from gitbulk.git import GIT
-from gitbulk.config.policy import policy_for
+from gitbulk.config.policy import Policy, policy_for
 from gitbulk.gh import GHError
 from gitbulk.invariants.base import (
     Fail,
@@ -83,6 +84,41 @@ _REBASE_PR_ONLY: frozenset[str] = frozenset({"rebase-pr"})
 #: CLEAN needs nothing; BLOCKED is gated on review/checks not conflicts;
 #: UNKNOWN/UNSTABLE/HAS_HOOKS don't indicate a base-staleness problem.
 _REBASEABLE_MERGEABLE_STATES: frozenset[str] = frozenset({"BEHIND", "DIRTY"})
+
+
+def _load_org_members(policy: Policy) -> frozenset[str] | None:
+    """Resolve the org-members frozenset for ``policy`` from the on-disk cache.
+
+    Returns the members set, or ``None`` when no org is configured or the
+    cache is missing/unreadable — exactly the value ``classify_login``
+    expects for its ``org_members`` argument. Shared by
+    :func:`seed_org_members` (the once-per-run pre-load) and the
+    ``pr.author_known`` fallback for un-seeded contexts.
+    """
+    org = policy.humans.org
+    if not org:
+        return None
+    cached = load_cache(org)
+    return cached.members if cached is not None else None
+
+
+def seed_org_members(ctx_base: InvariantContext) -> InvariantContext:
+    """Return ``ctx_base`` with the org-members frozenset resolved once.
+
+    Commands call this right after ``ensure_org_members_fresh`` and before
+    running their invariant chains. Because every per-repo/per-PR context is
+    derived from the base via ``dataclasses.replace``, seeding the base means
+    the hot per-PR ``pr.author_known`` invariant reads the set from memory
+    instead of re-reading + re-parsing the cache YAML once per PR (node
+    37ic / PERF-F2). The set is invariant for the run — the cache is only
+    (re)written by the preceding ``ensure_org_members_fresh`` under the org
+    lock.
+    """
+    return replace(
+        ctx_base,
+        org_members=_load_org_members(ctx_base.policy),
+        org_members_seeded=True,
+    )
 
 
 # ─── UNIVERSAL ────────────────────────────────────────────────────────────
@@ -583,11 +619,13 @@ class PrAuthorKnownInvariant(Invariant):
     def check(self, ctx: InvariantContext) -> Result:
         if ctx.pr is None:
             return Fail("per-PR invariant called without ctx.pr")
-        org_members = None
-        if ctx.policy.humans.org:
-            cached = load_cache(ctx.policy.humans.org)
-            if cached is not None:
-                org_members = cached.members
+        # Use the once-per-run pre-loaded set when the command seeded it
+        # (node 37ic / PERF-F2); otherwise fall back to a direct cache read
+        # so directly-constructed contexts (tests) keep working.
+        if ctx.org_members_seeded:
+            org_members = ctx.org_members
+        else:
+            org_members = _load_org_members(ctx.policy)
         result = classify_login(ctx.pr.author, ctx.policy, org_members)
         if result == Classification.UNKNOWN:
             return Fail(
