@@ -468,6 +468,17 @@ def test_no_color_overrides_force_color_end_to_end(monkeypatch, capsys, tmp_path
     assert "repos.txt not found" in err
 
 
+def test_recover_branch_dispatches_through_cli(monkeypatch, tmp_path, capsys):
+    """main() routes ``recover-branch`` to its handler (covers the lazy
+    wrapper). With no prune-branches run in the isolated cache, it is a clean
+    structural failure — no network, no --apply."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    rc = main(["recover-branch"])
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    assert "no readable state.yaml" in capsys.readouterr().err
+
+
 def test_not_implemented_handler_returns_99():
     """No subcommand is a stub anymore, but _not_implemented remains as
     the fallback for any future KNOWN subcommand added without a handler.
