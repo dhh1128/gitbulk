@@ -103,8 +103,14 @@ class GhAuthenticatedInvariant(Invariant):
             user = ctx.gh.authenticated_user()
         except GHError as e:
             return Fail(f"gh not authenticated: {e}")
-        if not user.get("login"):
+        login = user.get("login")
+        if not login:
             return Fail(f"gh authenticated but user has no login: {user!r}")
+        # Stamp the verified operator identity into the run manifest. This is
+        # the first and only point where the login is both fetched and known
+        # non-empty; recording it here closes the audit-attribution gap for
+        # every gh-touching subcommand at one site (node actrstmp7q).
+        ctx.runstate.record_actor(login)
         return Pass()
 
 

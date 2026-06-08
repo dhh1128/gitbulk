@@ -115,6 +115,11 @@ class RunState:
             "subcommand": subcommand,
             "argv": list(argv),
             "started_at": _utc_now_iso(),
+            # Seeded null; stamped by the gh.authenticated invariant via
+            # record_actor() once the operator's login is fetched+verified
+            # (node actrstmp7q). Always present so audit consumers get a
+            # stable schema — null means no verified identity was recorded.
+            "actor": None,
             "config_snapshot": config_snapshot,
         }
         _atomic_write_text(
@@ -127,6 +132,24 @@ class RunState:
     @property
     def run_dir(self) -> Path:
         return self._run_dir
+
+    def record_actor(self, login: str | None) -> None:
+        """Stamp the acting GitHub identity into ``manifest.yaml``.
+
+        Called once per run from the ``gh.authenticated`` universal invariant
+        (the first and only point where the operator's login is both fetched
+        and verified non-empty; node ``actrstmp7q``). Audit consumers read
+        ``manifest['actor']`` to attribute every mutating action
+        (merge/close/force-push) to a GitHub identity. Updates the manifest in
+        place (read-modify-write), mirroring :meth:`complete`. A ``None``
+        ``login`` leaves the recorded actor null rather than crashing — an
+        unverifiable session is the gh.authenticated invariant's job to Fail.
+        """
+        manifest_path = self._run_dir / "manifest.yaml"
+        with manifest_path.open() as f:
+            manifest = yaml.safe_load(f)
+        manifest["actor"] = login
+        _atomic_write_text(manifest_path, yaml.safe_dump(manifest, sort_keys=False))
 
     def record_invariant(
         self,

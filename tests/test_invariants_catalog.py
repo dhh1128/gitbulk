@@ -249,6 +249,29 @@ def test_gh_authenticated_pass(runstate):
     assert GhAuthenticatedInvariant().check(ctx) == Pass()
 
 
+def test_gh_authenticated_stamps_actor_into_manifest(runstate):
+    # The verified login is recorded into the run manifest (node actrstmp7q).
+    import yaml
+
+    gh = FakeGHClient(user={"login": "dhh1128"})
+    ctx = _ctx(runstate, gh=gh)
+    GhAuthenticatedInvariant().check(ctx)
+    manifest = yaml.safe_load((runstate.run_dir / "manifest.yaml").read_text())
+    assert manifest["actor"] == "dhh1128"
+
+
+def test_gh_authenticated_does_not_stamp_actor_on_failure(runstate):
+    # A failed auth probe leaves actor null — no verified identity exists.
+    import yaml
+
+    gh = FakeGHClient()  # no user configured → GHError → Fail
+    ctx = _ctx(runstate, gh=gh)
+    result = GhAuthenticatedInvariant().check(ctx)
+    assert isinstance(result, Fail)
+    manifest = yaml.safe_load((runstate.run_dir / "manifest.yaml").read_text())
+    assert manifest["actor"] is None
+
+
 def test_gh_authenticated_fail_no_gh(runstate):
     ctx = _ctx(runstate, gh=None)
     result = GhAuthenticatedInvariant().check(ctx)

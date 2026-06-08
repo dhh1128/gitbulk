@@ -283,7 +283,7 @@ prompts/                  — pluggable prompts for summarize & dispatch
   worktrees/<runid>/<owner>__<repo>__pr<N>/  # disposable worktrees
   runs/
     <UTC-timestamp>-<subcommand>/
-      manifest.yaml                   # argv, config snapshot, version, exit_code
+      manifest.yaml                   # argv, config snapshot, version, actor, exit_code
       state.yaml                      # full per-repo decisions (PR records)
       summary.md                      # human-readable digest
       invariants.log                  # JSONL: every pass/skip/fail with reason
@@ -342,9 +342,13 @@ the Phase-1A snapshot to make every stage testable in isolation:
 3. **`RunState.begin(subcommand, argv, config_snapshot)`** — creates the
    `~/.cache/gitbulk/runs/<UTC-timestamp>-<sub>/` directory, writes the
    initial empty `state.yaml`, and stamps `manifest.yaml` with argv and an
-   inline self-contained config snapshot (per `kp7nw4mq.a`).
+   inline self-contained config snapshot (per `kp7nw4mq.a`). The `actor`
+   field is seeded null here and filled in by the `gh.authenticated`
+   invariant once the operator's login is verified (per `actrstmp7q`).
 4. **Partition the subcommand's invariant chain** by `InvariantKind` —
-   UNIVERSAL → PER_REPO → PER_PR (per `c4jzm5pn`).
+   UNIVERSAL → PER_REPO → PER_PR (per `c4jzm5pn`). The UNIVERSAL
+   `gh.authenticated` check stamps the verified GitHub login into
+   `manifest.yaml` as `actor` (per `actrstmp7q`).
 5. **Run UNIVERSAL preflight** once. First Fail → exit 1.
 6. **For each repo**, run PER_REPO; intrinsic Skip drops the repo (counts
    toward exit 3); Fail aborts; cmdline-`--skip-check` Skip is bypassed

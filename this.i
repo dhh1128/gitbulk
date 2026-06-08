@@ -439,6 +439,34 @@ Gitbulk Triage Tool = goal:
         the user's ability to actively loosen a single run when they know
         what they are doing.
 
+    Manifest Stamps The Acting GitHub Identity = decision:
+      id: actrstmp7q
+      why: >
+        Every run manifest carries an `actor` field naming the GitHub login
+        gitbulk acted as. The audit trail's purpose is to attribute every
+        mutating action (merge/close/force-push) to an identity; without the
+        actor a reader of manifest.yaml can reconstruct WHAT was done but not
+        WHO it was done as — a gap that matters precisely when a cron host is
+        misconfigured to authenticate as the wrong account. The login is
+        stamped from inside the `gh.authenticated` UNIVERSAL invariant
+        (catalog.py), which is the first and only point where the operator's
+        identity is both fetched (`gh api user`) AND verified non-empty; it
+        was previously fetched there and discarded. This covers all six
+        gh-touching subcommands (report, summarize, dispatch, merge,
+        rebase-pr, close-stale) at one site rather than threading an actor
+        argument through nine RunState.begin call sites, and avoids a second
+        redundant `gh api user` round-trip. The invariant therefore has a
+        deliberate write side effect (record_actor -> manifest.yaml) beyond a
+        pure Pass/Skip/Fail check; accepted because the verified identity is
+        an audit fact that only exists at that moment. begin() seeds
+        `actor: null` so the key is always present (audit consumers get a
+        stable schema; null means "no verified identity was recorded" — e.g.
+        a run that failed auth, or a non-gh subcommand like prune-*). This is
+        an ADDITIVE manifest field, not a breaking shape change, so
+        SCHEMA_VERSION is not bumped. Local-only subcommands that never run
+        the universal chain (prune-branches/-worktrees, recover-branch) leave
+        actor null for now; extending coverage to them is a separate change.
+
     # ─── PR CLASSIFICATION & MERGE-READINESS ─────────────────────────────────
 
     Unknown Accounts Default Non Human = decision:
