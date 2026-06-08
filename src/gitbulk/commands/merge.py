@@ -18,7 +18,9 @@ Phase 5's first mutating subcommand. Pipeline mirrors :mod:`dispatch`:
      WOULD merge and exit 0 / 3 / 4 per the same exit-code ladder.
   9. (``--apply`` path) For each eligible PR, call
      ``gh.merge_pr(slug, number, method=policy_for(slug).merge_method,
-     delete_branch=True)``. The default merge method is ``merge`` (true
+     delete_branch=not pr.is_cross_repository)`` — fork PRs merge but keep
+     their fork branch (node ``frkrep5q``). The default merge method is
+     ``merge`` (true
      merge commit, this.i node ``gji4dyze``); per-repo override via
      ``repos.<slug>.merge_method`` lets individual repos opt for
      ``squash`` or ``rebase``.
@@ -767,7 +769,10 @@ def _run_under_lock(
                     slug,
                     pr.number,
                     method=method,
-                    delete_branch=True,
+                    # Never delete a fork's head branch (node frkrep5q):
+                    # delete-branch on a cross-repo merge would target a
+                    # branch on someone's fork. Same-repo PRs delete as before.
+                    delete_branch=not pr.is_cross_repository,
                 )
         except GHError as e:
             failure_count += 1

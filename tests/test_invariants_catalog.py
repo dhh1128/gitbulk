@@ -47,6 +47,7 @@ from gitbulk.invariants.catalog import (
     PrApprovedPerPolicyInvariant,
     PrAuthorKnownInvariant,
     PrBaseIsDefaultInvariant,
+    PrHeadOnOriginInvariant,
     PrInactiveInvariant,
     PrNeedsRebaseInvariant,
     PrMergeableStateCleanInvariant,
@@ -98,14 +99,19 @@ def _pr(
     author: str = "dhh1128",
     base_ref: str = "main",
     slug: str = "dhh1128/gitbulk",
+    is_cross_repository: bool = False,
+    head_repo_slug: str | None = None,
 ) -> SimpleNamespace:
     """Lightweight PRInfo-ish stand-in. The invariants only touch
-    .number, .author, .base_ref; a SimpleNamespace is enough."""
+    .number, .author, .base_ref, and (head_on_origin) the fork fields; a
+    SimpleNamespace is enough."""
     return SimpleNamespace(
         number=number,
         author=author,
         base_ref=base_ref,
         slug=slug,
+        is_cross_repository=is_cross_repository,
+        head_repo_slug=head_repo_slug,
     )
 
 
@@ -172,6 +178,7 @@ def test_all_phase2_invariants_registered():
         "pr.age_threshold",
         "pr.inactive",
         "pr.needs_rebase",
+        "pr.head_on_origin",
     }
     registered = set(all_invariants().keys())
     missing = expected - registered
@@ -247,6 +254,29 @@ def test_gh_authenticated_pass(runstate):
     gh = FakeGHClient(user={"login": "dhh1128"})
     ctx = _ctx(runstate, gh=gh)
     assert GhAuthenticatedInvariant().check(ctx) == Pass()
+
+
+def test_gh_authenticated_stamps_actor_into_manifest(runstate):
+    # The verified login is recorded into the run manifest (node actrstmp7q).
+    import yaml
+
+    gh = FakeGHClient(user={"login": "dhh1128"})
+    ctx = _ctx(runstate, gh=gh)
+    GhAuthenticatedInvariant().check(ctx)
+    manifest = yaml.safe_load((runstate.run_dir / "manifest.yaml").read_text())
+    assert manifest["actor"] == "dhh1128"
+
+
+def test_gh_authenticated_does_not_stamp_actor_on_failure(runstate):
+    # A failed auth probe leaves actor null — no verified identity exists.
+    import yaml
+
+    gh = FakeGHClient()  # no user configured → GHError → Fail
+    ctx = _ctx(runstate, gh=gh)
+    result = GhAuthenticatedInvariant().check(ctx)
+    assert isinstance(result, Fail)
+    manifest = yaml.safe_load((runstate.run_dir / "manifest.yaml").read_text())
+    assert manifest["actor"] is None
 
 
 def test_gh_authenticated_fail_no_gh(runstate):
@@ -1284,5 +1314,44 @@ def test_pr_needs_rebase_fail_no_pr(runstate, repo):
 
 def test_pr_needs_rebase_is_rebase_pr_only():
     inv = PrNeedsRebaseInvariant()
+    assert inv.subcommands == frozenset({"rebase-pr"})
+    assert inv.kind == InvariantKind.PER_PR
+
+
+# ─── pr.head_on_origin (rebase-pr-only; node frkrep5q) ─────────────────────
+
+
+def test_pr_head_on_origin_pass_same_repo(runstate, repo):
+    pr = _pr(is_cross_repository=False)
+    ctx = _ctx(runstate, repo=repo, pr=pr)
+    assert PrHeadOnOriginInvariant().check(ctx) == Pass()
+
+
+def test_pr_head_on_origin_skip_cross_repo(runstate, repo):
+    pr = _pr(is_cross_repository=True, head_repo_slug="contributor/gitbulk")
+    ctx = _ctx(runstate, repo=repo, pr=pr)
+    result = PrHeadOnOriginInvariant().check(ctx)
+    assert isinstance(result, Skip)
+    assert "contributor/gitbulk" in result.reason
+    assert "does not rebase fork PRs" in result.reason
+
+
+def test_pr_head_on_origin_skip_cross_repo_deleted_fork(runstate, repo):
+    # headRepository can be null (deleted fork) → head_repo_slug None; the
+    # skip message falls back to a generic phrase.
+    pr = _pr(is_cross_repository=True, head_repo_slug=None)
+    ctx = _ctx(runstate, repo=repo, pr=pr)
+    result = PrHeadOnOriginInvariant().check(ctx)
+    assert isinstance(result, Skip)
+    assert "a fork" in result.reason
+
+
+def test_pr_head_on_origin_fail_no_pr(runstate, repo):
+    ctx = _ctx(runstate, repo=repo, pr=None)
+    assert isinstance(PrHeadOnOriginInvariant().check(ctx), Fail)
+
+
+def test_pr_head_on_origin_is_rebase_pr_only():
+    inv = PrHeadOnOriginInvariant()
     assert inv.subcommands == frozenset({"rebase-pr"})
     assert inv.kind == InvariantKind.PER_PR

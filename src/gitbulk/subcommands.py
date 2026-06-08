@@ -93,6 +93,7 @@ _REBASE_PR_CHAIN: tuple[str, ...] = (
     "github.not_archived",
     "pr.base_is_default",
     "pr.author_known",
+    "pr.head_on_origin",
     "pr.needs_rebase",
 )
 

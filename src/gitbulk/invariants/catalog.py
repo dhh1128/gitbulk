@@ -103,8 +103,14 @@ class GhAuthenticatedInvariant(Invariant):
             user = ctx.gh.authenticated_user()
         except GHError as e:
             return Fail(f"gh not authenticated: {e}")
-        if not user.get("login"):
+        login = user.get("login")
+        if not login:
             return Fail(f"gh authenticated but user has no login: {user!r}")
+        # Stamp the verified operator identity into the run manifest. This is
+        # the first and only point where the login is both fetched and known
+        # non-empty; recording it here closes the audit-attribution gap for
+        # every gh-touching subcommand at one site (node actrstmp7q).
+        ctx.runstate.record_actor(login)
         return Pass()
 
 
@@ -672,3 +678,33 @@ class PrNeedsRebaseInvariant(Invariant):
             f"mergeable_state={state!r} does not warrant a rebase "
             f"(only {sorted(_REBASEABLE_MERGEABLE_STATES)} do)"
         )
+
+
+@register
+class PrHeadOnOriginInvariant(Invariant):
+    """Skip fork (cross-repo) PRs in rebase-pr.
+
+    A PR opened from a fork has its head branch on the FORK, not on
+    ``origin`` (the base-repo clone gitbulk operates from). rebase-pr's
+    force-push targets ``origin``, so rebasing a fork PR would push to a
+    branch on the base repo that has nothing to do with the PR — wrong and
+    potentially destructive. Such PRs are SKIPPED (this-PR-doesn't-qualify,
+    not a structural Fail); the PR's author handles fork-branch rebases
+    themselves. ``is_cross_repository`` comes from GraphQL
+    ``isCrossRepository`` (node ``frkrep5q``). rebase-pr-only.
+    """
+
+    name = "pr.head_on_origin"
+    kind = InvariantKind.PER_PR
+    subcommands = _REBASE_PR_ONLY
+
+    def check(self, ctx: InvariantContext) -> Result:
+        if ctx.pr is None:
+            return Fail("per-PR invariant called without ctx.pr")
+        if ctx.pr.is_cross_repository:
+            head_repo = ctx.pr.head_repo_slug or "a fork"
+            return Skip(
+                f"head branch is on {head_repo}, not origin; "
+                "gitbulk does not rebase fork PRs"
+            )
+        return Pass()

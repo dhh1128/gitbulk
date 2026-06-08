@@ -49,6 +49,11 @@ def test_begin_writes_manifest_with_expected_fields(isolated_cache):
     assert manifest["argv"] == argv
     assert manifest["config_snapshot"] == config
     assert "started_at" in manifest
+    # actor is seeded null at begin (stamped later by gh.authenticated); node
+    # actrstmp7q. The key is always present so audit consumers get a stable
+    # schema, with null meaning "no verified identity recorded".
+    assert "actor" in manifest
+    assert manifest["actor"] is None
     # completed_at and exit_code only appear after complete()
     assert "completed_at" not in manifest
     assert "exit_code" not in manifest
@@ -293,6 +298,48 @@ def test_write_summary(isolated_cache):
     rs = RunState.begin("report", [], {})
     rs.write_summary("# Run Summary\n\nAll good.\n")
     assert (rs.run_dir / "summary.md").read_text().startswith("# Run Summary")
+
+
+# ─── record_actor() ──────────────────────────────────────────────────────────
+
+
+def test_record_actor_stamps_login_into_manifest(isolated_cache):
+    rs = RunState.begin("merge", [], {})
+    rs.record_actor("dhh1128")
+    manifest = yaml.safe_load((rs.run_dir / "manifest.yaml").read_text())
+    assert manifest["actor"] == "dhh1128"
+
+
+def test_record_actor_none_leaves_actor_null(isolated_cache):
+    rs = RunState.begin("merge", [], {})
+    rs.record_actor(None)
+    manifest = yaml.safe_load((rs.run_dir / "manifest.yaml").read_text())
+    assert manifest["actor"] is None
+
+
+def test_record_actor_preserves_other_manifest_fields(isolated_cache):
+    when = datetime(2026, 5, 27, 12, 0, 0, tzinfo=timezone.utc)
+    argv = ["gitbulk", "merge", "--apply"]
+    config = {"defaults": {"merge_policy": "strict"}}
+    rs = RunState.begin("merge", argv, config, when=when)
+    rs.record_actor("dhh1128")
+    manifest = yaml.safe_load((rs.run_dir / "manifest.yaml").read_text())
+    assert manifest["actor"] == "dhh1128"
+    assert manifest["subcommand"] == "merge"
+    assert manifest["argv"] == argv
+    assert manifest["config_snapshot"] == config
+    assert "started_at" in manifest
+
+
+def test_record_actor_survives_complete(isolated_cache):
+    # complete() does its own read-modify-write of the manifest; the actor
+    # stamped earlier must not be lost.
+    rs = RunState.begin("merge", [], {})
+    rs.record_actor("dhh1128")
+    rs.complete(0)
+    manifest = yaml.safe_load((rs.run_dir / "manifest.yaml").read_text())
+    assert manifest["actor"] == "dhh1128"
+    assert manifest["exit_code"] == 0
 
 
 # ─── complete() ────────────────────────────────────────────────────────────

@@ -431,7 +431,9 @@ _GRAPHQL_FIXTURE = {
                     "state": "OPEN",
                     "baseRefName": "main",
                     "headRefName": "fix-thing",
-                    "headRefOid": "abc123",
+                    "headRefOid": "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4",
+                    "isCrossRepository": False,
+                    "headRepository": {"nameWithOwner": "dhh1128/gitbulk"},
                     "createdAt": "2026-05-27T10:00:00Z",
                     "updatedAt": "2026-05-28T11:00:00Z",
                     "mergeStateStatus": "CLEAN",
@@ -804,12 +806,68 @@ def test_pr_info_parser_handles_full_node():
     assert pr.number == 42
     assert pr.title == "Fix the thing"
     assert pr.author == "dhh1128"
-    assert pr.head_sha == "abc123"
+    assert pr.head_sha == "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4"
     assert pr.is_draft is False
     assert pr.state == "OPEN"
     assert pr.labels == ("bug", "ready")
     assert pr.last_pushed_at is not None
     assert pr.checks_status == "SUCCESS"
+    assert pr.head_repo_slug == "dhh1128/gitbulk"
+    assert pr.is_cross_repository is False
+
+
+def test_pr_info_parser_populates_cross_repo_from_fork_node():
+    node = _node_template()
+    node["isCrossRepository"] = True
+    node["headRepository"] = {"nameWithOwner": "contributor/gitbulk"}
+    pr = _pr_info_from_graphql_node(node)
+    assert pr.is_cross_repository is True
+    assert pr.head_repo_slug == "contributor/gitbulk"
+
+
+def test_pr_info_parser_cross_repo_defaults_when_fields_absent():
+    node = _node_template()
+    node.pop("isCrossRepository", None)
+    node.pop("headRepository", None)
+    pr = _pr_info_from_graphql_node(node)
+    assert pr.is_cross_repository is False
+    assert pr.head_repo_slug is None
+
+
+def test_pr_info_parser_tolerates_null_head_repository():
+    # headRepository is null for a deleted fork even when isCrossRepository.
+    node = _node_template()
+    node["isCrossRepository"] = True
+    node["headRepository"] = None
+    pr = _pr_info_from_graphql_node(node)
+    assert pr.is_cross_repository is True
+    assert pr.head_repo_slug is None
+
+
+@pytest.mark.parametrize("bad_ref", ["-x", "--upload-pack=/tmp/evil"])
+def test_pr_info_parser_rejects_dash_leading_head_ref(bad_ref):
+    # A ref parsed by git as an option is an RCE vector under cron; the parser
+    # fails closed with a GHError naming the PR (node gtargv7n).
+    node = _node_template()
+    node["headRefName"] = bad_ref
+    with pytest.raises(GHError) as exc:
+        _pr_info_from_graphql_node(node)
+    assert "dhh1128/gitbulk#42" in str(exc.value)
+
+
+def test_pr_info_parser_rejects_dash_leading_base_ref():
+    node = _node_template()
+    node["baseRefName"] = "--upload-pack=/tmp/evil"
+    with pytest.raises(GHError):
+        _pr_info_from_graphql_node(node)
+
+
+def test_pr_info_parser_rejects_malformed_head_sha():
+    node = _node_template()
+    node["headRefOid"] = "../../etc/passwd"
+    with pytest.raises(GHError) as exc:
+        _pr_info_from_graphql_node(node)
+    assert "sha" in str(exc.value)
 
 
 def test_pr_info_parser_handles_null_author():
@@ -1450,9 +1508,11 @@ def test_fetch_check_runs_argv_and_parse_ndjson():
     side_effect = _make_run_mock(_CompletedFake(0, stdout=stdout))
     with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
         client = ProductionGHClient()
-        result = client.fetch_check_runs("dhh1128/gitbulk", "abc123")
+        result = client.fetch_check_runs("dhh1128/gitbulk", "a" * 40)
     args, _ = mock_run.call_args
-    assert args[0][:3] == ["gh", "api", "repos/dhh1128/gitbulk/commits/abc123/check-runs"]
+    assert args[0][:3] == [
+        "gh", "api", f"repos/dhh1128/gitbulk/commits/{'a' * 40}/check-runs"
+    ]
     assert "--jq" in args[0]
     # Two valid rows; the malformed line is skipped.
     assert len(result) == 2
@@ -1468,7 +1528,19 @@ def test_fetch_check_runs_empty_response_returns_empty():
     side_effect = _make_run_mock(_CompletedFake(0, stdout=""))
     with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
         client = ProductionGHClient()
-        assert client.fetch_check_runs("a/b", "sha1") == []
+        assert client.fetch_check_runs("a/b", "a" * 40) == []
+
+
+def test_fetch_check_runs_rejects_malformed_sha():
+    # A sha containing path/query chars could redirect the REST path; the
+    # client refuses before building it and never shells out (node gtargv7n).
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=""))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        with pytest.raises(GHError) as exc:
+            client.fetch_check_runs("a/b", "../../secrets")
+    assert "sha" in str(exc.value)
+    mock_run.assert_not_called()
 
 
 def test_fetch_check_runs_handles_missing_fields():
@@ -1477,7 +1549,7 @@ def test_fetch_check_runs_handles_missing_fields():
     side_effect = _make_run_mock(_CompletedFake(0, stdout=row + "\n"))
     with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
         client = ProductionGHClient()
-        result = client.fetch_check_runs("a/b", "sha1")
+        result = client.fetch_check_runs("a/b", "a" * 40)
     assert len(result) == 1
     assert result[0].name == ""
     assert result[0].status == ""

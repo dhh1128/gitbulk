@@ -186,6 +186,16 @@ class PRInfo:
     labels: tuple[str, ...]
     review_decision: str | None
     checks_status: str | None
+    #: Head repository ``full_name`` (``owner/name``). Equals :attr:`slug` for
+    #: a same-repo PR; for a fork PR it is the fork's slug, or ``None`` when the
+    #: fork has been deleted. Populated from GraphQL ``headRepository`` (node
+    #: ``frkrep5q``); defaults to ``None`` so legacy fixtures stay ergonomic.
+    head_repo_slug: str | None = None
+    #: True when the PR's head branch lives on a different repository than the
+    #: base — a fork PR. From GraphQL ``isCrossRepository`` (the authoritative
+    #: fork signal). rebase-pr skips these (the head branch is on the fork, not
+    #: ``origin``) and merge leaves the fork branch intact (node ``frkrep5q``).
+    is_cross_repository: bool = False
     #: Count of currently-unresolved review threads on the PR. Bots are
     #: counted alongside humans per the merge-gate decision (see gaps.md
     #: and the merge-only ``pr.no_unresolved_threads`` invariant).
