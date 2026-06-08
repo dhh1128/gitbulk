@@ -704,10 +704,12 @@ def _run_under_lock(
     concurrency = _resolve_concurrency(args, policy)
     prune_local = _prune_local_enabled(args)
 
-    # One BATCHED open-PR fetch for the whole scope (node prnwpf9k): the gh
-    # client chunks repo: qualifiers internally (~50/search), so this is a
-    # handful of searches instead of one per repo. author=None — anyone's open
-    # PR pins a branch, not just mine. A whole-scope failure is structural (we
+    # One BATCHED open-PR head fetch for the whole scope (node prnwpf9k): the
+    # gh client chunks repo: qualifiers internally, so this is a handful of
+    # searches instead of one per repo. We only need each open PR's HEAD branch
+    # (any author — anyone's open PR pins a branch), so open_pr_heads uses a
+    # lean GraphQL selection that is far cheaper than the full PR query and much
+    # less likely to 502 (node 6bm7). A whole-scope failure is structural (we
     # can't reason about open-PR heads for any repo), so it aborts rather than
     # mis-classify every branch as having no open PR.
     #
@@ -718,9 +720,8 @@ def _run_under_lock(
         len(passing_repos), prefix="fetching open PRs: "
     )
     try:
-        open_prs_by_slug = gh.my_open_prs(
+        open_heads_by_slug = gh.open_pr_heads(
             [r.slug for r in passing_repos],
-            author=None,
             on_progress=lambda done, total: fetch_prog.update(done),
         )
     except GHError as e:
@@ -752,9 +753,6 @@ def _run_under_lock(
             skipped_entries=skipped_entries, filter_line=filter_line,
         )
     fetch_prog.done()
-    open_heads_by_slug = {
-        slug: {pr.head_ref for pr in prs} for slug, prs in open_prs_by_slug.items()
-    }
 
     # Pass A (parallel): read each clone's worktrees + local branches.
     prog_a = Progress(len(passing_repos), prefix="scanning clones: ")

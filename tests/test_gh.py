@@ -16,7 +16,9 @@ from gitbulk.gh import FakeGHClient, GHClient, GHError, GHTimeoutError
 from gitbulk.pr_info import PRInfo
 
 
-def _pr(slug: str = "dhh1128/gitbulk", number: int = 1) -> PRInfo:
+def _pr(
+    slug: str = "dhh1128/gitbulk", number: int = 1, *, head_ref: str | None = None
+) -> PRInfo:
     return PRInfo(
         slug=slug,
         number=number,
@@ -24,7 +26,7 @@ def _pr(slug: str = "dhh1128/gitbulk", number: int = 1) -> PRInfo:
         url=f"https://github.com/{slug}/pull/{number}",
         author="dhh1128",
         base_ref="main",
-        head_ref=f"feature/{number}",
+        head_ref=head_ref if head_ref is not None else f"feature/{number}",
         head_sha="a" * 40,
         state="OPEN",
         is_draft=False,
@@ -188,6 +190,50 @@ def test_my_open_prs_no_slugs_fires_on_progress_once():
     calls: list[tuple[int, int]] = []
     fake.my_open_prs(on_progress=lambda done, total: calls.append((done, total)))
     assert calls == [(1, 1)]
+
+
+# ─── FakeGHClient.open_pr_heads (node 6bm7) ─────────────────────────────────
+
+
+def _open_pr(slug, number, head_ref):
+    return _pr(slug, number, head_ref=head_ref)
+
+
+def test_open_pr_heads_returns_head_sets_per_slug():
+    fake = FakeGHClient(
+        my_open_prs={
+            "a/x": [_open_pr("a/x", 1, "feat-1"), _open_pr("a/x", 2, "feat-2")],
+            "b/y": [_open_pr("b/y", 3, "fix")],
+        }
+    )
+    result = fake.open_pr_heads(["a/x", "b/y"])
+    assert result == {"a/x": {"feat-1", "feat-2"}, "b/y": {"fix"}}
+
+
+def test_open_pr_heads_empty_set_for_repo_without_prs():
+    fake = FakeGHClient(my_open_prs={"a/x": [_open_pr("a/x", 1, "feat")]})
+    result = fake.open_pr_heads(["a/x", "quiet/repo"])
+    assert result["quiet/repo"] == set()
+    assert result["a/x"] == {"feat"}
+
+
+def test_open_pr_heads_raises_when_unconfigured():
+    fake = FakeGHClient()
+    with pytest.raises(GHError, match="my_open_prs not configured"):
+        fake.open_pr_heads(["a/x"])
+
+
+def test_open_pr_heads_fires_on_progress_per_chunk(monkeypatch):
+    import gitbulk.gh as gh_mod
+
+    monkeypatch.setattr(gh_mod, "_OPEN_PRS_REPO_CHUNK", 2)
+    fake = FakeGHClient(my_open_prs={})
+    calls: list[tuple[int, int]] = []
+    fake.open_pr_heads(
+        ["o/a", "o/b", "o/c", "o/d", "o/e"],
+        on_progress=lambda done, total: calls.append((done, total)),
+    )
+    assert calls == [(2, 5), (4, 5), (5, 5)]
 
 
 # ─── FakeGHClient.merge_pr ─────────────────────────────────────────────────

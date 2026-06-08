@@ -1194,7 +1194,7 @@ def test_open_pr_fetch_failure_aborts_structural(
 
     def _boom(*a, **k):
         raise GHError("search rate-limited")
-    monkeypatch.setattr(fake, "my_open_prs", _boom)
+    monkeypatch.setattr(fake, "open_pr_heads", _boom)
     _install(monkeypatch, fake)
     rc = prune_worktrees_handler(_args(code_root=code_root))
     assert rc == EXIT_STRUCTURAL_FAILURE
@@ -1218,8 +1218,8 @@ def test_open_pr_fetch_failure_logs_gh_command_and_points_at_errors(
     gh_cmd = ("gh", "api", "graphql", "-f", "query=...", "-F", "q=is:open is:pr")
 
     def _boom(*a, **k):
-        raise GHError("gh exhausted 3 attempts: gh: HTTP 502", command=gh_cmd)
-    monkeypatch.setattr(fake, "my_open_prs", _boom)
+        raise GHError("gh exhausted 5 attempts: gh: HTTP 502", command=gh_cmd)
+    monkeypatch.setattr(fake, "open_pr_heads", _boom)
     _install(monkeypatch, fake)
 
     rc = prune_worktrees_handler(_args(code_root=code_root))
@@ -1256,12 +1256,12 @@ def test_open_pr_fetch_receives_progress_callback(
     fake = _base_fake()
     captured = {}
 
-    def _capture(slugs, *, author=None, timeout=None, on_progress=None):
+    def _capture(slugs, *, timeout=None, on_progress=None):
         captured["on_progress"] = on_progress
         if on_progress is not None:
             on_progress(1, 1)  # exercise the callback wiring
-        return {s: [] for s in slugs}
-    monkeypatch.setattr(fake, "my_open_prs", _capture)
+        return {s: set() for s in slugs}
+    monkeypatch.setattr(fake, "open_pr_heads", _capture)
     _install(monkeypatch, fake)
 
     rc = prune_worktrees_handler(_args(code_root=code_root))
