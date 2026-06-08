@@ -162,6 +162,7 @@ class GHClient(Protocol):
         *,
         author: str | None = "@me",
         timeout: float | None = None,
+        on_progress: "Callable[[int, int], None] | None" = None,
     ) -> dict[str, list[PRInfo]]:
         """Return open PRs grouped by repo slug.
 
@@ -177,6 +178,13 @@ class GHClient(Protocol):
 
         Chunks/paginates internally (per ``ghclmp7n.c`` + the pagination
         fix) regardless of how many slugs are passed.
+
+        ``on_progress`` (if given) is called after each repo-chunk's
+        search completes with ``(repos_completed, repos_total)`` so callers
+        can render a progress indicator — for a large fleet this fetch is
+        several sequential multi-second GraphQL searches and otherwise
+        looks like a hang (node 6bm7). Mirrors
+        :meth:`prefetch_default_branches`.
         """
         ...
 
@@ -650,18 +658,28 @@ class FakeGHClient:
         *,
         author: str | None = "@me",
         timeout: float | None = None,
+        on_progress: "Callable[[int, int], None] | None" = None,
     ) -> dict[str, list[PRInfo]]:
         self.call_count["my_open_prs"] += 1
         self.last_my_open_prs_author = author  # for test assertions
         if self._my_open_prs is None:
             raise GHError("FakeGHClient: my_open_prs not configured")
         if slugs is None:
+            if on_progress is not None:
+                on_progress(1, 1)
             return {k: list(v) for k, v in self._my_open_prs.items()}
-        slugs_set = set(slugs)
-        return {
+        slug_list = list(slugs)
+        result = {
             slug: list(self._my_open_prs.get(slug, []))
-            for slug in slugs_set
+            for slug in slug_list
         }
+        # Mirror production's per-chunk progress firing so callers' progress
+        # wiring is exercised under test (node 6bm7).
+        if on_progress is not None:
+            total = len(slug_list)
+            for start in range(0, total, _OPEN_PRS_REPO_CHUNK):
+                on_progress(min(start + _OPEN_PRS_REPO_CHUNK, total), total)
+        return result
 
     def merge_pr(
         self,
@@ -1455,6 +1473,7 @@ class ProductionGHClient:
         *,
         author: str | None = "@me",
         timeout: float | None = None,
+        on_progress: "Callable[[int, int], None] | None" = None,
     ) -> dict[str, list[PRInfo]]:
         # verified non-deprecated against gh CLI 2026-05-28
         # author=None → no author: qualifier (any author); otherwise add
@@ -1469,8 +1488,11 @@ class ProductionGHClient:
         if slugs is None:
             # No repo filter: one paginated search across all my PRs.
             node_batches = [self._search_all_pages(base_terms, timeout=timeout)]
+            if on_progress is not None:
+                on_progress(1, 1)
         else:
             slug_list = list(slugs)
+            total = len(slug_list)
             # Pre-seed every requested slug so repos with no PRs still
             # appear (matches FakeGHClient.my_open_prs semantics).
             for slug in slug_list:
@@ -1478,14 +1500,18 @@ class ProductionGHClient:
             # Chunk the repo: qualifiers. GitHub silently caps how many
             # it honors in one query, so coalescing all 200+ into one
             # search would drop repos without any error. Each chunk is
-            # independently paginated.
+            # independently paginated. on_progress fires after each chunk
+            # (node 6bm7) — the searches are sequential and multi-second, so
+            # without it a large fleet looks hung between phases.
             node_batches = []
-            for start in range(0, len(slug_list), _OPEN_PRS_REPO_CHUNK):
+            for start in range(0, total, _OPEN_PRS_REPO_CHUNK):
                 chunk = slug_list[start : start + _OPEN_PRS_REPO_CHUNK]
                 terms = base_terms + [f"repo:{s}" for s in chunk]
                 node_batches.append(
                     self._search_all_pages(terms, timeout=timeout)
                 )
+                if on_progress is not None:
+                    on_progress(min(start + _OPEN_PRS_REPO_CHUNK, total), total)
 
         for nodes in node_batches:
             for node in nodes:

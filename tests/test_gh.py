@@ -167,6 +167,29 @@ def test_my_open_prs_call_count_tracks_coalescing():
     assert fake.call_count["my_open_prs"] == 1
 
 
+def test_my_open_prs_fires_on_progress_per_chunk(monkeypatch):
+    """The fake mirrors production's per-chunk on_progress(done, total)
+    firing so a caller's progress wiring is exercised (node 6bm7)."""
+    import gitbulk.gh as gh_mod
+
+    monkeypatch.setattr(gh_mod, "_OPEN_PRS_REPO_CHUNK", 2)
+    fake = FakeGHClient(my_open_prs={})
+    slugs = ["o/a", "o/b", "o/c", "o/d", "o/e"]  # 5 slugs, chunk 2 → 3 chunks
+    calls: list[tuple[int, int]] = []
+    fake.my_open_prs(
+        slugs=slugs, on_progress=lambda done, total: calls.append((done, total))
+    )
+    assert calls == [(2, 5), (4, 5), (5, 5)]
+
+
+def test_my_open_prs_no_slugs_fires_on_progress_once():
+    """The None-slugs path (one search) fires on_progress(1, 1)."""
+    fake = FakeGHClient(my_open_prs={"a/x": [_pr("a/x", 1)]})
+    calls: list[tuple[int, int]] = []
+    fake.my_open_prs(on_progress=lambda done, total: calls.append((done, total)))
+    assert calls == [(1, 1)]
+
+
 # ─── FakeGHClient.merge_pr ─────────────────────────────────────────────────
 
 

@@ -710,21 +710,48 @@ def _run_under_lock(
     # PR pins a branch, not just mine. A whole-scope failure is structural (we
     # can't reason about open-PR heads for any repo), so it aborts rather than
     # mis-classify every branch as having no open PR.
+    #
+    # The fetch is several sequential multi-second GraphQL searches; without a
+    # progress bar the screen sits blank for 30-45s on a large fleet and looks
+    # hung (node 6bm7). Drive a Progress off the per-chunk callback.
+    fetch_prog = Progress(
+        len(passing_repos), prefix="fetching open PRs: "
+    )
     try:
         open_prs_by_slug = gh.my_open_prs(
-            [r.slug for r in passing_repos], author=None
+            [r.slug for r in passing_repos],
+            author=None,
+            on_progress=lambda done, total: fetch_prog.update(done),
         )
     except GHError as e:
+        fetch_prog.done()
+        # Capture the failing gh invocation in the run log so `gitbulk show
+        # prune-worktrees --errors` reveals which call/qualifiers 502'd —
+        # str(e) alone (e.g. "gh: HTTP 502") gave the operator nothing to act
+        # on (node 6bm7).
+        gh_command = " ".join(e.command) if e.command else None
         rs.record_error(
-            f"open-PR fetch failed: {e}", level="ERROR", context={"error": str(e)}
+            f"open-PR fetch failed: {e}",
+            level="ERROR",
+            context={"error": str(e), "gh_command": gh_command},
+        )
+        # Echo where the raw logs live and a transient-error hint alongside the
+        # terse message, so diagnosis doesn't require a guess about HTTP 5xx.
+        detail = (
+            f"open-PR fetch failed: {e}\n"
+            "  HTTP 5xx here is a transient/overloaded GitHub PR search; "
+            "retrying shortly usually clears it.\n"
+            f"  full run logs: {rs.run_dir}\n"
+            "  failing gh call: gitbulk show prune-worktrees --errors"
         )
         return _finish(
-            rs, EXIT_STRUCTURAL_FAILURE, summary=f"open-PR fetch failed: {e}",
+            rs, EXIT_STRUCTURAL_FAILURE, summary=detail,
             policy=policy, attention=False, all_repos=repos,
             passing_repos=passing_repos, skipped_repos=skipped_repos,
             results=[], apply=bool(args.apply),
             skipped_entries=skipped_entries, filter_line=filter_line,
         )
+    fetch_prog.done()
     open_heads_by_slug = {
         slug: {pr.head_ref for pr in prs} for slug, prs in open_prs_by_slug.items()
     }

@@ -1201,6 +1201,74 @@ def test_open_pr_fetch_failure_aborts_structural(
     assert "open-PR fetch failed" in _summary()
 
 
+def test_open_pr_fetch_failure_logs_gh_command_and_points_at_errors(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
+):
+    """On a fetch 5xx, the failing gh command lands in errors.log and the
+    summary points the operator at the raw logs + `--errors` (node 6bm7)."""
+    import json
+
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),
+    ])
+    fake = _base_fake()
+    gh_cmd = ("gh", "api", "graphql", "-f", "query=...", "-F", "q=is:open is:pr")
+
+    def _boom(*a, **k):
+        raise GHError("gh exhausted 3 attempts: gh: HTTP 502", command=gh_cmd)
+    monkeypatch.setattr(fake, "my_open_prs", _boom)
+    _install(monkeypatch, fake)
+
+    rc = prune_worktrees_handler(_args(code_root=code_root))
+    assert rc == EXIT_STRUCTURAL_FAILURE
+
+    # The failing gh invocation is captured in the structured log.
+    run_dir = paths.latest_run_symlink("prune-worktrees").resolve()
+    errors = [
+        json.loads(line)
+        for line in (run_dir / "errors.log").read_text().splitlines()
+        if line.strip()
+    ]
+    fetch_err = next(e for e in errors if "open-PR fetch failed" in e["message"])
+    assert fetch_err["context"]["gh_command"] == " ".join(gh_cmd)
+
+    # The summary surfaces a transient-error hint + where to read raw logs.
+    summary = _summary()
+    assert "HTTP 5xx" in summary
+    assert "gitbulk show prune-worktrees --errors" in summary
+    assert str(run_dir) in summary
+
+
+def test_open_pr_fetch_receives_progress_callback(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
+):
+    """The handler wires an on_progress callback into the batched fetch so the
+    long fetch window is not silent (node 6bm7)."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),
+    ])
+    fake = _base_fake()
+    captured = {}
+
+    def _capture(slugs, *, author=None, timeout=None, on_progress=None):
+        captured["on_progress"] = on_progress
+        if on_progress is not None:
+            on_progress(1, 1)  # exercise the callback wiring
+        return {s: [] for s in slugs}
+    monkeypatch.setattr(fake, "my_open_prs", _capture)
+    _install(monkeypatch, fake)
+
+    rc = prune_worktrees_handler(_args(code_root=code_root))
+    assert rc == EXIT_OK
+    assert callable(captured["on_progress"])
+
+
 # ─── remote-driven protection guard (node prnwlb7q) ────────────────────────
 
 

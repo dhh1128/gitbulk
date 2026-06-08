@@ -542,6 +542,37 @@ def test_my_open_prs_argv_includes_repo_terms_for_each_slug():
     assert q_value == "q=author:@me is:open is:pr repo:a/x repo:b/y"
 
 
+def test_my_open_prs_fires_on_progress_after_each_chunk(monkeypatch):
+    """on_progress(repos_completed, repos_total) fires once per repo-chunk so
+    a caller can render a bar during the otherwise-silent fetch (node 6bm7)."""
+    monkeypatch.setattr("gitbulk.gh._OPEN_PRS_REPO_CHUNK", 2)
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps({"data": {"search": {"nodes": []}}}))
+    )
+    calls: list[tuple[int, int]] = []
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        client.my_open_prs(
+            slugs=["o/a", "o/b", "o/c", "o/d", "o/e"],  # 5 → chunks of 2
+            on_progress=lambda done, total: calls.append((done, total)),
+        )
+    assert calls == [(2, 5), (4, 5), (5, 5)]
+
+
+def test_my_open_prs_no_slugs_fires_on_progress_once(monkeypatch):
+    """The single-search (slugs=None) path fires on_progress(1, 1)."""
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps({"data": {"search": {"nodes": []}}}))
+    )
+    calls: list[tuple[int, int]] = []
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        client.my_open_prs(
+            on_progress=lambda done, total: calls.append((done, total))
+        )
+    assert calls == [(1, 1)]
+
+
 def test_my_open_prs_with_slugs_emits_empty_list_for_unknown_slug():
     """Matches FakeGHClient: every requested slug appears in result."""
     side_effect = _make_run_mock(
