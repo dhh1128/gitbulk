@@ -92,10 +92,12 @@ def _make_pr(
     checks_status: str | None = "SUCCESS",
     review_decision: str | None = "APPROVED",
     last_pushed_at: datetime | None = None,
+    is_cross_repository: bool = False,
 ) -> PRInfo:
     if last_pushed_at is None:
         last_pushed_at = datetime.now(timezone.utc) - timedelta(days=14)
     return PRInfo(
+        is_cross_repository=is_cross_repository,
         slug=slug,
         number=number,
         title=title or f"PR #{number}",
@@ -322,6 +324,49 @@ def test_apply_two_eligible_prs_both_merged(
         pr_states = state["repos"][slug]["prs"]
         assert len(pr_states) == 1
         assert pr_states[0]["merged"] is True
+
+
+# ─── --apply fork-aware delete_branch (node frkrep5q) ──────────────────────
+
+
+def test_apply_cross_repo_pr_merges_without_deleting_fork_branch(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """A fork PR still merges, but delete_branch is False so gitbulk never
+    asks GitHub to delete a branch living on someone's fork."""
+    write_config(repos_slugs=["dhh1128/alpha", "dhh1128/beta"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    pr_same = _make_pr(slug="dhh1128/alpha", number=1)
+    pr_fork = _make_pr(
+        slug="dhh1128/beta", number=2, is_cross_repository=True
+    )
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={
+            "dhh1128/alpha": "main",
+            "dhh1128/beta": "main",
+        },
+        my_open_prs={
+            "dhh1128/alpha": [pr_same],
+            "dhh1128/beta": [pr_fork],
+        },
+        merge_responses={
+            ("dhh1128/alpha", 1): {"merged": True},
+            ("dhh1128/beta", 2): {"merged": True},
+        },
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.merge.ProductionGHClient", lambda: fake
+    )
+
+    rc = merge_handler(_make_args(apply=True, code_root=code_root))
+    assert rc == EXIT_OK
+    assert fake.call_count["merge_pr"] == 2
+    delete_by_number = {c["number"]: c["delete_branch"] for c in fake.merge_calls}
+    # Same-repo PR: branch deleted as usual. Fork PR: branch left intact.
+    assert delete_by_number[1] is True
+    assert delete_by_number[2] is False
 
 
 # ─── --apply with one not-ready PR → skipped by invariants ─────────────────

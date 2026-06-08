@@ -167,6 +167,7 @@ def test_subcommand_has_invariant_chain_default_empty():
                 "github.not_archived",
                 "pr.base_is_default",
                 "pr.author_known",
+                "pr.head_on_origin",
                 "pr.needs_rebase",
             ),
         ),

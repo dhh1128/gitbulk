@@ -467,6 +467,62 @@ Gitbulk Triage Tool = goal:
         the universal chain (prune-branches/-worktrees, recover-branch) leave
         actor null for now; extending coverage to them is a separate change.
 
+    Untrusted Refs And SHAs Are Validated At The gh Boundary = decision:
+      id: gtargv7n
+      why: >
+        base_ref / head_ref / head_sha originate from gh's GraphQL/REST JSON
+        and are interpolated into git subprocess argv (rebase.py fetch/rebase/
+        force-push) and into REST API paths (gh.fetch_check_runs:
+        `repos/<slug>/commits/<sha>/check-runs`). A ref that begins with `-`
+        is parsed by git as an OPTION rather than a positional — e.g.
+        `--upload-pack=<cmd>` on a fetch is remote-code-execution under cron;
+        a sha containing `/` or `?` redirects the REST path. Two layers of
+        defense, fail-closed:
+          (1) PRIMARY — validate at ingest. `gitbulk.util.gitref` exposes
+          `is_safe_ref` (non-empty, no leading `-`, no whitespace/ASCII
+          control) and `is_valid_sha` (`^[0-9a-f]{7,40}$`).
+          `_pr_info_from_graphql_node` calls `ensure_safe_ref` on
+          base_ref/head_ref and `ensure_valid_sha` on head_sha; a violation
+          raises GHError and PROPAGATES (the run aborts loudly naming the bad
+          value). This is acceptable because GitHub/git's own refname rules
+          forbid leading-dash and whitespace refs, so legitimate data never
+          trips it — a value that does is an attack or corruption and must
+          not reach git. `fetch_check_runs` independently `ensure_valid_sha`s
+          its sha argument before building the REST path (folds SEC-F2).
+          (2) DEFENCE-IN-DEPTH — `--` terminator. rebase.py inserts `--`
+          before the positional ref in every `git fetch origin -- <base_ref>`
+          and `git rebase -- origin/<base_ref>`, so even an unvalidated
+          dash-leading ref is forced to be read as a refspec. (Verified git
+          accepts `--` there, 2026-06-08.) The force-push refspecs
+          (`--force-with-lease=<ref>:<sha>`, `HEAD:<ref>`) are already
+          option-safe by their fixed prefixes once the ref/sha are validated.
+        Rejected: a per-PR skip on a malformed ref inside my_open_prs — it
+        would let a single crafted PR silently vanish from triage; a hard
+        abort is the safer security posture for a tool that force-pushes.
+
+    Fork / Cross-Repo PRs Are Fork-Aware In rebase-pr And merge = decision:
+      id: frkrep5q
+      why: >
+        A PR opened from a fork has its head branch on the FORK, not on
+        `origin` (the base repo gitbulk has a clone of). Two unconditional
+        operations were wrong for such PRs: (a) rebase-pr's
+        `force_push_with_lease(worktree, head_ref, head_sha)` pushes
+        `HEAD:<head_ref>` to `origin` — for a fork PR that targets a branch
+        on the BASE repo that has nothing to do with the PR, either failing
+        or clobbering an unrelated ref; (b) merge passed
+        `delete_branch=True` unconditionally, asking GitHub to delete a
+        branch that lives on someone's fork (gitbulk's standing policy is to
+        never delete fork branches — see ClosedPRRef / prune). Fix: PRInfo
+        gains `is_cross_repository` (from GraphQL `isCrossRepository`, the
+        authoritative fork signal) and `head_repo_slug` (from
+        `headRepository.nameWithOwner`, null when the fork is deleted), both
+        default-valued so fixtures stay ergonomic. rebase-pr adds a PER_PR
+        invariant `pr.head_on_origin` that SKIPS cross-repo PRs (this-PR-
+        doesn't-qualify, not a structural Fail). merge passes
+        `delete_branch=not pr.is_cross_repository`, so fork PRs still merge
+        but their fork branch is left intact. Local-only prune commands
+        already had head_repo_slug via the REST path and are unaffected.
+
     # ─── PR CLASSIFICATION & MERGE-READINESS ─────────────────────────────────
 
     Unknown Accounts Default Non Human = decision:

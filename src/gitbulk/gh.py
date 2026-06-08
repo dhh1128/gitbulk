@@ -48,6 +48,7 @@ from gitbulk.pr_info import (
     PRInfo,
     TimelineEvent,
 )
+from gitbulk.util.gitref import UnsafeGitValue, ensure_safe_ref, ensure_valid_sha
 
 
 @runtime_checkable
@@ -1044,6 +1045,8 @@ query($q: String!, $after: String) {
         baseRefName
         headRefName
         headRefOid
+        isCrossRepository
+        headRepository { nameWithOwner }
         createdAt
         updatedAt
         mergeStateStatus
@@ -1740,6 +1743,13 @@ class ProductionGHClient:
         *,
         timeout: float | None = None,
     ) -> list[CheckRun]:
+        # Validate the sha before it is interpolated into the REST path; a
+        # value containing '/' or '?' could otherwise redirect the API call
+        # (node gtargv7n / folds SEC-F2).
+        try:
+            sha = ensure_valid_sha(sha)
+        except UnsafeGitValue as e:
+            raise GHError(f"refusing check-runs fetch for {slug}: {e}") from e
         # verified non-deprecated against gh CLI 2026-05-28
         # (REST endpoint /repos/<slug>/commits/<sha>/check-runs)
         stdout = self._run(
@@ -1987,6 +1997,24 @@ def _pr_info_from_graphql_node(node: dict[str, Any]) -> PRInfo:
     author_obj = node.get("author") or {}
     author = author_obj.get("login", "")
 
+    # Fail-closed validation of the values that will reach a git subprocess or
+    # a REST path (node gtargv7n). A ref beginning with `-` would be parsed by
+    # git as an option (e.g. `--upload-pack=<cmd>` → RCE under cron); a
+    # malformed sha can redirect an API path. Legitimate GitHub refs/SHAs never
+    # trip this, so a violation aborts the run loudly rather than reaching git.
+    try:
+        base_ref = ensure_safe_ref(node["baseRefName"])
+        head_ref = ensure_safe_ref(node["headRefName"])
+        head_sha = ensure_valid_sha(node["headRefOid"])
+    except UnsafeGitValue as e:
+        raise GHError(
+            f"refusing PR {slug}#{node.get('number')}: {e}"
+        ) from e
+
+    head_repo_obj = node.get("headRepository") or {}
+    head_repo_slug = head_repo_obj.get("nameWithOwner")
+    is_cross_repository = bool(node.get("isCrossRepository", False))
+
     labels_obj = node.get("labels") or {}
     label_nodes = labels_obj.get("nodes") or []
     labels = tuple(n["name"] for n in label_nodes if n and n.get("name"))
@@ -2058,9 +2086,9 @@ def _pr_info_from_graphql_node(node: dict[str, Any]) -> PRInfo:
         title=node["title"],
         url=node["url"],
         author=author,
-        base_ref=node["baseRefName"],
-        head_ref=node["headRefName"],
-        head_sha=node["headRefOid"],
+        base_ref=base_ref,
+        head_ref=head_ref,
+        head_sha=head_sha,
         state=node["state"],
         is_draft=node["isDraft"],
         mergeable_state=node.get("mergeStateStatus"),
@@ -2070,6 +2098,8 @@ def _pr_info_from_graphql_node(node: dict[str, Any]) -> PRInfo:
         labels=labels,
         review_decision=node.get("reviewDecision"),
         checks_status=checks_status,
+        head_repo_slug=head_repo_slug,
+        is_cross_repository=is_cross_repository,
         unresolved_thread_count=unresolved_thread_count,
         timeline_events=tuple(timeline_events),
         timeline_capped=timeline_capped,

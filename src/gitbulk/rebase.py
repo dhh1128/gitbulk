@@ -112,14 +112,14 @@ def rebase_onto_base(worktree_path: Path, base_ref: str) -> RebaseResult:
       - ERROR: a non-conflict failure (bad fetch, bad ref). The rebase
         is aborted so the worktree is clean and removable.
     """
-    fetched = _git(worktree_path, "fetch", "origin", base_ref)
+    fetched = _git(worktree_path, "fetch", "origin", "--", base_ref)
     if fetched.returncode != 0:
         return RebaseResult(
             RebaseStatus.ERROR,
             f"fetch origin {base_ref} failed: {fetched.stderr.strip()}",
         )
 
-    rebased = _git(worktree_path, "rebase", f"origin/{base_ref}")
+    rebased = _git(worktree_path, "rebase", "--", f"origin/{base_ref}")
     if rebased.returncode == 0:
         return RebaseResult(RebaseStatus.CLEAN, f"rebased onto origin/{base_ref}")
 
@@ -149,7 +149,7 @@ def fetch_base(worktree_path: Path, base_ref: str) -> RebaseResult:
     ERROR with the git stderr; never raises (the caller decides whether a
     fetch failure skips the target).
     """
-    fetched = _git(worktree_path, "fetch", "origin", base_ref)
+    fetched = _git(worktree_path, "fetch", "origin", "--", base_ref)
     if fetched.returncode != 0:
         return RebaseResult(
             RebaseStatus.ERROR,

@@ -101,6 +101,9 @@ merge method (`rebase`/`merge`/`squash`) comes from config.
 
 Rebases your behind-or-conflicting PRs onto their current base and force-pushes
 with a lease (`--force-with-lease`), so it never clobbers a concurrent push.
+Fork (cross-repo) PRs are **skipped** — their head branch lives on the fork,
+not on the repo gitbulk pushes to — so gitbulk only rebases PRs whose head
+branch is on `origin`.
 
 ### `close-stale`
 

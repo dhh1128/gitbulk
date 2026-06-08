@@ -55,11 +55,13 @@ def test_rebase_clean():
     with patch("gitbulk.rebase.subprocess.run", side_effect=side) as run:
         result = rebase_onto_base(WT, "dev")
     assert result.status is RebaseStatus.CLEAN
-    # argv: fetch origin dev, then rebase origin/dev
+    # argv: fetch origin -- dev, then rebase -- origin/dev. The '--'
+    # terminates option parsing so a '-'-leading ref can't become a git
+    # option (defense-in-depth, node gtargv7n).
     fetch_argv = run.call_args_list[0][0][0]
     rebase_argv = run.call_args_list[1][0][0]
-    assert fetch_argv == [GIT, "-C", str(WT), "fetch", "origin", "dev"]
-    assert rebase_argv == [GIT, "-C", str(WT), "rebase", "origin/dev"]
+    assert fetch_argv == [GIT, "-C", str(WT), "fetch", "origin", "--", "dev"]
+    assert rebase_argv == [GIT, "-C", str(WT), "rebase", "--", "origin/dev"]
 
 
 def test_rebase_fetch_failure_is_error():
@@ -165,7 +167,7 @@ def test_fetch_base_clean():
         result = fetch_base(WT, "main")
     assert result.status is RebaseStatus.CLEAN
     assert run.call_args_list[0][0][0] == [
-        GIT, "-C", str(WT), "fetch", "origin", "main",
+        GIT, "-C", str(WT), "fetch", "origin", "--", "main",
     ]
 
 
