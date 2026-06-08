@@ -362,6 +362,8 @@ def test_state2a_on_remote_stale_deletes(monkeypatch, clean_helpers):
     out = _classify(_no_pr_fake(), _entry("/wt"), default_branch="main")
     assert out["decision"] == "delete"
     assert "every commit is already on a remote" in out["reason"]
+    # A worktree passed the clean-tree gate, so the report says so (tick 3sp5).
+    assert "the worktree is clean (no uncommitted tracked work)" in out["reason"]
     # State-2a also proved unpushed==0 → force-delete eligible (prnfd8kq).
     assert out["all_commits_remote"] is True
 
@@ -405,6 +407,8 @@ def test_state2a_free_branch_uses_ref_age(monkeypatch, clean_helpers):
     assert out["decision"] == "delete"
     assert out["kind"] == "branch"
     assert "every commit is already on a remote" in out["reason"]
+    # A free branch has no worktree, so the clean-tree clause is omitted (3sp5).
+    assert "the worktree is clean" not in out["reason"]
 
 
 # ─── no-PR safe paths: State 2b (merged into local default, opt-in) ─────────

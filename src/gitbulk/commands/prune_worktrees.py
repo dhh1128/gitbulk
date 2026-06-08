@@ -261,7 +261,9 @@ def _classify_branch_by_pr(
         }
     # unpushed == 0 here, so every commit is already on a remote: apply may
     # safely force-delete via the all-commits-remote helper rather than
-    # ``git branch -d`` (node prnfd8kq).
+    # ``git branch -d`` (node prnfd8kq). For a worktree this is only reachable
+    # after the clean-tree gate in _classify_worktree, so there is also no
+    # uncommitted tracked work to lose (tick 3sp5).
     return {
         **base, "decision": "delete", "all_commits_remote": True,
         "reason": f"PR #{pr.number} {pr.state.lower()}",
@@ -371,12 +373,21 @@ def _classify_no_pr(
         if age >= grace_days:
             # Every commit is already on a remote (re-verified at apply time),
             # so apply force-deletes via the all-commits-remote helper rather
-            # than ``git branch -d`` (node prnfd8kq).
+            # than ``git branch -d`` (node prnfd8kq). For a worktree, the
+            # clean-tree gate in _classify_worktree already proved there is no
+            # uncommitted tracked work — state that explicitly so the report
+            # makes clear nothing local is lost (a free branch has no worktree,
+            # so the clause is omitted there). Tick 3sp5.
+            clean_note = (
+                " and the worktree is clean (no uncommitted tracked work)"
+                if kind == "worktree" and worktree_path is not None
+                else ""
+            )
             return {
                 **base, "decision": "delete", "all_commits_remote": True,
                 "reason": (
-                    f"no PR, but every commit is already on a remote; "
-                    f"{int(age)}d stale"
+                    f"no PR, but every commit is already on a remote"
+                    f"{clean_note}; {int(age)}d stale"
                 ),
             }
         return {
