@@ -376,6 +376,16 @@ class GHClient(Protocol):
         adds."""
         ...
 
+    def create_branch_ref(
+        self, slug: str, branch: str, sha: str, *, timeout: float | None = None
+    ) -> None:
+        """Create the remote branch ``branch`` on ``slug`` pointing at ``sha``
+        via the git-ref API — the inverse of :meth:`delete_branch_ref`, used by
+        ``recover-branch`` to restore a branch prune-branches deleted (tick
+        6lui). Caller pre-checks existence with :meth:`branch_ref_sha`, so this
+        is only invoked for an absent ref."""
+        ...
+
 
 class GHError(RuntimeError):
     """Raised when a gh invocation fails in a way the caller is expected
@@ -458,6 +468,9 @@ class FakeGHClient:
         delete_branch_responses: Mapping[
             tuple[str, str], "None | Exception"
         ] | None = None,
+        create_branch_responses: Mapping[
+            tuple[str, str], "None | Exception"
+        ] | None = None,
     ) -> None:
         self._user = user
         self._org_members = dict(org_members) if org_members is not None else None
@@ -525,8 +538,15 @@ class FakeGHClient:
             if delete_branch_responses is not None
             else None
         )
+        self._create_branch_responses = (
+            dict(create_branch_responses)
+            if create_branch_responses is not None
+            else None
+        )
         #: Records every delete_branch_ref invocation for assertions.
         self.delete_branch_calls: list[dict[str, Any]] = []
+        #: Records every create_branch_ref invocation for assertions.
+        self.create_branch_calls: list[dict[str, Any]] = []
         # Per-call argument records so tests can assert merge_pr was
         # invoked with the right method / delete_branch flags.
         self.merge_calls: list[dict[str, Any]] = []
@@ -555,6 +575,7 @@ class FakeGHClient:
             "branch_ahead_by": 0,
             "branch_ref_sha": 0,
             "delete_branch_ref": 0,
+            "create_branch_ref": 0,
         }
 
     def authenticated_user(self, *, timeout: float | None = None) -> dict[str, Any]:
@@ -911,6 +932,24 @@ class FakeGHClient:
         # Unconfigured delete defaults to success — tests that care about
         # failure configure an Exception explicitly (mirrors merge_responses
         # ergonomics inverted: deletes are the common happy path).
+        return None
+
+    def create_branch_ref(
+        self, slug: str, branch: str, sha: str, *, timeout: float | None = None
+    ) -> None:
+        self.call_count["create_branch_ref"] += 1
+        self.create_branch_calls.append(
+            {"slug": slug, "branch": branch, "sha": sha}
+        )
+        if (
+            self._create_branch_responses is not None
+            and (slug, branch) in self._create_branch_responses
+        ):
+            value = self._create_branch_responses[(slug, branch)]
+            if isinstance(value, Exception):
+                raise value
+            return None
+        # Unconfigured create defaults to success (mirrors delete_branch_ref).
         return None
 
 
@@ -1888,6 +1927,30 @@ class ProductionGHClient:
                 "-X",
                 "DELETE",
                 f"repos/{slug}/git/refs/heads/{branch}",
+            ),
+            timeout=timeout,
+        )
+
+    def create_branch_ref(
+        self, slug: str, branch: str, sha: str, *, timeout: float | None = None
+    ) -> None:
+        # verified non-deprecated against gh CLI 2026-06-08
+        # (REST POST /repos/<slug>/git/refs with ref=refs/heads/<branch> +
+        # sha — the documented create-ref endpoint, the inverse of the DELETE
+        # sibling above. Used by recover-branch (tick 6lui). The caller
+        # pre-checks with branch_ref_sha so we only POST for an absent ref;
+        # a 422 "Reference already exists" therefore propagates as a GHError
+        # rather than being swallowed here.)
+        self._run(
+            (
+                "api",
+                "-X",
+                "POST",
+                f"repos/{slug}/git/refs",
+                "-f",
+                f"ref=refs/heads/{branch}",
+                "-f",
+                f"sha={sha}",
             ),
             timeout=timeout,
         )

@@ -175,6 +175,13 @@ def _prune_worktrees_handler(args: argparse.Namespace) -> int:
     return prune_worktrees_handler(args)
 
 
+def _recover_branch_handler(args: argparse.Namespace) -> int:
+    # Lazy import for the same reason as the other handlers.
+    from gitbulk.commands.recover_branch import recover_branch_handler
+
+    return recover_branch_handler(args)
+
+
 def _show_handler(args: argparse.Namespace) -> int:
     # Lazy import for the same reason as the other handlers — keeps the
     # locks / paths / runstate-reading machinery out of the --help path.
@@ -301,6 +308,7 @@ _SPECIAL_HANDLERS = {
     "rebase-pr": _rebase_pr_handler,
     "prune-branches": _prune_branches_handler,
     "prune-worktrees": _prune_worktrees_handler,
+    "recover-branch": _recover_branch_handler,
     "show": _show_handler,
 }
 
@@ -425,6 +433,43 @@ def _add_show_args(sp: argparse.ArgumentParser) -> None:
         action="store_true",
         default=False,
         help="Print the run directory path itself (handy for scripting).",
+    )
+
+
+def _add_recover_branch_args(sp: argparse.ArgumentParser) -> None:
+    """Argparse flags for ``recover-branch``. Scope is positional: a bare
+    invocation recovers every branch the latest prune-branches run deleted;
+    an optional ``slug`` (then ``branch``) narrows it. ``--apply`` is the
+    mutating opt-in; ``--run`` selects a non-latest source run.
+    """
+    sp.add_argument(
+        "slug",
+        metavar="SLUG",
+        nargs="?",
+        default=None,
+        help="Restore only this repo's deleted branches (e.g. owner/repo). "
+        "Omit to restore every repo in the run.",
+    )
+    sp.add_argument(
+        "branch",
+        metavar="BRANCH",
+        nargs="?",
+        default=None,
+        help="Restore only this branch (requires SLUG).",
+    )
+    sp.add_argument(
+        "--run",
+        metavar="RUNID",
+        default=None,
+        help="Read deletions from this prune-branches run id instead of the "
+        "latest (see `gitbulk show prune-branches --path`).",
+    )
+    sp.add_argument(
+        "--apply",
+        action="store_true",
+        default=False,
+        help="Actually re-create the branch refs. Without it, recover-branch "
+        "only lists what it would restore (dry-run).",
     )
 
 
@@ -1006,6 +1051,8 @@ def build_parser() -> argparse.ArgumentParser:
             _add_prune_branches_args(sp)
         elif sc.name == "prune-worktrees":
             _add_prune_worktrees_args(sp)
+        elif sc.name == "recover-branch":
+            _add_recover_branch_args(sp)
         elif sc.name == "show":
             _add_show_args(sp)
         # Fleet-subset filters apply to every PR-fetching subcommand.

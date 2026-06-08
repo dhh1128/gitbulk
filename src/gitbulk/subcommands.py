@@ -219,6 +219,13 @@ KNOWN: tuple[Subcommand, ...] = (
         sets_attention=True,
     ),
     Subcommand(
+        name="recover-branch",
+        help="Restore a branch that prune-branches deleted, from its audit log.",
+        mutating=True,
+        needs_clone=False,
+        invariant_chain=(),
+    ),
+    Subcommand(
         name="show",
         help="Show the latest run of a given subcommand.",
         mutating=False,

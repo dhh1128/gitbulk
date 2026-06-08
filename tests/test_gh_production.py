@@ -2271,3 +2271,32 @@ def test_delete_branch_ref_propagates_gherror():
     with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
         with pytest.raises(GHError):
             ProductionGHClient().delete_branch_ref("o/r", "gone")
+
+
+def test_create_branch_ref_argv():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=""))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        ProductionGHClient().create_branch_ref("o/r", "feat/x", "deadbeef")
+    args, kwargs = mock_run.call_args
+    argv = args[0]
+    assert argv[1:] == [
+        "api",
+        "-X",
+        "POST",
+        "repos/o/r/git/refs",
+        "-f",
+        "ref=refs/heads/feat/x",
+        "-f",
+        "sha=deadbeef",
+    ]
+
+
+def test_create_branch_ref_propagates_gherror():
+    # A 422 "Reference already exists" must surface, not be swallowed — the
+    # caller pre-checks existence, so a POST failure is a real error.
+    side_effect = _make_run_mock(
+        _CompletedFake(1, stderr="422 Reference already exists")
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        with pytest.raises(GHError):
+            ProductionGHClient().create_branch_ref("o/r", "dup", "deadbeef")

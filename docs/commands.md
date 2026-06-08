@@ -16,6 +16,7 @@ act on.
 | [`close-stale`](#close-stale) | Warn, then close, PRs inactive past the configured threshold. | Yes (`--apply`) |
 | [`prune-branches`](#prune-branches) | Delete remote branches whose only PRs are merged/closed, with guardrails. | Yes (`--apply`) |
 | [`prune-worktrees`](#prune-worktrees) | Remove local linked worktrees whose branch's only PRs are merged/closed, then delete the merged local branch. | Yes (`--apply`) |
+| [`recover-branch`](#recover-branch) | Restore a branch that `prune-branches` deleted, from that run's audit log. | Yes (`--apply`) |
 | [`show`](#show) | Print the latest run's artifacts for any subcommand, or the dashboard. | No |
 | [`ack`](#ack) | Clear the `ATTENTION` sentinel after you've reviewed it. | No |
 | [`invariants`](#invariants) | List the invariant registry and which subcommands use each. | No |
@@ -175,6 +176,29 @@ period and the no-data-loss rule:
 
 A clean `--apply` run is quiet (no `ATTENTION`); only failures and skipped
 repos surface. Both accept the `--org`/`--repo`/`--filter` fleet filters.
+
+### `recover-branch`
+
+Restores a branch that `prune-branches --apply` deleted. It reads the deleting
+run's audit trail — every deleted branch leaves a row in that run's
+`state.yaml` carrying the tip SHA recorded just before deletion — and
+re-creates the ref through the GitHub ref API. Recovery is reliable because
+`prune-branches` only ever deletes a branch whose tip is either a merged PR's
+head (pinned forever by `refs/pull/N/head`) or already contained in the default
+branch, so the recorded SHA is never garbage-collected.
+
+Scope is positional, on the one command:
+
+- `gitbulk recover-branch` — restore **every** branch the latest
+  `prune-branches` run deleted.
+- `gitbulk recover-branch owner/repo` — restore only that repo's deletions.
+- `gitbulk recover-branch owner/repo my-branch` — restore one branch.
+- `--run <runid>` reads a specific prune-branches run instead of the latest
+  (find ids with `gitbulk show prune-branches --path`).
+
+Like the other mutating commands it **defaults to dry-run**; pass `--apply` to
+actually create the refs. A branch that already exists is reported and left
+untouched (never overwritten, even at a different SHA), so re-running is safe.
 
 ## Next steps
 

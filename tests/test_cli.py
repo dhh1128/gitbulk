@@ -40,6 +40,7 @@ _IMPLEMENTED_SUBCOMMANDS = {
     "rebase-pr",
     "prune-branches",
     "prune-worktrees",
+    "recover-branch",
     "show",
 }
 _STUB_SUBCOMMANDS = [n for n, _ in SUBCOMMANDS if n not in _IMPLEMENTED_SUBCOMMANDS]
