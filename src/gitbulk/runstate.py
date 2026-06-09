@@ -69,6 +69,13 @@ class RunState:
         self._subcommand = subcommand
         self._per_repo: dict[str, dict[str, Any]] = {}
         self._extras: dict[str, Any] = {}
+        # state.yaml is written lazily: record_repo_state/set_repos/
+        # record_extra accumulate in memory and only mark the snapshot dirty;
+        # the single on-disk write happens in flush_state() (called from
+        # complete(), or explicitly at a phase boundary). This turns N
+        # per-repo updates from O(n^2) full-file rewrites into one O(n) write
+        # at 150-205 repo scale (node 7gpd / PERF-F1, this.i kp7nw4mq.c).
+        self._state_dirty = False
 
     @classmethod
     def begin(
@@ -151,6 +158,23 @@ class RunState:
         manifest["actor"] = login
         _atomic_write_text(manifest_path, yaml.safe_dump(manifest, sort_keys=False))
 
+    def record_timings(self, timings: dict[str, float]) -> None:
+        """Stamp per-phase wall-clock durations (seconds) into manifest.yaml.
+
+        Recorded once near the end of a run from a
+        :class:`gitbulk.util.timing.PhaseTimer` (node 5agg / PERF-F3) so
+        cross-run pipeline cost can be tracked and an O(n^2) regression
+        (node 7gpd) caught against a baseline. Read-modify-write of the
+        manifest, mirroring :meth:`record_actor`; must run before
+        :meth:`complete` so its rewrite preserves the block. Values are
+        rounded to milliseconds for legibility.
+        """
+        manifest_path = self._run_dir / "manifest.yaml"
+        with manifest_path.open() as f:
+            manifest = yaml.safe_load(f)
+        manifest["timings"] = {k: round(float(v), 3) for k, v in timings.items()}
+        _atomic_write_text(manifest_path, yaml.safe_dump(manifest, sort_keys=False))
+
     def record_invariant(
         self,
         name: str,
@@ -190,8 +214,13 @@ class RunState:
         _append_jsonl(self._run_dir / "errors.log", event)
 
     def record_repo_state(self, slug: str, payload: dict[str, Any]) -> None:
-        self._per_repo[slug] = payload
-        self._rewrite_state()
+        # Deep-copy so a later caller mutation of ``payload`` can't reach the
+        # deferred flush — preserving snapshot-at-call-time semantics now that
+        # the write no longer happens immediately (matches set_repos; node
+        # 7gpd review). O(payload), not O(n^2), so the write-amplification fix
+        # stands.
+        self._per_repo[slug] = copy.deepcopy(payload)
+        self._state_dirty = True
 
     def set_repos(self, repos: dict[str, dict[str, Any]]) -> None:
         """Replace the entire per-repo map in a single state.yaml write.
@@ -200,10 +229,10 @@ class RunState:
         records a whole carried-forward plan (node ``prnpl3kq``) would
         otherwise rewrite the growing state file once per repo — O(n²).
         ``record_extra`` values are preserved. The input is deep-copied so a
-        later caller mutation can't reach the persisted state (a subsequent
-        ``record_extra`` re-dumps ``_per_repo``)."""
+        later caller mutation can't reach the persisted state (the deferred
+        flush re-dumps ``_per_repo``)."""
         self._per_repo = copy.deepcopy(repos)
-        self._rewrite_state()
+        self._state_dirty = True
 
     def record_extra(self, key: str, value: Any) -> None:
         """Add or replace a top-level key in state.yaml besides ``repos``.
@@ -216,10 +245,26 @@ class RunState:
         """
         if key in {"schema_version", "repos"}:
             raise ValueError(f"reserved state.yaml key: {key!r}")
-        self._extras[key] = value
-        self._rewrite_state()
+        # Deep-copy for the same snapshot-at-call-time reason as
+        # record_repo_state/set_repos (node 7gpd review): the deferred flush
+        # must serialize the value as it was when recorded, not a later mutation.
+        self._extras[key] = copy.deepcopy(value)
+        self._state_dirty = True
 
-    def _rewrite_state(self) -> None:
+    def flush_state(self) -> None:
+        """Write the accumulated per-repo + extra snapshot to state.yaml.
+
+        The single durability point for the in-memory state mutated by
+        :meth:`record_repo_state`, :meth:`set_repos`, and
+        :meth:`record_extra`. A no-op when nothing changed since the last
+        flush, so calling it at a phase boundary AND from :meth:`complete`
+        costs at most one extra write. ``begin()`` already wrote an initial
+        ``{schema_version, repos: {}}`` so a crash before the first flush still
+        leaves a parseable file; the audit of mutating actions themselves is appended
+        live to errors.log/invariants.log, not state.yaml (node 7gpd /
+        PERF-F1, this.i kp7nw4mq.c)."""
+        if not self._state_dirty:
+            return
         full_state: dict[str, Any] = {
             "schema_version": SCHEMA_VERSION,
             "repos": dict(self._per_repo),
@@ -229,6 +274,7 @@ class RunState:
             self._run_dir / "state.yaml",
             yaml.safe_dump(full_state, sort_keys=False),
         )
+        self._state_dirty = False
 
     def write_summary(self, markdown: str) -> None:
         _atomic_write_text(self._run_dir / "summary.md", markdown)
@@ -243,6 +289,12 @@ class RunState:
         jw3kpn4q, callers in Phase 2+ pass the value from
         ``policy.defaults.retain_runs``.
         """
+        # Flush any pending per-repo/extra state to disk before finalizing so
+        # the completed run's state.yaml reflects everything recorded (node
+        # 7gpd). Mutating-action audit lives in errors.log/invariants.log
+        # (appended live); this is the per-repo summary snapshot.
+        self.flush_state()
+
         manifest_path = self._run_dir / "manifest.yaml"
         with manifest_path.open() as f:
             manifest = yaml.safe_load(f)

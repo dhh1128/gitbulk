@@ -60,6 +60,7 @@ from gitbulk.commands._common import (
 from gitbulk.invariants import (
     InvariantContext,
     run_chain,
+    seed_org_members,
 )
 from gitbulk.locks import LockTimeoutError, run_state_lock, sentinel_lock
 from gitbulk.org_members_cache import (
@@ -70,6 +71,7 @@ from gitbulk.pr_info import CheckRun, PRInfo
 from gitbulk.runstate import RunState
 from gitbulk.util.progress import Progress
 from gitbulk.util.style import error_line, summary_line
+from gitbulk.util.timing import PhaseTimer
 from gitbulk.watchdog_ack import load_acked, record_ack
 from gitbulk import subcommands as subcommands_mod
 
@@ -519,6 +521,11 @@ def _run_under_lock(
         argv=list(sys.argv),
         config_snapshot=config_snapshot,
     )
+    # Per-phase wall-clock baseline (node 5agg / PERF-F3): mark() at each
+    # phase boundary, then stamp into the manifest on the success path so a
+    # regression (e.g. node 7gpd's O(n^2) write-amplification) is visible
+    # across runs. Failure paths return before record_timings, by design.
+    timer = PhaseTimer()
 
     # Build gh client + base context.
     gh = ProductionGHClient()
@@ -551,6 +558,10 @@ def _run_under_lock(
             attention_count=0,
             skipped_entries=skipped_entries,
         )
+
+    # Resolve org-members once now that the cache is fresh; carried through
+    # every per-PR context so pr.author_known reads it from memory (node 37ic).
+    ctx_base = seed_org_members(ctx_base)
 
     # 5/6/8. Partition the report chain.
     report_sub = subcommands_mod.by_name("report")
@@ -588,6 +599,8 @@ def _run_under_lock(
             attention_count=0,
             skipped_entries=skipped_entries,
         )
+
+    timer.mark("preflight")
 
     # 6. PER_REPO preflight. Each repo gets its own context.
     #
@@ -655,6 +668,7 @@ def _run_under_lock(
         else:
             passing_repos.append(repo)
     progress.done()
+    timer.mark("per_repo")
 
     # 7. Coalesced PR fetch. One GraphQL call regardless of repo count,
     # but it can take a few seconds for a fleet — print a status line
@@ -752,6 +766,8 @@ def _run_under_lock(
             {"pr_count": len(repo_prs), "prs": pr_records},
         )
 
+    timer.mark("per_pr")
+
     # 8b. Post-merge watchdog: scan recent merge runs for CD failures
     # on the resulting merge commits. Surfaces them in the summary and
     # forces ATTENTION if any are red.
@@ -805,6 +821,10 @@ def _run_under_lock(
     )
     if fline:
         summary_text = f"{summary_text}; {fline}"
+    # Stamp per-phase timings into the manifest before complete() rewrites it
+    # (node 5agg). Only the success path reaches here; structural-failure
+    # branches return early without timings, which is the intended behavior.
+    rs.record_timings(timer.timings)
     return _finish(
         rs,
         exit_code,

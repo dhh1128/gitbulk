@@ -54,6 +54,8 @@ from gitbulk.invariants.catalog import (
     PrNoUnresolvedThreadsInvariant,
     PrRequiredChecksGreenInvariant,
     _extract_slug_from_remote_url,
+    _load_org_members,
+    seed_org_members,
 )
 from gitbulk.pr_info import PRInfo
 from gitbulk.org_members_cache import CachedMembers, save_cache
@@ -823,6 +825,87 @@ def test_pr_author_known_fail_when_classifier_returns_unknown(
     assert isinstance(result, Fail)
     assert "UNKNOWN" in result.reason
     assert "ghost" in result.reason
+
+
+# ─── org-members memoization (node 37ic / PERF-F2) ──────────────────────────
+
+
+def test_pr_author_known_uses_seeded_members_without_cache_read(
+    monkeypatch, runstate, isolated_cache
+):
+    """When the context is seeded, the per-PR check reads the carried
+    frozenset and never touches the cache file (the whole point of 37ic)."""
+    monkeypatch.setattr(
+        catalog,
+        "load_cache",
+        lambda org: (_ for _ in ()).throw(
+            AssertionError("load_cache must not be called on a seeded context")
+        ),
+    )
+    policy = Policy(humans=HumansConfig(org="provenant-dev"))
+    ctx = InvariantContext(
+        policy=policy,
+        runstate=runstate,
+        pr=_pr(author="dhh1128"),
+        org_members=frozenset({"dhh1128"}),
+        org_members_seeded=True,
+    )
+    assert PrAuthorKnownInvariant().check(ctx) == Pass()
+
+
+def test_pr_author_known_unseeded_falls_back_to_cache_read(
+    runstate, isolated_cache
+):
+    """An un-seeded (e.g. directly constructed) context still resolves the
+    members by reading the cache, preserving the old behavior."""
+    _save_fresh_cache("provenant-dev", ["dhh1128"])
+    policy = Policy(humans=HumansConfig(org="provenant-dev"))
+    ctx = _ctx(runstate, policy=policy, pr=_pr(author="dhh1128"))
+    assert ctx.org_members_seeded is False
+    assert PrAuthorKnownInvariant().check(ctx) == Pass()
+
+
+def test_load_org_members_returns_none_without_org(isolated_cache):
+    assert _load_org_members(Policy(humans=HumansConfig(org=None))) is None
+
+
+def test_load_org_members_returns_none_when_cache_missing(isolated_cache):
+    policy = Policy(humans=HumansConfig(org="provenant-dev"))
+    assert _load_org_members(policy) is None
+
+
+def test_load_org_members_returns_frozenset_from_cache(isolated_cache):
+    _save_fresh_cache("provenant-dev", ["dhh1128", "alice"])
+    policy = Policy(humans=HumansConfig(org="provenant-dev"))
+    assert _load_org_members(policy) == frozenset({"dhh1128", "alice"})
+
+
+def test_seed_org_members_resolves_once_and_propagates_via_replace(
+    runstate, isolated_cache
+):
+    """seed_org_members loads the set once; the value survives the
+    replace() chain used to build per-repo/per-PR contexts."""
+    from dataclasses import replace as dc_replace
+
+    _save_fresh_cache("provenant-dev", ["dhh1128"])
+    policy = Policy(humans=HumansConfig(org="provenant-dev"))
+    base = InvariantContext(policy=policy, runstate=runstate)
+    seeded = seed_org_members(base)
+    assert seeded.org_members_seeded is True
+    assert seeded.org_members == frozenset({"dhh1128"})
+    # Derived per-PR context carries the seeded set unchanged.
+    derived = dc_replace(seeded, pr=_pr(author="dhh1128"))
+    assert derived.org_members == frozenset({"dhh1128"})
+    assert derived.org_members_seeded is True
+
+
+def test_seed_org_members_seeds_none_when_no_org(runstate, isolated_cache):
+    base = InvariantContext(
+        policy=Policy(humans=HumansConfig(org=None)), runstate=runstate
+    )
+    seeded = seed_org_members(base)
+    assert seeded.org_members is None
+    assert seeded.org_members_seeded is True
 
 
 # ─── Phase 5 merge-only invariants ────────────────────────────────────────

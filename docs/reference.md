@@ -15,7 +15,7 @@ Every subcommand writes a per-run directory under
 | `state.yaml` | Structured records (e.g. PR state). |
 | `invariants.log` | JSONL audit trail of every invariant evaluated. |
 | `errors.log` | JSONL error records. |
-| `manifest.yaml` | The `argv`, a config snapshot, and the acting GitHub identity (`actor`) for the run. |
+| `manifest.yaml` | The `argv`, a config snapshot, the acting GitHub identity (`actor`), and per-phase wall-clock `timings` for the run. |
 
 A `latest-<subcommand>` symlink points at the newest run of each subcommand,
 and `dashboard.md` aggregates one excerpt per subcommand.

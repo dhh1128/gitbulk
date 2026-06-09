@@ -261,6 +261,31 @@ def test_report_no_prs_exit_ok(
     assert "no open prs" in summary.lower()
 
 
+def test_report_success_records_phase_timings_in_manifest(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    """A successful report stamps the three pipeline phase durations into
+    manifest.yaml (node 5agg / PERF-F3)."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+    )
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    rc = report_handler(_make_args(code_root=code_root))
+    assert rc == EXIT_OK
+    latest = paths.latest_run_symlink("report").resolve()
+    manifest = yaml.safe_load((latest / "manifest.yaml").read_text())
+    assert set(manifest["timings"]) == {"preflight", "per_repo", "per_pr"}
+    assert all(isinstance(v, float) and v >= 0.0 for v in manifest["timings"].values())
+
+
 # ─── github.reachable Skip → exit 3 ────────────────────────────────────────
 
 

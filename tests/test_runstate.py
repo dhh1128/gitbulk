@@ -186,6 +186,7 @@ def test_record_error_without_context_uses_empty_dict(isolated_cache):
 def test_record_repo_state_writes_state_yaml(isolated_cache):
     rs = RunState.begin("merge", [], {})
     rs.record_repo_state("owner/repo", {"prs_seen": 3, "merged": 1})
+    rs.flush_state()
     state = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
     assert state == {
         "schema_version": SCHEMA_VERSION,
@@ -198,6 +199,7 @@ def test_record_repo_state_preserves_earlier_repos(isolated_cache):
     rs.record_repo_state("owner1/repo1", {"x": 1})
     rs.record_repo_state("owner2/repo2", {"y": 2})
     rs.record_repo_state("owner1/repo1", {"x": 99})  # update repo1
+    rs.flush_state()
     state = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
     assert state == {
         "schema_version": SCHEMA_VERSION,
@@ -211,8 +213,78 @@ def test_record_repo_state_preserves_earlier_repos(isolated_cache):
 def test_record_repo_state_leaves_no_tmp_file(isolated_cache):
     rs = RunState.begin("merge", [], {})
     rs.record_repo_state("owner/repo", {"x": 1})
+    rs.flush_state()
     # No state.yaml.tmp should remain
     assert not (rs.run_dir / "state.yaml.tmp").exists()
+
+
+# ─── deferred write semantics (node 7gpd / PERF-F1) ─────────────────────────
+
+
+def test_record_repo_state_defers_write_until_flush(isolated_cache):
+    """record_repo_state accumulates in memory; state.yaml stays at the
+    begin()-time empty snapshot until flush_state() (O(n^2) → O(n) fix)."""
+    rs = RunState.begin("merge", [], {})
+    rs.record_repo_state("owner/repo", {"x": 1})
+    # Not yet written — still the initial empty state from begin().
+    on_disk = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
+    assert on_disk == {"schema_version": SCHEMA_VERSION, "repos": {}}
+    rs.flush_state()
+    flushed = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
+    assert flushed["repos"] == {"owner/repo": {"x": 1}}
+
+
+def test_record_repo_state_deep_copies_payload(isolated_cache):
+    """A caller mutating the payload after record_repo_state must not change
+    the eventually-flushed snapshot (node 7gpd review — matches set_repos)."""
+    rs = RunState.begin("merge", [], {})
+    payload = {"prs": [1], "merged": 0}
+    rs.record_repo_state("o/r", payload)
+    payload["prs"].append(2)  # mutate nested list after recording
+    payload["merged"] = 99
+    rs.flush_state()
+    state = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
+    assert state["repos"]["o/r"] == {"prs": [1], "merged": 0}
+
+
+def test_record_extra_deep_copies_value(isolated_cache):
+    """A caller mutating the value after record_extra must not change the
+    eventually-flushed snapshot."""
+    rs = RunState.begin("report", [], {})
+    value = [{"slug": "a/b"}]
+    rs.record_extra("recent_merges", value)
+    value.append({"slug": "c/d"})  # mutate after recording
+    value[0]["slug"] = "mutated"
+    rs.flush_state()
+    doc = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
+    assert doc["recent_merges"] == [{"slug": "a/b"}]
+
+
+def test_flush_state_is_noop_when_not_dirty(isolated_cache):
+    """flush_state() with nothing pending does not rewrite state.yaml."""
+    rs = RunState.begin("merge", [], {})
+    before = (rs.run_dir / "state.yaml").read_text()
+    rs.flush_state()  # nothing recorded → no-op
+    assert (rs.run_dir / "state.yaml").read_text() == before
+
+
+def test_flush_state_second_call_after_flush_is_noop(isolated_cache):
+    """A flush clears the dirty flag; a redundant flush writes nothing new."""
+    rs = RunState.begin("merge", [], {})
+    rs.record_repo_state("o/r", {"x": 1})
+    rs.flush_state()
+    snapshot = (rs.run_dir / "state.yaml").read_text()
+    rs.flush_state()  # not dirty anymore
+    assert (rs.run_dir / "state.yaml").read_text() == snapshot
+
+
+def test_complete_flushes_pending_state(isolated_cache):
+    """complete() flushes accumulated state even with no explicit flush."""
+    rs = RunState.begin("merge", [], {})
+    rs.record_repo_state("owner/repo", {"merged": 1})
+    rs.complete(0)
+    state = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
+    assert state["repos"] == {"owner/repo": {"merged": 1}}
 
 
 # ─── set_repos() ───────────────────────────────────────────────────────────
@@ -222,6 +294,7 @@ def test_set_repos_replaces_whole_map_in_one_write(isolated_cache):
     rs = RunState.begin("prune-branches", [], {})
     rs.record_repo_state("owner/old", {"x": 1})
     rs.set_repos({"owner/a": {"v": 1}, "owner/b": {"v": 2}})
+    rs.flush_state()
     state = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
     # The earlier "owner/old" is gone — set_repos REPLACES, not merges.
     assert state["repos"] == {"owner/a": {"v": 1}, "owner/b": {"v": 2}}
@@ -231,6 +304,7 @@ def test_set_repos_preserves_extras(isolated_cache):
     rs = RunState.begin("prune-branches", [], {})
     rs.record_extra("prune_plan", {"scope_slugs": ["o/a"]})
     rs.set_repos({"o/a": {"v": 1}})
+    rs.flush_state()
     state = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
     assert state["prune_plan"] == {"scope_slugs": ["o/a"]}
     assert state["repos"] == {"o/a": {"v": 1}}
@@ -241,7 +315,8 @@ def test_set_repos_deep_copies_input(isolated_cache):
     payload = {"o/a": {"branches": [1]}}
     rs.set_repos(payload)
     payload["o/a"]["branches"].append(2)  # mutate caller's nested list
-    rs.record_extra("k", "v")  # forces a re-dump of _per_repo
+    rs.record_extra("k", "v")  # another mutation, still buffered
+    rs.flush_state()  # single deferred re-dump of _per_repo
     state = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
     # Deep copy means the caller's later mutation never reached the re-dump.
     assert state["repos"]["o/a"]["branches"] == [1]
@@ -254,6 +329,7 @@ def test_record_extra_writes_top_level_key(isolated_cache):
     """record_extra adds a top-level key alongside repos/schema_version."""
     rs = RunState.begin("report", [], {})
     rs.record_extra("recent_merges", [{"slug": "a/b", "sha": "x"}])
+    rs.flush_state()
     doc = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
     assert doc["recent_merges"] == [{"slug": "a/b", "sha": "x"}]
     # repos and schema_version still present.
@@ -265,6 +341,7 @@ def test_record_extra_overwrites_on_repeat(isolated_cache):
     rs = RunState.begin("report", [], {})
     rs.record_extra("recent_merges", [{"slug": "a/b"}])
     rs.record_extra("recent_merges", [{"slug": "c/d"}])
+    rs.flush_state()
     doc = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
     assert doc["recent_merges"] == [{"slug": "c/d"}]
 
@@ -276,6 +353,7 @@ def test_record_extra_coexists_with_record_repo_state(isolated_cache):
     rs.record_repo_state("a/b", {"prs": []})
     rs.record_extra("recent_merges", [])
     rs.record_repo_state("c/d", {"prs": []})
+    rs.flush_state()
     doc = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
     assert set(doc["repos"].keys()) == {"a/b", "c/d"}
     assert doc["recent_merges"] == []
@@ -340,6 +418,39 @@ def test_record_actor_survives_complete(isolated_cache):
     manifest = yaml.safe_load((rs.run_dir / "manifest.yaml").read_text())
     assert manifest["actor"] == "dhh1128"
     assert manifest["exit_code"] == 0
+
+
+# ─── record_timings() (node 5agg / PERF-F3) ─────────────────────────────────
+
+
+def test_record_timings_stamps_rounded_block_into_manifest(isolated_cache):
+    rs = RunState.begin("report", [], {})
+    rs.record_timings({"preflight": 0.42119, "per_repo": 3.1, "per_pr": 1.875})
+    manifest = yaml.safe_load((rs.run_dir / "manifest.yaml").read_text())
+    # Rounded to milliseconds for legibility.
+    assert manifest["timings"] == {
+        "preflight": 0.421,
+        "per_repo": 3.1,
+        "per_pr": 1.875,
+    }
+
+
+def test_record_timings_survives_complete(isolated_cache):
+    """complete() does its own manifest read-modify-write; timings stamped
+    earlier must not be lost."""
+    rs = RunState.begin("report", [], {})
+    rs.record_timings({"preflight": 1.0})
+    rs.complete(0)
+    manifest = yaml.safe_load((rs.run_dir / "manifest.yaml").read_text())
+    assert manifest["timings"] == {"preflight": 1.0}
+    assert manifest["exit_code"] == 0
+
+
+def test_record_timings_empty_mapping_writes_empty_block(isolated_cache):
+    rs = RunState.begin("report", [], {})
+    rs.record_timings({})
+    manifest = yaml.safe_load((rs.run_dir / "manifest.yaml").read_text())
+    assert manifest["timings"] == {}
 
 
 # ─── complete() ────────────────────────────────────────────────────────────

@@ -1634,6 +1634,10 @@ Gitbulk Triage Tool = goal:
             rs.record_invariant(name, target, result, reason)
             rs.record_error(message, *, level, context)
             rs.record_repo_state(slug, payload)
+            rs.set_repos(repos)
+            rs.record_extra(key, value)
+            rs.flush_state()           # node 7gpd: deferred state.yaml write
+            rs.record_timings(mapping) # node 5agg: per-phase wall-clock
             rs.write_summary(markdown)
             rs.complete(exit_code)
             rs.run_dir (property)
@@ -1658,10 +1662,30 @@ Gitbulk Triage Tool = goal:
         primary consumer is tooling, not eyeballing.
 
         (c) state.yaml is rewritten atomically (write to .tmp,
-        rename over) on every record_repo_state call. Crash safety:
-        if the process dies mid-run, the most recent successful
-        per-repo write is durable on disk. Append-style YAML would
-        be smaller but harder to validate after a partial write.
+        rename over). Crash safety: begin() writes an empty
+        {repos:{}} immediately, and the file is rewritten in full at
+        finalization, so a crashed run still leaves a parseable file.
+        Append-style YAML would be smaller but harder to validate
+        after a partial write.
+        UPDATE (7gpd / PERF-F1, 2026-06-08): the original design
+        rewrote the WHOLE state dict on EVERY record_repo_state /
+        record_extra / set_repos call. At 150-205 repos that is N
+        full-file dumps of a growing dict — O(n^2) work plus N
+        fsync-class writes per run. record_repo_state/record_extra/
+        set_repos now only accumulate in memory and mark the snapshot
+        dirty; the single on-disk write happens in flush_state()
+        (called from complete(), or explicitly at a phase boundary by
+        a caller that wants an intermediate checkpoint). This is O(n).
+        Tension with the original per-call durability: RESOLVED by
+        observing that the mutating-action audit (merges, force-pushes,
+        branch deletions) is appended LIVE to errors.log/invariants.log,
+        not state.yaml — state.yaml is only the post-action per-repo
+        summary, which today's callers already write in a tight loop
+        immediately before complete(). Deferring that summary's write to
+        a single flush therefore trades negligible crash-resilience
+        (the begin() empty write keeps the file parseable; a crash
+        mid-run loses only the in-memory summary, recoverable from the
+        live logs) for eliminating the O(n^2) amplification.
 
         (d) manifest.yaml is rewritten on complete() to add
         completed_at and exit_code. A missing completed_at field

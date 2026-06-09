@@ -60,7 +60,7 @@ from gitbulk.commands._common import (
     partition_chain,
     read_repos_text,
 )
-from gitbulk.invariants import InvariantContext, run_chain
+from gitbulk.invariants import InvariantContext, run_chain, seed_org_members
 from gitbulk.locks import (
     LockTimeoutError,
     repo_lock,
@@ -335,6 +335,10 @@ def _run_under_lock(
             apply=bool(args.apply),
             skipped_entries=skipped_entries,
         )
+
+    # Resolve org-members once now that the cache is fresh; carried through
+    # every per-PR context so pr.author_known reads it from memory (node 37ic).
+    ctx_base = seed_org_members(ctx_base)
 
     sub = subcommands_mod.by_name("rebase-pr")
     universal, per_repo, per_pr = partition_chain(sub.invariant_chain)
