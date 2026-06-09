@@ -719,6 +719,10 @@ def _run_under_lock(
     fetch_prog = Progress(
         len(passing_repos), prefix="fetching open PRs: "
     )
+    # Render 0/N up front: the first on_progress fires only AFTER the first
+    # chunk's multi-second search, so without this the bar would still be blank
+    # for the initial chunk — the very gap this is meant to close (node 6bm7).
+    fetch_prog.update(0)
     try:
         open_heads_by_slug = gh.open_pr_heads(
             [r.slug for r in passing_repos],
@@ -736,17 +740,20 @@ def _run_under_lock(
             level="ERROR",
             context={"error": str(e), "gh_command": gh_command},
         )
-        # Echo where the raw logs live and a transient-error hint alongside the
-        # terse message, so diagnosis doesn't require a guess about HTTP 5xx.
-        detail = (
-            f"open-PR fetch failed: {e}\n"
-            "  HTTP 5xx here is a transient/overloaded GitHub PR search; "
-            "retrying shortly usually clears it.\n"
-            f"  full run logs: {rs.run_dir}\n"
-            "  failing gh call: gitbulk show prune-worktrees --errors"
+        # Echo the transient-5xx hint + where the raw logs live to STDERR, so
+        # the one-line stdout summary contract is preserved (node 6bm7 review)
+        # while diagnosis still doesn't require a guess about HTTP 5xx.
+        print(
+            error_line(
+                "  HTTP 5xx here is a transient/overloaded GitHub PR search; "
+                "retrying shortly usually clears it.\n"
+                f"  full run logs: {rs.run_dir}\n"
+                "  failing gh call: gitbulk show prune-worktrees --errors"
+            ),
+            file=sys.stderr,
         )
         return _finish(
-            rs, EXIT_STRUCTURAL_FAILURE, summary=detail,
+            rs, EXIT_STRUCTURAL_FAILURE, summary=f"open-PR fetch failed: {e}",
             policy=policy, attention=False, all_repos=repos,
             passing_repos=passing_repos, skipped_repos=skipped_repos,
             results=[], apply=bool(args.apply),

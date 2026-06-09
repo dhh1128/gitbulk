@@ -1649,6 +1649,13 @@ class ProductionGHClient:
         )
         # slug_list is never None here (slugs is required), but guard anyway.
         heads: dict[str, set[str]] = {s: set() for s in (slug_list or [])}
+        # GitHub returns repository.nameWithOwner in canonical casing, which can
+        # differ from the requested slug's casing (slugs are case-insensitive,
+        # and repo.slug comes from the clone's remote URL). Map results back to
+        # the requested slug so a case mismatch can't strand a repo's heads
+        # under a different key — which would let prune-worktrees treat an
+        # open-PR branch as unpinned and remove it (node 6bm7 review).
+        requested_by_lower = {s.lower(): s for s in (slug_list or [])}
         for node in nodes:
             if not node:
                 continue
@@ -1656,7 +1663,8 @@ class ProductionGHClient:
             slug = repo.get("nameWithOwner")
             head = node.get("headRefName")
             if slug and head:
-                heads.setdefault(slug, set()).add(head)
+                key = requested_by_lower.get(slug.lower(), slug)
+                heads.setdefault(key, set()).add(head)
         return heads
 
 

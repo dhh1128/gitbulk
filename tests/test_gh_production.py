@@ -623,6 +623,30 @@ def test_open_pr_heads_groups_head_refs_by_repo():
     assert result["quiet/repo"] == set()
 
 
+def test_open_pr_heads_maps_canonical_casing_back_to_requested_slug():
+    """GitHub returns nameWithOwner in canonical casing; if it differs from the
+    requested slug's casing, the heads must still land under the REQUESTED slug
+    — otherwise prune-worktrees would treat an open-PR branch as unpinned and
+    could remove it (node 6bm7 review)."""
+    payload = {
+        "data": {
+            "search": {
+                "nodes": [
+                    # canonical casing differs from the requested "Owner/Repo"
+                    {"headRefName": "feat", "repository": {"nameWithOwner": "owner/repo"}},
+                ]
+            }
+        }
+    }
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        result = client.open_pr_heads(["Owner/Repo"])
+
+    # Head lands under the requested casing, not the canonical one.
+    assert result == {"Owner/Repo": {"feat"}}
+
+
 def test_open_pr_heads_skips_null_and_incomplete_nodes():
     payload = {
         "data": {
