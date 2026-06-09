@@ -162,6 +162,7 @@ class GHClient(Protocol):
         *,
         author: str | None = "@me",
         timeout: float | None = None,
+        on_progress: "Callable[[int, int], None] | None" = None,
     ) -> dict[str, list[PRInfo]]:
         """Return open PRs grouped by repo slug.
 
@@ -177,6 +178,35 @@ class GHClient(Protocol):
 
         Chunks/paginates internally (per ``ghclmp7n.c`` + the pagination
         fix) regardless of how many slugs are passed.
+
+        ``on_progress`` (if given) is called after each repo-chunk's
+        search completes with ``(repos_completed, repos_total)`` so callers
+        can render a progress indicator — for a large fleet this fetch is
+        several sequential multi-second GraphQL searches and otherwise
+        looks like a hang (node 6bm7). Mirrors
+        :meth:`prefetch_default_branches`.
+        """
+        ...
+
+    def open_pr_heads(
+        self,
+        slugs: Iterable[str],
+        *,
+        timeout: float | None = None,
+        on_progress: "Callable[[int, int], None] | None" = None,
+    ) -> dict[str, set[str]]:
+        """Return the set of open-PR head branch names per repo slug.
+
+        A lean cousin of :meth:`my_open_prs` for callers — notably
+        ``prune-worktrees`` — that only need to know *which branches are
+        pinned by an open PR*, not the full PR metadata. It searches with
+        no ``author:`` qualifier (ANY author's open PR pins a branch) and
+        selects only ``headRefName``, so each chunked query is far cheaper
+        and much less likely to provoke an HTTP 502 on the search backend
+        (node 6bm7). Every requested slug appears in the result, mapping to
+        an empty set when it has no open PRs.
+
+        ``on_progress`` behaves as in :meth:`my_open_prs` (fired per chunk).
         """
         ...
 
@@ -561,6 +591,7 @@ class FakeGHClient:
             "org_members": 0,
             "default_branch": 0,
             "my_open_prs": 0,
+            "open_pr_heads": 0,
             "merge_pr": 0,
             "fetch_pr_comments": 0,
             "post_comment": 0,
@@ -650,18 +681,51 @@ class FakeGHClient:
         *,
         author: str | None = "@me",
         timeout: float | None = None,
+        on_progress: "Callable[[int, int], None] | None" = None,
     ) -> dict[str, list[PRInfo]]:
         self.call_count["my_open_prs"] += 1
         self.last_my_open_prs_author = author  # for test assertions
         if self._my_open_prs is None:
             raise GHError("FakeGHClient: my_open_prs not configured")
         if slugs is None:
+            if on_progress is not None:
+                on_progress(1, 1)
             return {k: list(v) for k, v in self._my_open_prs.items()}
-        slugs_set = set(slugs)
-        return {
+        slug_list = list(slugs)
+        result = {
             slug: list(self._my_open_prs.get(slug, []))
-            for slug in slugs_set
+            for slug in slug_list
         }
+        # Mirror production's per-chunk progress firing so callers' progress
+        # wiring is exercised under test (node 6bm7).
+        if on_progress is not None:
+            total = len(slug_list)
+            for start in range(0, total, _OPEN_PRS_REPO_CHUNK):
+                on_progress(min(start + _OPEN_PRS_REPO_CHUNK, total), total)
+        return result
+
+    def open_pr_heads(
+        self,
+        slugs: Iterable[str],
+        *,
+        timeout: float | None = None,
+        on_progress: "Callable[[int, int], None] | None" = None,
+    ) -> dict[str, set[str]]:
+        # Derives head sets from the same configured my_open_prs data so
+        # existing test fixtures need no extra wiring (node 6bm7).
+        self.call_count["open_pr_heads"] += 1
+        if self._my_open_prs is None:
+            raise GHError("FakeGHClient: my_open_prs not configured")
+        slug_list = list(slugs)
+        result = {
+            slug: {pr.head_ref for pr in self._my_open_prs.get(slug, [])}
+            for slug in slug_list
+        }
+        if on_progress is not None:
+            total = len(slug_list)
+            for start in range(0, total, _OPEN_PRS_REPO_CHUNK):
+                on_progress(min(start + _OPEN_PRS_REPO_CHUNK, total), total)
+        return result
 
     def merge_pr(
         self,
@@ -1026,9 +1090,12 @@ _REVIEW_THREADS_WINDOW = 100
 #: Repos per coalesced search query. GitHub's search silently caps how
 #: many ``repo:`` qualifiers it honors in one query (and may truncate
 #: rather than error), so we chunk to stay well clear of the limit.
-#: 50 matches the default-branch prefetch chunk size and is comfortably
-#: under any observed ceiling.
-_OPEN_PRS_REPO_CHUNK = 50
+#: Lowered 50 → 20 (node 6bm7): with ``author=None`` (the prune surface's
+#: "anyone's open PR") a 50-repo chunk can return hundreds of PRs in one
+#: GraphQL search, which GitHub's backend is more likely to 502 on under
+#: load. Smaller chunks keep each query cheap; the cost is a few more
+#: round-trips, which the per-chunk progress bar now makes visible.
+_OPEN_PRS_REPO_CHUNK = 20
 
 _MY_OPEN_PRS_GRAPHQL = """\
 query($q: String!, $after: String) {
@@ -1087,6 +1154,28 @@ query($q: String!, $after: String) {
 """
 
 
+#: Minimal open-PR search used by :meth:`GHClient.open_pr_heads` (node 6bm7).
+#: prune-worktrees only needs each open PR's head branch name to know which
+#: local branches/worktrees are still pinned by an open PR — NOT the review
+#: threads, checks, timeline, labels, etc. that ``_MY_OPEN_PRS_GRAPHQL``
+#: drags back. Selecting only ``headRefName`` makes the per-chunk query
+#: orders of magnitude cheaper, so it is far less likely to tip GitHub's
+#: search backend into an HTTP 502 during a wobble or a PR surge.
+_OPEN_PR_HEADS_GRAPHQL = """\
+query($q: String!, $after: String) {
+  search(query: $q, type: ISSUE, first: 100, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      ... on PullRequest {
+        headRefName
+        repository { nameWithOwner }
+      }
+    }
+  }
+}
+"""
+
+
 def _parse_iso8601(value: str) -> datetime:
     """Parse a GitHub ISO-8601 timestamp (always ends in ``Z``) into an
     aware UTC ``datetime``. Kept local to gh.py because the rest of
@@ -1115,7 +1204,10 @@ class ProductionGHClient:
       - ``default_timeout``: per-call timeout in seconds when the caller
         passes ``timeout=None``. Default 30s, matching node ghclmp7n.d.
       - ``max_retries``: max attempts (including the initial try) for
-        transient failures. Default 3.
+        transient failures. Default 5 — bumped from 3 (node 6bm7) so a
+        short GitHub 5xx blip (the search backend briefly bad-gatewaying)
+        is ridden out across ~15s of capped exponential backoff instead
+        of aborting the whole run after ~3s.
 
     Raises :class:`GHError` immediately if ``gh_path`` does not resolve
     to an executable.
@@ -1126,7 +1218,7 @@ class ProductionGHClient:
         *,
         gh_path: str = "gh",
         default_timeout: float = 30.0,
-        max_retries: int = 3,
+        max_retries: int = 5,
     ) -> None:
         import shutil
 
@@ -1206,7 +1298,9 @@ class ProductionGHClient:
             # (secondary rate limit) overrides the exponential delay when it
             # asks for longer, clamped to _MAX_BACKOFF_SECONDS (node prnpf8nq).
             if attempt < self._max_retries - 1:
-                delay: float = 2 ** attempt
+                # Clamp the exponential term too (not just Retry-After) so a
+                # high max_retries can't schedule an unbounded sleep (node 6bm7).
+                delay: float = min(2 ** attempt, _MAX_BACKOFF_SECONDS)
                 retry_after = _retry_after_seconds(last_stderr)
                 if retry_after is not None:
                     delay = min(max(delay, retry_after), _MAX_BACKOFF_SECONDS)
@@ -1409,6 +1503,7 @@ class ProductionGHClient:
         search_terms: list[str],
         *,
         timeout: float | None,
+        query: str = _MY_OPEN_PRS_GRAPHQL,
     ) -> list[dict[str, Any]]:
         """Run a search query, following ``pageInfo`` until exhausted.
 
@@ -1417,6 +1512,9 @@ class ProductionGHClient:
         matching PRs would silently lose the overflow (the original
         single-page bug). A missing ``pageInfo`` (older fixtures, or a
         backend that omits it) is treated as a single page.
+
+        ``query`` selects the GraphQL document: the full per-PR selection
+        (default) or the lean ``_OPEN_PR_HEADS_GRAPHQL`` (node 6bm7).
         """
         search_string = " ".join(search_terms)
         nodes: list[dict[str, Any]] = []
@@ -1435,7 +1533,7 @@ class ProductionGHClient:
                 # Raw string (-f): cursors are opaque base64 and must
                 # not be type-coerced by -F.
                 argv.extend(["-f", f"after={cursor}"])
-            argv.extend(["-f", f"query={_MY_OPEN_PRS_GRAPHQL}"])
+            argv.extend(["-f", f"query={query}"])
             stdout = self._run(tuple(argv), timeout=timeout)
             search = json.loads(stdout).get("data", {}).get("search", {}) or {}
             nodes.extend(search.get("nodes", []) or [])
@@ -1449,55 +1547,125 @@ class ProductionGHClient:
                 break
         return nodes
 
+    def _chunked_pr_search(
+        self,
+        slugs: Iterable[str] | None,
+        *,
+        author: str | None,
+        query: str,
+        timeout: float | None,
+        on_progress: "Callable[[int, int], None] | None",
+    ) -> tuple[list[dict[str, Any]], list[str] | None]:
+        """Run the open-PR search, chunked by ``repo:`` qualifier.
+
+        Shared by :meth:`my_open_prs` (full selection) and
+        :meth:`open_pr_heads` (lean selection). Returns the flat list of
+        result nodes across all chunks/pages, plus the resolved slug list
+        (or ``None`` when ``slugs`` is None) so the caller can pre-seed
+        repos that have no matching PRs.
+
+        ``author=None`` → no ``author:`` qualifier (any author); otherwise
+        the qualifier goes first so the query reads naturally and the
+        argv-assertion tests still match for the default ``@me``. GitHub
+        silently caps how many ``repo:`` qualifiers it honors in one query,
+        so coalescing all 200+ into one search would drop repos without any
+        error — hence the chunking. ``on_progress`` fires after each chunk
+        (node 6bm7); the searches are sequential and multi-second, so
+        without it a large fleet looks hung between phases.
+        """
+        base_terms = ["is:open", "is:pr"]
+        if author is not None:
+            base_terms.insert(0, f"author:{author}")
+        nodes: list[dict[str, Any]] = []
+
+        if slugs is None:
+            nodes.extend(
+                self._search_all_pages(base_terms, timeout=timeout, query=query)
+            )
+            if on_progress is not None:
+                on_progress(1, 1)
+            return nodes, None
+
+        slug_list = list(slugs)
+        total = len(slug_list)
+        for start in range(0, total, _OPEN_PRS_REPO_CHUNK):
+            chunk = slug_list[start : start + _OPEN_PRS_REPO_CHUNK]
+            terms = base_terms + [f"repo:{s}" for s in chunk]
+            nodes.extend(
+                self._search_all_pages(terms, timeout=timeout, query=query)
+            )
+            if on_progress is not None:
+                on_progress(min(start + _OPEN_PRS_REPO_CHUNK, total), total)
+        return nodes, slug_list
+
     def my_open_prs(
         self,
         slugs: Iterable[str] | None = None,
         *,
         author: str | None = "@me",
         timeout: float | None = None,
+        on_progress: "Callable[[int, int], None] | None" = None,
     ) -> dict[str, list[PRInfo]]:
         # verified non-deprecated against gh CLI 2026-05-28
-        # author=None → no author: qualifier (any author); otherwise add
-        # the qualifier. The qualifier goes first so the query reads
-        # naturally and the existing argv-assertion tests still match
-        # when author is the default "@me".
-        base_terms = ["is:open", "is:pr"]
-        if author is not None:
-            base_terms.insert(0, f"author:{author}")
+        nodes, slug_list = self._chunked_pr_search(
+            slugs,
+            author=author,
+            query=_MY_OPEN_PRS_GRAPHQL,
+            timeout=timeout,
+            on_progress=on_progress,
+        )
         grouped: dict[str, list[PRInfo]] = {}
-
-        if slugs is None:
-            # No repo filter: one paginated search across all my PRs.
-            node_batches = [self._search_all_pages(base_terms, timeout=timeout)]
-        else:
-            slug_list = list(slugs)
-            # Pre-seed every requested slug so repos with no PRs still
-            # appear (matches FakeGHClient.my_open_prs semantics).
+        # Pre-seed every requested slug so repos with no PRs still appear
+        # (matches FakeGHClient.my_open_prs semantics).
+        if slug_list is not None:
             for slug in slug_list:
                 grouped.setdefault(slug, [])
-            # Chunk the repo: qualifiers. GitHub silently caps how many
-            # it honors in one query, so coalescing all 200+ into one
-            # search would drop repos without any error. Each chunk is
-            # independently paginated.
-            node_batches = []
-            for start in range(0, len(slug_list), _OPEN_PRS_REPO_CHUNK):
-                chunk = slug_list[start : start + _OPEN_PRS_REPO_CHUNK]
-                terms = base_terms + [f"repo:{s}" for s in chunk]
-                node_batches.append(
-                    self._search_all_pages(terms, timeout=timeout)
-                )
-
-        for nodes in node_batches:
-            for node in nodes:
-                if not node:
-                    # GraphQL returns nulls for non-PullRequest items
-                    # (defensive — is:pr filters them, but the field is
-                    # still nullable).
-                    continue
-                pr = _pr_info_from_graphql_node(node)
-                grouped.setdefault(pr.slug, []).append(pr)
-
+        for node in nodes:
+            if not node:
+                # GraphQL returns nulls for non-PullRequest items
+                # (defensive — is:pr filters them, but the field is
+                # still nullable).
+                continue
+            pr = _pr_info_from_graphql_node(node)
+            grouped.setdefault(pr.slug, []).append(pr)
         return grouped
+
+    def open_pr_heads(
+        self,
+        slugs: Iterable[str],
+        *,
+        timeout: float | None = None,
+        on_progress: "Callable[[int, int], None] | None" = None,
+    ) -> dict[str, set[str]]:
+        # verified non-deprecated against gh CLI 2026-05-28 (same graphql
+        # endpoint as my_open_prs; only the selection differs).
+        # author=None: ANY open PR pins a branch, not just the operator's.
+        nodes, slug_list = self._chunked_pr_search(
+            slugs,
+            author=None,
+            query=_OPEN_PR_HEADS_GRAPHQL,
+            timeout=timeout,
+            on_progress=on_progress,
+        )
+        # slug_list is never None here (slugs is required), but guard anyway.
+        heads: dict[str, set[str]] = {s: set() for s in (slug_list or [])}
+        # GitHub returns repository.nameWithOwner in canonical casing, which can
+        # differ from the requested slug's casing (slugs are case-insensitive,
+        # and repo.slug comes from the clone's remote URL). Map results back to
+        # the requested slug so a case mismatch can't strand a repo's heads
+        # under a different key — which would let prune-worktrees treat an
+        # open-PR branch as unpinned and remove it (node 6bm7 review).
+        requested_by_lower = {s.lower(): s for s in (slug_list or [])}
+        for node in nodes:
+            if not node:
+                continue
+            repo = node.get("repository") or {}
+            slug = repo.get("nameWithOwner")
+            head = node.get("headRefName")
+            if slug and head:
+                key = requested_by_lower.get(slug.lower(), slug)
+                heads.setdefault(key, set()).add(head)
+        return heads
 
 
     def merge_pr(

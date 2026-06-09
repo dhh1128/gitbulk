@@ -1194,11 +1194,141 @@ def test_open_pr_fetch_failure_aborts_structural(
 
     def _boom(*a, **k):
         raise GHError("search rate-limited")
-    monkeypatch.setattr(fake, "my_open_prs", _boom)
+    monkeypatch.setattr(fake, "open_pr_heads", _boom)
     _install(monkeypatch, fake)
     rc = prune_worktrees_handler(_args(code_root=code_root))
     assert rc == EXIT_STRUCTURAL_FAILURE
     assert "open-PR fetch failed" in _summary()
+
+
+def test_open_pr_fetch_failure_logs_gh_command_and_points_at_errors(
+    monkeypatch, capsys, isolated_xdg, code_root, write_config, fresh_org_cache,
+    clean_helpers,
+):
+    """On a fetch 5xx: the failing gh command lands in errors.log; the diagnostic
+    hints (transient-5xx, run dir, --errors) go to STDERR; and the stdout summary
+    stays a single line (node 6bm7 + PR-21 review)."""
+    import json
+
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),
+    ])
+    fake = _base_fake()
+    gh_cmd = ("gh", "api", "graphql", "-f", "query=...", "-F", "q=is:open is:pr")
+
+    def _boom(*a, **k):
+        raise GHError("gh exhausted 5 attempts: gh: HTTP 502", command=gh_cmd)
+    monkeypatch.setattr(fake, "open_pr_heads", _boom)
+    _install(monkeypatch, fake)
+
+    rc = prune_worktrees_handler(_args(code_root=code_root))
+    assert rc == EXIT_STRUCTURAL_FAILURE
+    captured = capsys.readouterr()
+
+    # The failing gh invocation is captured in the structured log.
+    run_dir = paths.latest_run_symlink("prune-worktrees").resolve()
+    errors = [
+        json.loads(line)
+        for line in (run_dir / "errors.log").read_text().splitlines()
+        if line.strip()
+    ]
+    fetch_err = next(e for e in errors if "open-PR fetch failed" in e["message"])
+    assert fetch_err["context"]["gh_command"] == " ".join(gh_cmd)
+
+    # Diagnostics go to stderr: transient-error hint + where to read raw logs.
+    assert "HTTP 5xx" in captured.err
+    assert "gitbulk show prune-worktrees --errors" in captured.err
+    assert str(run_dir) in captured.err
+
+    # The stdout summary stays a single line (no embedded newline before the
+    # "View:" pointer the finisher appends).
+    summary_lines = [ln for ln in captured.out.splitlines() if ln.strip()]
+    assert any("open-PR fetch failed" in ln for ln in summary_lines)
+    fetch_line = next(ln for ln in summary_lines if "open-PR fetch failed" in ln)
+    assert "HTTP 5xx" not in fetch_line  # detail is NOT crammed into the summary
+    # The persisted summary.md is likewise single-line for this message.
+    assert "open-PR fetch failed" in _summary()
+
+
+def test_open_pr_fetch_receives_progress_callback(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
+):
+    """The handler wires an on_progress callback into the batched fetch so the
+    long fetch window is not silent (node 6bm7)."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),
+    ])
+    fake = _base_fake()
+    captured = {}
+
+    def _capture(slugs, *, timeout=None, on_progress=None):
+        captured["on_progress"] = on_progress
+        if on_progress is not None:
+            on_progress(1, 1)  # exercise the callback wiring
+        return {s: set() for s in slugs}
+    monkeypatch.setattr(fake, "open_pr_heads", _capture)
+    _install(monkeypatch, fake)
+
+    rc = prune_worktrees_handler(_args(code_root=code_root))
+    assert rc == EXIT_OK
+    assert callable(captured["on_progress"])
+
+
+def test_open_pr_fetch_renders_initial_zero_progress(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
+):
+    """The fetch bar renders 0/N up front, before the first (multi-second)
+    chunk completes, so the initial window is not blank (node 6bm7 review)."""
+
+    class _SpyProgress:
+        instances: list["_SpyProgress"] = []
+
+        def __init__(self, total, *, prefix="", stream=None):
+            self.total = total
+            self.prefix = prefix
+            self.updates: list[int] = []
+            _SpyProgress.instances.append(self)
+
+        def update(self, n, message=""):
+            self.updates.append(n)
+
+        def done(self):
+            pass
+
+        def set_wait_suffix(self, text):
+            pass
+
+        def clear_wait_suffix(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(pw, "Progress", _SpyProgress)
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),
+    ])
+    _install(monkeypatch, _base_fake())
+
+    rc = prune_worktrees_handler(_args(code_root=code_root))
+    assert rc == EXIT_OK
+    fetch_bar = next(
+        p for p in _SpyProgress.instances if p.prefix == "fetching open PRs: "
+    )
+    # First render is the up-front 0/N (before any chunk finishes).
+    assert fetch_bar.updates and fetch_bar.updates[0] == 0
 
 
 # ─── remote-driven protection guard (node prnwlb7q) ────────────────────────

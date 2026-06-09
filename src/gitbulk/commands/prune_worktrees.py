@@ -704,19 +704,53 @@ def _run_under_lock(
     concurrency = _resolve_concurrency(args, policy)
     prune_local = _prune_local_enabled(args)
 
-    # One BATCHED open-PR fetch for the whole scope (node prnwpf9k): the gh
-    # client chunks repo: qualifiers internally (~50/search), so this is a
-    # handful of searches instead of one per repo. author=None — anyone's open
-    # PR pins a branch, not just mine. A whole-scope failure is structural (we
+    # One BATCHED open-PR head fetch for the whole scope (node prnwpf9k): the
+    # gh client chunks repo: qualifiers internally, so this is a handful of
+    # searches instead of one per repo. We only need each open PR's HEAD branch
+    # (any author — anyone's open PR pins a branch), so open_pr_heads uses a
+    # lean GraphQL selection that is far cheaper than the full PR query and much
+    # less likely to 502 (node 6bm7). A whole-scope failure is structural (we
     # can't reason about open-PR heads for any repo), so it aborts rather than
     # mis-classify every branch as having no open PR.
+    #
+    # The fetch is several sequential multi-second GraphQL searches; without a
+    # progress bar the screen sits blank for 30-45s on a large fleet and looks
+    # hung (node 6bm7). Drive a Progress off the per-chunk callback.
+    fetch_prog = Progress(
+        len(passing_repos), prefix="fetching open PRs: "
+    )
+    # Render 0/N up front: the first on_progress fires only AFTER the first
+    # chunk's multi-second search, so without this the bar would still be blank
+    # for the initial chunk — the very gap this is meant to close (node 6bm7).
+    fetch_prog.update(0)
     try:
-        open_prs_by_slug = gh.my_open_prs(
-            [r.slug for r in passing_repos], author=None
+        open_heads_by_slug = gh.open_pr_heads(
+            [r.slug for r in passing_repos],
+            on_progress=lambda done, total: fetch_prog.update(done),
         )
     except GHError as e:
+        fetch_prog.done()
+        # Capture the failing gh invocation in the run log so `gitbulk show
+        # prune-worktrees --errors` reveals which call/qualifiers 502'd —
+        # str(e) alone (e.g. "gh: HTTP 502") gave the operator nothing to act
+        # on (node 6bm7).
+        gh_command = " ".join(e.command) if e.command else None
         rs.record_error(
-            f"open-PR fetch failed: {e}", level="ERROR", context={"error": str(e)}
+            f"open-PR fetch failed: {e}",
+            level="ERROR",
+            context={"error": str(e), "gh_command": gh_command},
+        )
+        # Echo the transient-5xx hint + where the raw logs live to STDERR, so
+        # the one-line stdout summary contract is preserved (node 6bm7 review)
+        # while diagnosis still doesn't require a guess about HTTP 5xx.
+        print(
+            error_line(
+                "  HTTP 5xx here is a transient/overloaded GitHub PR search; "
+                "retrying shortly usually clears it.\n"
+                f"  full run logs: {rs.run_dir}\n"
+                "  failing gh call: gitbulk show prune-worktrees --errors"
+            ),
+            file=sys.stderr,
         )
         return _finish(
             rs, EXIT_STRUCTURAL_FAILURE, summary=f"open-PR fetch failed: {e}",
@@ -725,9 +759,7 @@ def _run_under_lock(
             results=[], apply=bool(args.apply),
             skipped_entries=skipped_entries, filter_line=filter_line,
         )
-    open_heads_by_slug = {
-        slug: {pr.head_ref for pr in prs} for slug, prs in open_prs_by_slug.items()
-    }
+    fetch_prog.done()
 
     # Pass A (parallel): read each clone's worktrees + local branches.
     prog_a = Progress(len(passing_repos), prefix="scanning clones: ")

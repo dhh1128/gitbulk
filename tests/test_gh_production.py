@@ -152,11 +152,11 @@ def test_parse_iso8601_handles_explicit_offset():
 def test_constructor_defaults():
     client = ProductionGHClient()
     # Internal attributes are not part of the public API, but we assert on
-    # them to lock in the documented defaults (30s timeout, 3 attempts,
-    # "gh" on PATH) — see node ghclmp7n.d.
+    # them to lock in the documented defaults (30s timeout, 5 attempts,
+    # "gh" on PATH) — see node ghclmp7n.d / node 6bm7.
     assert client._gh_path == "gh"
     assert client._default_timeout == 30.0
-    assert client._max_retries == 3
+    assert client._max_retries == 5
 
 
 def test_constructor_overrides():
@@ -302,8 +302,11 @@ def test_retry_succeeds_after_one_transient_failure():
 
 
 def test_retry_exponential_backoff_then_failure_raises_gherror():
-    """Three consecutive retryable failures exhaust max_retries=3 attempts."""
+    """Five consecutive retryable failures exhaust max_retries=5 attempts
+    (node 6bm7 raised the default 3→5 to ride out short GitHub 5xx blips)."""
     side_effect = _make_run_mock(
+        _CompletedFake(1, stderr="rate limit"),
+        _CompletedFake(1, stderr="rate limit"),
         _CompletedFake(1, stderr="rate limit"),
         _CompletedFake(1, stderr="rate limit"),
         _CompletedFake(1, stderr="rate limit final"),
@@ -314,11 +317,11 @@ def test_retry_exponential_backoff_then_failure_raises_gherror():
             with pytest.raises(GHError) as exc_info:
                 client.authenticated_user()
 
-    assert mock_run.call_count == 3
-    # Backoff between attempts: 1s after first, 2s after second; no sleep
-    # after the third (final) attempt.
-    assert [c.args for c in mock_sleep.call_args_list] == [(1,), (2,)]
-    assert "exhausted 3 attempts" in str(exc_info.value)
+    assert mock_run.call_count == 5
+    # Capped exponential backoff between attempts: 1, 2, 4, 8s; no sleep
+    # after the fifth (final) attempt.
+    assert [c.args for c in mock_sleep.call_args_list] == [(1,), (2,), (4,), (8,)]
+    assert "exhausted 5 attempts" in str(exc_info.value)
     assert "rate limit final" in str(exc_info.value)
     assert exc_info.value.command == ("gh", "api", "user")
 
@@ -377,7 +380,7 @@ def test_timeout_exhausted_raises_ghtimeouterror():
     """All attempts time out → GHTimeoutError (subclass of GHError)."""
     timeouts = [
         subprocess.TimeoutExpired(cmd=["gh", "api", "user"], timeout=30.0)
-        for _ in range(3)
+        for _ in range(5)
     ]
     side_effect = _make_run_mock(*timeouts)
     with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
@@ -386,7 +389,7 @@ def test_timeout_exhausted_raises_ghtimeouterror():
             with pytest.raises(GHTimeoutError) as exc_info:
                 client.authenticated_user()
 
-    assert mock_run.call_count == 3
+    assert mock_run.call_count == 5
     assert "timeout" in str(exc_info.value).lower()
     assert exc_info.value.command == ("gh", "api", "user")
 
@@ -540,6 +543,142 @@ def test_my_open_prs_argv_includes_repo_terms_for_each_slug():
     argv = args[0]
     q_value = argv[argv.index("-F") + 1]
     assert q_value == "q=author:@me is:open is:pr repo:a/x repo:b/y"
+
+
+def test_my_open_prs_fires_on_progress_after_each_chunk(monkeypatch):
+    """on_progress(repos_completed, repos_total) fires once per repo-chunk so
+    a caller can render a bar during the otherwise-silent fetch (node 6bm7)."""
+    monkeypatch.setattr("gitbulk.gh._OPEN_PRS_REPO_CHUNK", 2)
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps({"data": {"search": {"nodes": []}}}))
+    )
+    calls: list[tuple[int, int]] = []
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        client.my_open_prs(
+            slugs=["o/a", "o/b", "o/c", "o/d", "o/e"],  # 5 → chunks of 2
+            on_progress=lambda done, total: calls.append((done, total)),
+        )
+    assert calls == [(2, 5), (4, 5), (5, 5)]
+
+
+def test_my_open_prs_no_slugs_fires_on_progress_once(monkeypatch):
+    """The single-search (slugs=None) path fires on_progress(1, 1)."""
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps({"data": {"search": {"nodes": []}}}))
+    )
+    calls: list[tuple[int, int]] = []
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        client.my_open_prs(
+            on_progress=lambda done, total: calls.append((done, total))
+        )
+    assert calls == [(1, 1)]
+
+
+# ─── open_pr_heads: lean query + head grouping (node 6bm7) ──────────────────
+
+
+def test_open_pr_heads_uses_lean_query_without_author_qualifier():
+    """The head-only fetch sends the lean GraphQL doc (no reviewThreads/
+    commits/timeline) and no author: qualifier (any author pins a branch)."""
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps({"data": {"search": {"nodes": []}}}))
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.open_pr_heads(["a/x", "b/y"])
+
+    argv = mock_run.call_args[0][0]
+    q_value = argv[argv.index("-F") + 1]
+    assert q_value == "q=is:open is:pr repo:a/x repo:b/y"  # no author:
+    query_doc = argv[argv.index("-f") + 1]
+    assert "headRefName" in query_doc
+    # The expensive selections must NOT be in the lean query.
+    assert "reviewThreads" not in query_doc
+    assert "statusCheckRollup" not in query_doc
+    assert "timelineItems" not in query_doc
+
+
+def test_open_pr_heads_groups_head_refs_by_repo():
+    payload = {
+        "data": {
+            "search": {
+                "nodes": [
+                    {"headRefName": "feat-1", "repository": {"nameWithOwner": "a/x"}},
+                    {"headRefName": "feat-2", "repository": {"nameWithOwner": "a/x"}},
+                    {"headRefName": "fix", "repository": {"nameWithOwner": "b/y"}},
+                ]
+            }
+        }
+    }
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        result = client.open_pr_heads(["a/x", "b/y", "quiet/repo"])
+
+    assert result["a/x"] == {"feat-1", "feat-2"}
+    assert result["b/y"] == {"fix"}
+    # Requested-but-PR-less repo still appears, as an empty set.
+    assert result["quiet/repo"] == set()
+
+
+def test_open_pr_heads_maps_canonical_casing_back_to_requested_slug():
+    """GitHub returns nameWithOwner in canonical casing; if it differs from the
+    requested slug's casing, the heads must still land under the REQUESTED slug
+    — otherwise prune-worktrees would treat an open-PR branch as unpinned and
+    could remove it (node 6bm7 review)."""
+    payload = {
+        "data": {
+            "search": {
+                "nodes": [
+                    # canonical casing differs from the requested "Owner/Repo"
+                    {"headRefName": "feat", "repository": {"nameWithOwner": "owner/repo"}},
+                ]
+            }
+        }
+    }
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        result = client.open_pr_heads(["Owner/Repo"])
+
+    # Head lands under the requested casing, not the canonical one.
+    assert result == {"Owner/Repo": {"feat"}}
+
+
+def test_open_pr_heads_skips_null_and_incomplete_nodes():
+    payload = {
+        "data": {
+            "search": {
+                "nodes": [
+                    None,  # nullable non-PR item
+                    {"headRefName": None, "repository": {"nameWithOwner": "a/x"}},
+                    {"headRefName": "ok", "repository": {"nameWithOwner": "a/x"}},
+                ]
+            }
+        }
+    }
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        result = client.open_pr_heads(["a/x"])
+    assert result["a/x"] == {"ok"}
+
+
+def test_open_pr_heads_fires_on_progress_per_chunk(monkeypatch):
+    monkeypatch.setattr("gitbulk.gh._OPEN_PRS_REPO_CHUNK", 2)
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps({"data": {"search": {"nodes": []}}}))
+    )
+    calls: list[tuple[int, int]] = []
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        client = ProductionGHClient()
+        client.open_pr_heads(
+            ["o/a", "o/b", "o/c", "o/d", "o/e"],
+            on_progress=lambda done, total: calls.append((done, total)),
+        )
+    assert calls == [(2, 5), (4, 5), (5, 5)]
 
 
 def test_my_open_prs_with_slugs_emits_empty_list_for_unknown_slug():
@@ -710,11 +849,11 @@ def test_my_open_prs_stops_when_next_page_but_no_cursor():
     assert len(result["dhh1128/gitbulk"]) == 1
 
 
-def test_my_open_prs_chunks_repo_qualifiers_at_50():
-    """>50 slugs → multiple search calls, each with ≤50 repo: terms.
-    GitHub silently caps qualifiers, so coalescing all into one query
-    would drop repos."""
-    slugs = [f"owner/repo{i}" for i in range(120)]  # → 3 chunks (50,50,20)
+def test_my_open_prs_chunks_repo_qualifiers_at_chunk_size():
+    """>chunk-size slugs → multiple search calls, each with ≤ chunk-size
+    repo: terms. GitHub silently caps qualifiers, so coalescing all into one
+    query would drop repos. Chunk size is 20 (node 6bm7)."""
+    slugs = [f"owner/repo{i}" for i in range(50)]  # → 3 chunks (20,20,10)
     side_effect = _make_run_mock(
         _CompletedFake(0, stdout=json.dumps(_search_page([]))),
         _CompletedFake(0, stdout=json.dumps(_search_page([]))),
@@ -726,25 +865,26 @@ def test_my_open_prs_chunks_repo_qualifiers_at_50():
 
     # 3 chunks → 3 search calls.
     assert mock_run.call_count == 3
-    # Each chunk's q has at most 50 repo: terms.
+    # Each chunk's q has at most 20 repo: terms.
     for call in mock_run.call_args_list:
         argv = call[0][0]
         q = argv[argv.index("-F") + 1]
-        assert q.count("repo:") <= 50
+        assert q.count("repo:") <= 20
     # All requested slugs are still pre-seeded as keys.
-    assert len(result) == 120
+    assert len(result) == 50
 
 
 def test_my_open_prs_chunk_results_merge_across_chunks():
-    """A PR found in chunk 2 lands in the result alongside chunk-1 PRs."""
-    slugs = [f"owner/repo{i}" for i in range(60)]  # 2 chunks (50 + 10)
+    """A PR found in a later chunk lands in the result alongside earlier
+    chunks' PRs (chunk size 20 → repo25 is in the second chunk)."""
+    slugs = [f"owner/repo{i}" for i in range(30)]  # 2 chunks (20 + 10)
     pr_in_chunk1 = dict(
         _GRAPHQL_FIXTURE["data"]["search"]["nodes"][0],
         number=1, repository={"nameWithOwner": "owner/repo0"},
     )
     pr_in_chunk2 = dict(
         _GRAPHQL_FIXTURE["data"]["search"]["nodes"][0],
-        number=2, repository={"nameWithOwner": "owner/repo55"},
+        number=2, repository={"nameWithOwner": "owner/repo25"},
     )
     side_effect = _make_run_mock(
         _CompletedFake(0, stdout=json.dumps(_search_page([pr_in_chunk1]))),
@@ -754,7 +894,7 @@ def test_my_open_prs_chunk_results_merge_across_chunks():
         client = ProductionGHClient()
         result = client.my_open_prs(slugs=slugs)
     assert [p.number for p in result["owner/repo0"]] == [1]
-    assert [p.number for p in result["owner/repo55"]] == [2]
+    assert [p.number for p in result["owner/repo25"]] == [2]
 
 
 def test_my_open_prs_runaway_guard_caps_at_100_pages():
@@ -2003,15 +2143,13 @@ def test_prefetch_handles_timeout_with_retry(monkeypatch):
 def test_prefetch_exhausts_retries_on_persistent_timeout(monkeypatch):
     """All attempts time out → stdout stays empty → give up silently."""
     side_effect = _make_run_mock(
-        subprocess.TimeoutExpired(cmd=["gh"], timeout=30.0),
-        subprocess.TimeoutExpired(cmd=["gh"], timeout=30.0),
-        subprocess.TimeoutExpired(cmd=["gh"], timeout=30.0),
+        *[subprocess.TimeoutExpired(cmd=["gh"], timeout=30.0) for _ in range(5)]
     )
     monkeypatch.setattr("gitbulk.gh.time.sleep", lambda _: None)
     with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
         client = ProductionGHClient()
         client.prefetch_default_branches(["a/b"])
-    assert mock_run.call_count == 3
+    assert mock_run.call_count == 5  # max_retries default 5 (node 6bm7)
     assert client._default_branch_cache == {}
 
 
