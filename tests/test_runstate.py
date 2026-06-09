@@ -234,6 +234,32 @@ def test_record_repo_state_defers_write_until_flush(isolated_cache):
     assert flushed["repos"] == {"owner/repo": {"x": 1}}
 
 
+def test_record_repo_state_deep_copies_payload(isolated_cache):
+    """A caller mutating the payload after record_repo_state must not change
+    the eventually-flushed snapshot (node 7gpd review — matches set_repos)."""
+    rs = RunState.begin("merge", [], {})
+    payload = {"prs": [1], "merged": 0}
+    rs.record_repo_state("o/r", payload)
+    payload["prs"].append(2)  # mutate nested list after recording
+    payload["merged"] = 99
+    rs.flush_state()
+    state = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
+    assert state["repos"]["o/r"] == {"prs": [1], "merged": 0}
+
+
+def test_record_extra_deep_copies_value(isolated_cache):
+    """A caller mutating the value after record_extra must not change the
+    eventually-flushed snapshot."""
+    rs = RunState.begin("report", [], {})
+    value = [{"slug": "a/b"}]
+    rs.record_extra("recent_merges", value)
+    value.append({"slug": "c/d"})  # mutate after recording
+    value[0]["slug"] = "mutated"
+    rs.flush_state()
+    doc = yaml.safe_load((rs.run_dir / "state.yaml").read_text())
+    assert doc["recent_merges"] == [{"slug": "a/b"}]
+
+
 def test_flush_state_is_noop_when_not_dirty(isolated_cache):
     """flush_state() with nothing pending does not rewrite state.yaml."""
     rs = RunState.begin("merge", [], {})

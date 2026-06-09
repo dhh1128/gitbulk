@@ -214,7 +214,12 @@ class RunState:
         _append_jsonl(self._run_dir / "errors.log", event)
 
     def record_repo_state(self, slug: str, payload: dict[str, Any]) -> None:
-        self._per_repo[slug] = payload
+        # Deep-copy so a later caller mutation of ``payload`` can't reach the
+        # deferred flush — preserving snapshot-at-call-time semantics now that
+        # the write no longer happens immediately (matches set_repos; node
+        # 7gpd review). O(payload), not O(n^2), so the write-amplification fix
+        # stands.
+        self._per_repo[slug] = copy.deepcopy(payload)
         self._state_dirty = True
 
     def set_repos(self, repos: dict[str, dict[str, Any]]) -> None:
@@ -240,7 +245,10 @@ class RunState:
         """
         if key in {"schema_version", "repos"}:
             raise ValueError(f"reserved state.yaml key: {key!r}")
-        self._extras[key] = value
+        # Deep-copy for the same snapshot-at-call-time reason as
+        # record_repo_state/set_repos (node 7gpd review): the deferred flush
+        # must serialize the value as it was when recorded, not a later mutation.
+        self._extras[key] = copy.deepcopy(value)
         self._state_dirty = True
 
     def flush_state(self) -> None:
@@ -250,9 +258,9 @@ class RunState:
         :meth:`record_repo_state`, :meth:`set_repos`, and
         :meth:`record_extra`. A no-op when nothing changed since the last
         flush, so calling it at a phase boundary AND from :meth:`complete`
-        costs at most one extra write. ``begin()`` already wrote an empty
-        ``{repos: {}}`` so a crash before the first flush still leaves a
-        parseable file; the audit of mutating actions themselves is appended
+        costs at most one extra write. ``begin()`` already wrote an initial
+        ``{schema_version, repos: {}}`` so a crash before the first flush still
+        leaves a parseable file; the audit of mutating actions themselves is appended
         live to errors.log/invariants.log, not state.yaml (node 7gpd /
         PERF-F1, this.i kp7nw4mq.c)."""
         if not self._state_dirty:
