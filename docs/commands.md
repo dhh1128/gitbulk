@@ -122,7 +122,11 @@ run first.
 !!! info "Shared guardrails"
     - **Grace period** — a branch/worktree is only touched once its PR has been
       merged/closed for at least `prune_min_age_days` (default 7, per-repo
-      overridable). Just-merged work is left alone.
+      overridable). Just-merged work is left alone. Pass `--min-age-days DAYS`
+      to override the default for one run (e.g. `--min-age-days 2` to sweep work
+      merged 2+ days ago instead of 7+); `0` removes the grace entirely. It
+      rewrites the *default* only — a repo with its own `prune_min_age_days`
+      override still uses that.
     - **No data loss** — a remote branch is deleted only when its tip is the
       merged PR's recorded head SHA *or* it is fully contained in the default
       branch; a worktree's branch is removed only when it has no unpushed

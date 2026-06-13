@@ -1134,6 +1134,17 @@ Gitbulk Triage Tool = goal:
         closedAt (closed), not the branch's last-commit date, because PR
         lifecycle — not commit recency — is what "associated with a
         closed/merged PR" means.
+
+        Both prune commands also accept ``--min-age-days DAYS`` (2026-06-13):
+        a per-run override meaning "instead of the default N". It rewrites
+        ``defaults.prune_min_age_days`` only (via
+        ``_common.apply_prune_min_age_override``), so the whole classifier
+        chain and the run's config snapshot see the effective grace with no
+        extra plumbing. It deliberately does NOT win over an explicit per-repo
+        ``prune_min_age_days`` override: a configured per-repo grace is a
+        stronger, usually-SAFETY statement of intent (a longer cool-off) and an
+        ad-hoc CLI flag must not silently shorten it. DAYS is a non-negative int
+        (0 removes the grace); a negative is a clean argparse usage error.
       approved-by: daniel, 2026-06-03
 
     Prune Data-Loss Guard = decision:

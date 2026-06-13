@@ -86,6 +86,26 @@ def test_parser_constructs_without_error():
     assert parser.prog == "gitbulk"
 
 
+@pytest.mark.parametrize("sub", ["prune-worktrees", "prune-branches"])
+def test_min_age_days_parses_for_both_prune_subcommands(sub):
+    """``--min-age-days`` is offered on both prune subcommands and yields a
+    non-negative int (node prgrc3kp); omitting it leaves ``None`` so the
+    handler falls back to the policy default."""
+    parser = build_parser()
+    assert parser.parse_args([sub, "--min-age-days", "3"]).min_age_days == 3
+    assert parser.parse_args([sub, "--min-age-days", "0"]).min_age_days == 0
+    assert parser.parse_args([sub]).min_age_days is None
+
+
+@pytest.mark.parametrize("bad", ["-1", "abc"])
+def test_min_age_days_rejects_negative_and_non_integer(bad):
+    """A negative or non-integer ``--min-age-days`` is a clean argparse usage
+    error (exit 2), not a silently-broken grace period."""
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["prune-worktrees", "--min-age-days", bad])
+
+
 # ─── ack subcommand ────────────────────────────────────────────────────────
 
 
