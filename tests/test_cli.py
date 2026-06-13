@@ -102,9 +102,9 @@ def test_min_age_days_rejects_negative_and_non_integer(bad):
     """A negative or non-integer ``--min-age-days`` is a clean argparse usage
     error (exit 2), not a silently-broken grace period."""
     parser = build_parser()
-with pytest.raises(SystemExit) as exc:
-    parser.parse_args(["prune-worktrees", "--min-age-days", bad])
-assert exc.value.code == 2
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["prune-worktrees", "--min-age-days", bad])
+    assert exc.value.code == 2
 
 
 # ─── ack subcommand ────────────────────────────────────────────────────────
