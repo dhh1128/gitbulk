@@ -47,6 +47,7 @@ from gitbulk.org_members_cache import (
     ensure_org_members_fresh,
 )
 from gitbulk.commands._common import (
+    apply_prune_min_age_override,
     dc_to_dict,
     read_repos_text,
     sacred_branch_names,
@@ -727,7 +728,7 @@ def prune_branches_handler(args: argparse.Namespace) -> int:
             error_line(f"gitbulk prune-branches: {e}"), file=sys.stderr
         )
         return EXIT_STRUCTURAL_FAILURE
-    policy = load_policy()
+    policy = apply_prune_min_age_override(load_policy(), args)
     code_root = Path(args.code_root).expanduser() if args.code_root else None
     repos, skipped_entries = load_repos(code_root=code_root)
     repos_text = read_repos_text()

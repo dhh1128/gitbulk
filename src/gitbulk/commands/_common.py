@@ -17,7 +17,8 @@ worktree, not a PR — see the comments at those call sites.
 
 from __future__ import annotations
 
-from dataclasses import asdict
+import argparse
+from dataclasses import asdict, replace
 from typing import Iterable
 
 from gitbulk import paths
@@ -37,6 +38,30 @@ from gitbulk.invariants.base import Invariant, InvariantKind
 #: protection), so this set is purely additive — it only ever keeps MORE
 #: branches and can never cause a deletion.
 SACRED_BRANCH_NAMES: frozenset[str] = frozenset({"main", "master"})
+
+
+def apply_prune_min_age_override(
+    policy: Policy, args: argparse.Namespace
+) -> Policy:
+    """Return ``policy`` with the prune grace period overridden by
+    ``--min-age-days`` if it was passed, else ``policy`` unchanged (node
+    prgrc3kp).
+
+    The flag is a per-run knob meaning "instead of the default N days": it
+    rewrites ``defaults.prune_min_age_days`` only. A repo that carries an
+    explicit per-repo ``prune_min_age_days`` override still wins via
+    :func:`policy_for`, because a deliberately-configured per-repo grace is a
+    stronger statement of intent than an ad-hoc CLI flag and is usually a
+    SAFETY setting (a longer cool-off) we must not silently shorten. Folding
+    the value into ``defaults`` rather than threading it through every
+    classifier means the whole call chain — and the run's config snapshot —
+    sees the effective grace with no extra plumbing."""
+    val = getattr(args, "min_age_days", None)
+    if val is None:
+        return policy
+    return replace(
+        policy, defaults=replace(policy.defaults, prune_min_age_days=val)
+    )
 
 
 def sacred_branch_names(policy: Policy, slug: str) -> frozenset[str]:

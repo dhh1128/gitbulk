@@ -708,10 +708,23 @@ def _add_rebase_pr_args(sp: argparse.ArgumentParser) -> None:
     )
 
 
+def _nonneg_int(text: str) -> int:
+    """argparse ``type`` for a non-negative integer (used by ``--min-age-days``,
+    node prgrc3kp). Rejecting a negative at parse time gives a clean usage error
+    instead of letting it slip through as a never-satisfied grace period."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not an integer")
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0, got {value}")
+    return value
+
+
 def _add_prune_common_args(sp: argparse.ArgumentParser, *, what: str) -> None:
     """Shared flags for the two prune subcommands: --apply opt-in,
-    --code-root, --skip-check, --refresh-org-members. ``what`` fills the
-    --apply help text."""
+    --code-root, --skip-check, --refresh-org-members, --min-age-days. ``what``
+    fills the --apply help text."""
     sp.add_argument(
         "--apply",
         action="store_true",
@@ -747,6 +760,20 @@ def _add_prune_common_args(sp: argparse.ArgumentParser, *, what: str) -> None:
         help=(
             "Force a fresh fetch of the configured humans.org members even "
             "when the cache is still within its TTL."
+        ),
+    )
+    sp.add_argument(
+        "--min-age-days",
+        type=_nonneg_int,
+        default=None,
+        metavar="DAYS",
+        help=(
+            "Override the grace period (defaults.prune_min_age_days, default "
+            "7; node prgrc3kp) for this run: only prune a worktree/branch "
+            "whose PR merged/closed at least DAYS days ago (and, for the no-PR "
+            "safe states, that has sat idle at least DAYS days). 0 removes the "
+            "grace entirely. This replaces the policy DEFAULT only; an explicit "
+            "per-repo prune_min_age_days override still takes precedence."
         ),
     )
 

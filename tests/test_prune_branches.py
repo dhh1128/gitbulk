@@ -59,7 +59,7 @@ def write_config(isolated_xdg, code_root):
 def _args(*, apply=False, code_root=None, skip_check=None,
           refresh_org_members=False, org=None, repo=None, base=None,
           mergeable_state=None, author=None, filter=None, concurrency=1,
-          max_age=None, force_scan=False):
+          max_age=None, force_scan=False, min_age_days=None):
     # concurrency defaults to 1 here so handler tests run the deterministic
     # inline scan path; parallel-path tests pass concurrency>1 explicitly.
     return argparse.Namespace(
@@ -69,7 +69,7 @@ def _args(*, apply=False, code_root=None, skip_check=None,
         refresh_org_members=refresh_org_members,
         org=org, repo=repo, base=base, mergeable_state=mergeable_state,
         author=author, filter=filter, concurrency=concurrency,
-        max_age=max_age, force_scan=force_scan,
+        max_age=max_age, force_scan=force_scan, min_age_days=min_age_days,
     )
 
 
@@ -521,6 +521,31 @@ def test_resolve_concurrency_floors_at_one():
     from gitbulk.config.policy import Policy
     assert pb._resolve_concurrency(_args(concurrency=0), Policy()) == 1
     assert pb._resolve_concurrency(_args(concurrency=-5), Policy()) == 1
+
+
+def test_apply_prune_min_age_override():
+    """The shared ``--min-age-days`` override (node prgrc3kp): a value rewrites
+    the policy DEFAULT; ``None`` leaves the policy untouched; an explicit
+    per-repo override still wins over the CLI value."""
+    from gitbulk.commands._common import apply_prune_min_age_override
+    from gitbulk.config.policy import Defaults, Policy, RepoOverride, policy_for
+
+    policy = Policy(
+        defaults=Defaults(prune_min_age_days=7),
+        repos={"o/special": RepoOverride(prune_min_age_days=30)},
+    )
+
+    # No flag → policy returned unchanged (same object).
+    assert apply_prune_min_age_override(policy, _args()) is policy
+
+    # Flag set → default is overridden; per-repo override is preserved and
+    # still takes precedence via policy_for.
+    out = apply_prune_min_age_override(policy, _args(min_age_days=2))
+    assert out.defaults.prune_min_age_days == 2
+    assert policy_for(out, "o/other").prune_min_age_days == 2
+    assert policy_for(out, "o/special").prune_min_age_days == 30
+    # Original policy is not mutated (frozen dataclasses, replace()).
+    assert policy.defaults.prune_min_age_days == 7
 
 
 def test_parallel_scan_surfaces_all_candidates_in_slug_sorted_order(
@@ -1312,3 +1337,43 @@ def test_branch_kept_within_grace_shown_in_summary(
     summary = _latest_summary()
     assert "Kept (guardrail)" in summary
     assert "grace period" in summary
+
+
+def test_min_age_days_override_shortens_grace(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """``--min-age-days`` lowers the grace period for the run (node prgrc3kp).
+    A branch whose PR closed 2 days ago is KEPT under the default 7-day grace
+    but becomes a delete candidate under ``--min-age-days 1`` (2 >= 1). The PR
+    head SHA matches the branch tip so the only gate under test is the grace
+    period."""
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+        branches={"dhh1128/alpha": [_br(name="recent", sha="a" * 40)]},
+        closed_prs_for_head={
+            ("dhh1128/alpha", "recent"): [
+                _closed("dhh1128/alpha", 8, head_ref="recent",
+                        head_sha="a" * 40, days_ago=2)
+            ],
+        },
+    )
+    _install(monkeypatch, fake)
+
+    # Default 7-day grace: 2 days old → kept.
+    rc = prune_branches_handler(_args(code_root=code_root))
+    assert rc == EXIT_OK
+    assert "Would delete" not in _latest_summary()
+
+    # --min-age-days 1: 2 >= 1 → deletable.
+    rc = prune_branches_handler(
+        _args(code_root=code_root, min_age_days=1, force_scan=True)
+    )
+    assert rc == EXIT_OK
+    override_summary = _latest_summary()
+    assert "Would delete" in override_summary
+    assert "recent" in override_summary

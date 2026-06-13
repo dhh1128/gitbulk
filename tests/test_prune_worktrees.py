@@ -77,7 +77,7 @@ def _args(*, apply=False, code_root=None, skip_check=None,
           refresh_org_members=False, include_untracked=False, org=None,
           repo=None, base=None, mergeable_state=None, author=None, filter=None,
           concurrency=None, no_prune_local_branches=False,
-          trust_local_default=False):
+          trust_local_default=False, min_age_days=None):
     return argparse.Namespace(
         subcommand="prune-worktrees", apply=apply,
         code_root=str(code_root) if code_root else None,
@@ -89,6 +89,7 @@ def _args(*, apply=False, code_root=None, skip_check=None,
         concurrency=concurrency,
         no_prune_local_branches=no_prune_local_branches,
         trust_local_default=trust_local_default,
+        min_age_days=min_age_days,
     )
 
 
@@ -673,6 +674,65 @@ def test_handler_grace_boundary_honored_through_injected_clock(
     kept_section = summary.split("## Kept (guardrail)")[1]
     assert "alpha-inside" in kept_section
     assert "grace period" in kept_section
+
+
+def test_handler_min_age_days_override_shortens_grace(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache, clean_helpers,
+):
+    """``--min-age-days`` lowers the grace period for the whole run (node
+    prgrc3kp). A worktree whose PR closed 5 days ago is KEPT under the default
+    7-day grace but becomes a remove candidate once ``--min-age-days 4`` is
+    passed (5 >= 4). This drives the override end-to-end through the handler →
+    classifier so a regression that stops threading it would flip the
+    assertion back to "kept"."""
+    T = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    monkeypatch.setattr(pw, "_utc_now", lambda: T)  # overrides autouse pin
+
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    clone = code_root / "alpha"
+    wt = clone.parent / "alpha-recent"  # PR closed 5d ago
+    monkeypatch.setattr(pw, "list_worktrees", lambda r: [
+        _entry(clone, branch="main", is_main=True),
+        _entry(wt, branch="recent"),
+    ])
+    monkeypatch.setattr(pw, "remove_linked_worktree", lambda r, p: None)
+    fake = FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        branches={"dhh1128/alpha": []},
+        my_open_prs={"dhh1128/alpha": []},
+        closed_prs_for_head={
+            ("dhh1128/alpha", "recent"): [
+                ClosedPRRef(
+                    number=5, title="t", url="u", merged=True, base_ref="main",
+                    head_ref="recent", head_sha="z" * 40,
+                    head_repo_slug="dhh1128/alpha",
+                    closed_at=T - timedelta(days=5),
+                )
+            ],
+        },
+    )
+    _install(monkeypatch, fake)
+
+    # Default 7-day grace: 5 days old → kept.
+    rc = prune_worktrees_handler(_args(code_root=code_root))
+    assert rc == EXIT_OK
+    default_summary = (
+        paths.latest_run_symlink("prune-worktrees").resolve() / "summary.md"
+    ).read_text()
+    assert "## Would remove" not in default_summary
+    assert "grace period" in default_summary.split("## Kept (guardrail)")[1]
+
+    # --min-age-days 4: 5 >= 4 → now a remove candidate.
+    rc = prune_worktrees_handler(_args(code_root=code_root, min_age_days=4))
+    assert rc == EXIT_OK
+    override_summary = (
+        paths.latest_run_symlink("prune-worktrees").resolve() / "summary.md"
+    ).read_text()
+    assert "## Would remove" in override_summary
+    assert "alpha-recent" in override_summary
 
 
 def test_scan_error_recorded(
