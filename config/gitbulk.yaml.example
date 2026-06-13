@@ -16,8 +16,11 @@ defaults:
   prune_min_age_days: 7          # prune-branches/-worktrees: grace period since a PR merged/closed
   # sacred_branches: []          # prune-branches/-worktrees: extra branch names NEVER
   #                              # auto-pruned (local OR remote), alongside the always-sacred
-  #                              # main/master and each repo's GitHub default branch
-  #                              # (e.g. [develop, trunk]). Exact, case-sensitive match.
+  #                              # main/master, gh-pages/tick (orphan-branch conventions),
+  #                              # and each repo's GitHub default branch (e.g. [develop, trunk]).
+  #                              # Exact, case-sensitive match. prune-worktrees additionally
+  #                              # never harvests any branch with no shared history with the
+  #                              # default (an orphan branch), regardless of its name.
   # skip_checks: []              # invariants suppressed for every repo
   # extra_checks: []             # extra invariants enabled for every repo
 

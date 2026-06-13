@@ -132,9 +132,13 @@ run first.
       branch; a worktree's branch is removed only when it has no unpushed
       commits. Anything with unique work is kept, with a reason.
     - **Sacred branch names** — neither command will ever delete a branch named
-      `main`/`master`, one matching a repo's GitHub default branch, or any name
-      in [`sacred_branches`](configuration.md#sacred_branches--branches-the-prune-commands-must-never-delete).
+      `main`/`master`, `gh-pages`/`tick`, one matching a repo's GitHub default
+      branch, or any name in [`sacred_branches`](configuration.md#sacred_branches--branches-the-prune-commands-must-never-delete).
       The same set guards local *and* remote deletion.
+    - **Orphan branches** — `prune-worktrees` never harvests a branch that
+      shares no history with the default branch (no common ancestor), so a
+      deliberately-detached branch like an orphan `gh-pages` site or a `tick`
+      ledger worktree is kept even when every commit is already on its remote.
 
 ### `prune-branches`
 

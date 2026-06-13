@@ -88,11 +88,15 @@ repos:
 
 ### `sacred_branches` — branches the prune commands must never delete
 
-Both prune commands already refuse to delete a branch named `main`/`master` or
-one matching a repo's GitHub **default branch** (`prune-branches` also honours
-GitHub branch protection). Set `defaults.sacred_branches` (or a per-repo
-override) to extend that always-protected set with your own conventions —
-`develop`, `trunk`, `release`, integration branches, etc.
+Both prune commands already refuse to delete a branch named `main`/`master`,
+`gh-pages`/`tick` (well-known orphan-branch conventions — a GitHub Pages publish
+branch and the [`tick`](https://github.com/dhh1128/tick) defect-ledger branch),
+or one matching a repo's GitHub **default branch** (`prune-branches` also
+honours GitHub branch protection). They additionally never harvest any branch
+that shares **no history** with the default branch — an orphan branch with no
+common ancestor — even when it isn't named above. Set `defaults.sacred_branches`
+(or a per-repo override) to extend that always-protected set with your own
+conventions — `develop`, `trunk`, `release`, integration branches, etc.
 
 The same set applies to **both** `prune-worktrees` (local branch/worktree
 removal) and `prune-branches` (remote branch deletion): a name you protect from

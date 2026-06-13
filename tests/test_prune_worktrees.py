@@ -164,6 +164,10 @@ def clean_helpers(monkeypatch):
     monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: None)
     monkeypatch.setattr(pw, "ref_last_update_age_days", lambda r, ref, now: None)
     monkeypatch.setattr(pw, "branch_contained_in", lambda r, base, b: False)
+    # The structural orphan backstop defaults to "shares history" so a clean
+    # baseline run treats a branch as normal feature work; the orphan tests
+    # override it to False/None (node prnorph7).
+    monkeypatch.setattr(pw, "branch_shares_history", lambda r, b, base: True)
 
 
 # ─── _classify_worktree unit tests ─────────────────────────────────────────
@@ -1520,6 +1524,83 @@ def test_classify_non_sacred_branch_unaffected_by_config(clean_helpers):
         policy=policy,
     )
     assert "never auto-pruned" not in out["reason"]
+
+
+def test_gh_pages_and_tick_are_sacred_by_default(clean_helpers):
+    # gh-pages and tick are now in the universally-sacred set, so they are kept
+    # by name with no config, even when the default branch is something else and
+    # they have no upstream (node prnorph7).
+    for name in ("gh-pages", "tick"):
+        out = _classify_lb(
+            FakeGHClient(), name, default_branch="main", upstream=None,
+        )
+        assert out["decision"] == "skip", name
+        assert "never auto-pruned" in out["reason"], name
+
+
+# ─── structural orphan backstop (node prnorph7) ────────────────────────────
+
+
+def test_classify_keeps_orphan_branch_unrelated_history(monkeypatch, clean_helpers):
+    # A branch with NO common ancestor with the default branch (an orphan, e.g.
+    # the tick ledger or an orphan gh-pages) is kept regardless of staleness.
+    monkeypatch.setattr(pw, "branch_shares_history", lambda r, b, base: False)
+    out = _classify_lb(FakeGHClient(), "ledger", default_branch="main")
+    assert out["decision"] == "skip"
+    assert "unrelated history to default branch 'main'" in out["reason"]
+    assert "orphan branch" in out["reason"]
+
+
+def test_orphan_backstop_overrides_state2a_delete(monkeypatch, clean_helpers):
+    # THE behavioural fix: a stale branch whose every commit is already on a
+    # remote would be a State-2a delete — but being an orphan keeps it. This is
+    # exactly the tick/.tick worktree harvest path the guardrail closes.
+    monkeypatch.setattr(pw, "branch_ahead_behind", lambda r, b, base: (5, 0))
+    monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 0)
+    monkeypatch.setattr(pw, "ref_last_update_age_days", lambda r, ref, now: 90.0)
+    monkeypatch.setattr(pw, "branch_shares_history", lambda r, b, base: False)
+    # A non-sacred-named orphan so the STRUCTURAL guard is what protects it
+    # (a sacred name like `tick` would be kept one gate earlier).
+    out = _classify(_no_pr_fake("ledger"), _entry("/wt", branch="ledger"),
+                    default_branch="main")
+    assert out["decision"] == "skip"
+    assert "unrelated history" in out["reason"]
+    assert "all_commits_remote" not in out
+
+
+def test_classify_keeps_branch_when_shared_history_unverifiable(
+    monkeypatch, clean_helpers
+):
+    # merge-base could not determine a verdict (None: e.g. the local default ref
+    # is absent) → bias to keep, mirroring the remote-protection guard.
+    monkeypatch.setattr(pw, "branch_shares_history", lambda r, b, base: None)
+    out = _classify_lb(FakeGHClient(), "feature", default_branch="main")
+    assert out["decision"] == "skip"
+    assert "could not verify shared history" in out["reason"]
+
+
+def test_orphan_backstop_runs_before_pr_lookup(monkeypatch, clean_helpers):
+    # An orphan short-circuits ahead of the closed-PR network lookup.
+    monkeypatch.setattr(pw, "branch_shares_history", lambda r, b, base: False)
+    fake = FakeGHClient(closed_prs_for_head={
+        ("o/r", "ledger"): [_closed("o/r", 3, head_ref="ledger")]
+    })
+    out = _classify_lb(fake, "ledger", default_branch="main")
+    assert out["decision"] == "skip" and "unrelated history" in out["reason"]
+    assert fake.call_count["closed_prs_for_head"] == 0
+
+
+def test_orphan_check_skipped_when_default_unknown(monkeypatch, clean_helpers):
+    # With no resolvable default branch the structural check cannot run; it must
+    # NOT fire (and must not even call the helper). The branch falls through to
+    # the normal no-PR path (kept here, with unpushed work).
+    monkeypatch.setattr(pw, "branch_unpushed_commit_count", lambda r, b: 1)
+
+    def boom(r, b, base):  # pragma: no cover - must never be called
+        raise AssertionError("branch_shares_history called with no default")
+    monkeypatch.setattr(pw, "branch_shares_history", boom)
+    out = _classify_lb(_no_pr_fake("feature"), "feature", default_branch=None)
+    assert out["decision"] == "skip" and "no merged/closed PR" in out["reason"]
 
 
 def test_configured_sacred_branch_kept_end_to_end(

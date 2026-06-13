@@ -309,6 +309,7 @@ from gitbulk.worktree import (  # noqa: E402
     WorktreeEntry,
     branch_ahead_behind,
     branch_contained_in,
+    branch_shares_history,
     branch_unpushed_commit_count,
     delete_branch_all_commits_remote,
     delete_branch_trusting_local_default,
@@ -494,6 +495,34 @@ def test_branch_unpushed_commit_count_bad_output_raises():
     ):
         with pytest.raises(WorktreeError):
             branch_unpushed_commit_count(Path("/r"), "feat")
+
+
+def test_branch_shares_history_true_when_merge_base_found():
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout="abc123\n", returncode=0),
+    ) as mock_run:
+        assert branch_shares_history(Path("/r"), "feat", "main") is True
+    argv = mock_run.call_args[0][0]
+    assert argv[-3:] == ["merge-base", "refs/heads/main", "feat"]
+
+
+def test_branch_shares_history_false_for_unrelated_histories():
+    # git merge-base exits 1 (no common ancestor) for an orphan branch.
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stdout="", returncode=1),
+    ):
+        assert branch_shares_history(Path("/r"), "tick", "main") is False
+
+
+def test_branch_shares_history_none_on_git_error():
+    # Any other exit (e.g. 128: base ref absent) → can't determine → None.
+    with patch(
+        "gitbulk.worktree.subprocess.run",
+        side_effect=lambda *a, **k: _completed(stderr="fatal", returncode=128),
+    ):
+        assert branch_shares_history(Path("/r"), "feat", "nope") is None
 
 
 def test_local_branch_upstreams_parses_and_strips():
