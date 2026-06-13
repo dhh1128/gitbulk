@@ -145,8 +145,9 @@ run first.
 Deletes remote branches whose only PRs are merged or closed. It **never
 deletes** the default branch, a protected branch, a [sacred-named
 branch](configuration.md#sacred_branches--branches-the-prune-commands-must-never-delete)
-(`main`/`master` or a configured name), the head of an open PR, or the base of
-an open PR (the stacked-PR case), and never touches fork branches.
+(`main`/`master`, `gh-pages`/`tick`, or a configured name), an **orphan branch**
+that shares no history with the default branch, the head of an open PR, or the
+base of an open PR (the stacked-PR case), and never touches fork branches.
 Deletion goes through the GitHub ref API (not `git push --delete`), and the
 deleted SHA is recorded for recovery.
 

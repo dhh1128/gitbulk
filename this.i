@@ -1166,6 +1166,37 @@ Gitbulk Triage Tool = goal:
             cannot run. No opt-out flag: harvesting an unrelated-history branch
             is never desired; the user removes such a branch by hand if ever
             needed.
+
+            EXTENDED TO prune-branches 2026-06-13 (user: "do the same for
+            prune-branches"), but proportionate to its DIFFERENT architecture.
+            prune-branches is clone-free (no local git), so the structural check
+            uses the GitHub compare API, whose "No common ancestor" 404 is the
+            orphan signal (verified live: compare main...tick on dhh1128/gitbulk
+            returns HTTP 404 "No common ancestor"). Crucially, prune-branches has
+            NO no-PR delete path — unlike prune-worktrees' State-2a, it deletes a
+            branch ONLY when that branch has a merged/closed UPSTREAM PR
+            (guard 6). So the real orphan branches (tick, gh-pages) — which carry
+            NO PR — are already kept at guard 6, and now ALSO at the cheap
+            sacred-name guard (gh-pages/tick added to SACRED_BRANCH_NAMES, which
+            prune-branches shares), which is the primary, zero-cost protection.
+            The structural addition: the existing ``branch_ahead_by`` compare
+            call's "No common ancestor" GHError is mapped to an explicit
+            "orphan branch — never auto-pruned" skip (helper
+            ``_is_no_common_ancestor``) instead of the generic "could not verify
+            merge state" — clearer report, true structural recognition, ZERO
+            extra API cost (reuses a call already made).
+            DELIBERATELY NOT gated: the tip-unchanged "merged PR" shortcut
+            (``pr.merged and branch.sha == pr.head_sha``), which deletes without
+            a compare call. Gating it would add a compare call to the HOTTEST
+            delete path (every routine merged-branch cleanup) to defend a case
+            that cannot arise for a real orphan: a tick/gh-pages branch never has
+            a merged PR into the default. The only branch reaching that shortcut
+            as an orphan is one a user deliberately PR-merged into the default
+            (merge-commit merge => shares history afterwards, safe to delete;
+            squash merge => the diff landed on the default and the deleted SHA is
+            audit-logged and recoverable via create_branch_ref). Adding the call
+            would also regress the prnpf8nq-optimized scan and the prnsh5kp SHA
+            cache for no real-world gain. Recorded as the one accepted residual.
           approved-by: daniel, 2026-06-13
 
     Prune Grace Period = decision:
