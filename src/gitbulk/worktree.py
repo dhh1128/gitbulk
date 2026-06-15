@@ -500,6 +500,44 @@ def branch_contained_in(repo_path: Path, base: str, branch: str) -> bool:
         ) from exc
 
 
+def branch_shares_history(
+    repo_path: Path, branch: str, base: str
+) -> bool | None:
+    """Whether ``branch`` and the LOCAL ``base`` share any common ancestor.
+
+    ``git merge-base refs/heads/<base> <branch>``:
+
+    * exit 0 (a merge base exists) → the two histories share at least one
+      commit → ``True``;
+    * exit 1 (git's "no merge base" status) → the histories are UNRELATED, i.e.
+      ``branch`` is an ORPHAN with no commit in common with ``base`` → ``False``;
+    * any other exit (e.g. ``base`` does not exist locally, ``128``) → cannot
+      determine → ``None``.
+
+    ``base`` is resolved as ``refs/heads/<base>`` — deliberately the LOCAL
+    branch, mirroring :func:`branch_ahead_behind` — so the check does not depend
+    on an upstream being configured.
+
+    An orphan branch is the signal prune-worktrees uses to NEVER auto-prune a
+    deliberately-detached, special-purpose branch: the ``tick`` ledger branch
+    (https://github.com/dhh1128/tick), an orphan ``gh-pages`` site branch, or a
+    standalone build/artifact branch. Such a branch can satisfy the State-2a
+    "every commit is already on a remote" delete gate (its commits live on
+    ``origin/<branch>``) and so would otherwise be harvested when stale, even
+    though removing it destroys a working setup the user maintains on purpose
+    (node prnorph7). ``None`` (can't verify) is treated by the caller as
+    keep — bias to safe — like the other unverifiable guards. Read-only.
+    """
+    completed = _git_run(
+        repo_path, "merge-base", f"refs/heads/{base}", branch, check=False
+    )
+    if completed.returncode == 0:
+        return True
+    if completed.returncode == 1:
+        return False
+    return None
+
+
 #: Extracts the ``@{<unixtime>}`` suffix from a ``%gd`` reflog selector.
 _REFLOG_UNIX = re.compile(r"@\{(\d+)\}")
 
@@ -622,6 +660,7 @@ __all__ = [
     "WorktreeError",
     "branch_ahead_behind",
     "branch_contained_in",
+    "branch_shares_history",
     "branch_unpushed_commit_count",
     "create_worktree",
     "delete_branch_all_commits_remote",

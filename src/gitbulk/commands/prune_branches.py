@@ -136,6 +136,20 @@ def _runid_from_run_dir(run_dir: Path) -> str:
 # ─── per-branch classification (the guardrails) ────────────────────────────
 
 
+def _is_no_common_ancestor(err: GHError) -> bool:
+    """Whether a compare-API failure is GitHub's "No common ancestor" 404.
+
+    That 404 means the two refs have UNRELATED histories — ``branch`` is an
+    ORPHAN with no commit in common with the default branch (the ``tick``
+    ledger, an orphan ``gh-pages`` site, a standalone build/artifact branch),
+    which is never auto-pruned (node prnorph7). Distinguished from a transient
+    or other failure so only a genuine orphan gets the orphan verdict; anything
+    else still biases to a plain "could not verify" skip. GitHub's message is
+    stable — ``No common ancestor between <base> and <head>.`` — verified
+    against the live API 2026-06-13."""
+    return "no common ancestor" in str(err).lower()
+
+
 def _classify_branch(
     gh,
     policy: Policy,
@@ -154,13 +168,17 @@ def _classify_branch(
 
       1. not the default branch
       2. not protected
-      3. not a sacred branch name — ``main``/``master`` or a configured
-         ``sacred_branches`` entry (shared with prune-worktrees via _common)
+      3. not a sacred branch name — ``main``/``master``, the orphan-convention
+         names ``gh-pages``/``tick``, or a configured ``sacred_branches`` entry
+         (shared with prune-worktrees via _common)
       4. not the head of any OPEN PR
       5. not the base of any OPEN PR (stacked-PR dependency)
       6. there IS a closed/merged PR for it on the UPSTREAM (not a fork)
       7. that PR is older than the grace period (node prgrc3kp)
-      8. no commit loss (node prdls2nq): the branch tip equals the merged
+      8. not an ORPHAN branch — it shares history with the default branch
+         (node prnorph7): the compare API's "No common ancestor" 404 keeps an
+         unrelated-history branch even when it carries a stray closed PR
+      9. no commit loss (node prdls2nq): the branch tip equals the merged
          PR's recorded head SHA, OR the branch is fully contained in the
          default branch
 
@@ -228,10 +246,11 @@ def _classify_deep(
     branch,
     now: datetime,
 ) -> dict:
-    """Guards 5-7 (node prnbr4kq): the closed-PR lookup, grace period, and
-    data-loss check (node prdls2nq). Each makes per-branch gh calls and is
-    the dominant scan cost, so it runs in the flattened Pass B of the
-    parallel scan. Any gh error or inconclusive check biases to ``skip``."""
+    """Guards 5-9 (node prnbr4kq): the closed-PR lookup, grace period, orphan
+    guard (node prnorph7), and data-loss check (node prdls2nq). Each makes
+    per-branch gh calls and is the dominant scan cost, so it runs in the
+    flattened Pass B of the parallel scan. Any gh error or inconclusive check
+    biases to ``skip``."""
     name = branch.name
     base = {"slug": slug, "branch": name, "sha": branch.sha}
     try:
@@ -275,6 +294,25 @@ def _classify_deep(
     try:
         ahead = gh.branch_ahead_by(slug, default_branch, name)
     except GHError as e:
+        # ORPHAN guard (node prnorph7): a branch with NO commit in common with
+        # the default branch makes the compare API answer "No common ancestor"
+        # (HTTP 404). Recognise it explicitly and KEEP it — an unrelated-history
+        # branch (the tick ledger, an orphan gh-pages site, a build branch) is
+        # never auto-pruned, mirroring prune-worktrees and the shared sacred-name
+        # backstop that already covers the well-known gh-pages/tick names. A real
+        # orphan like those never has a merged PR into the default, so it does
+        # not reach the tip-unchanged shortcut above; this clause catches the
+        # ones that DO carry a stray closed/merged PR. Any OTHER compare failure
+        # biases to a plain skip as before (fail safe, prdls2nq).
+        if _is_no_common_ancestor(e):
+            return {
+                **base,
+                "decision": "skip",
+                "reason": (
+                    f"unrelated history to default '{default_branch}' "
+                    f"(orphan branch — never auto-pruned)"
+                ),
+            }
         return {
             **base,
             "decision": "skip",

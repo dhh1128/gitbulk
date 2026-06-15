@@ -1118,6 +1118,87 @@ Gitbulk Triage Tool = goal:
             remote candidates that re-check is now ours.
           approved-by: daniel, 2026-06-06
 
+        Prune Never Harvests Orphan Branches = decision:
+          id: prnorph7
+          why: >
+            Gap the user identified 2026-06-13: prune-worktrees recommended (and
+            with --apply would harvest) ORPHAN branches — branches deliberately
+            detached from the default branch with NO commit in common. The
+            motivating case is the ``tick`` ledger branch
+            (https://github.com/dhh1128/tick), an orphan branch checked out in a
+            ``.tick`` linked worktree, which the ``tick`` CLI pushes to
+            ``origin/tick``. Trace: an orphan has no merge base with the default
+            branch, so ``branch_ahead_behind`` reports ahead>0 (State-1 cannot
+            fire) and ``branch_contained_in`` is false (State-2b cannot fire) —
+            but EVERY commit is on ``origin/tick`` so
+            ``branch_unpushed_commit_count == 0``, which together with reflog
+            staleness makes State-2a (prdls2nq) classify it deletable. No git
+            data is lost (the commits survive on the remote), but removing the
+            ``.tick`` worktree and force-deleting the local ``tick`` branch
+            destroys a working setup the user maintains on purpose and must
+            re-create. The same path harvests an orphan ``gh-pages`` site branch.
+
+            Resolution — TWO additive, bias-to-keep layers (a branch can only
+            ever be KEPT by them, never deleted; neither weakens prdls2nq or any
+            other guard):
+            (1) STRUCTURAL — a new read-only helper
+            ``worktree.branch_shares_history`` runs ``git merge-base
+            refs/heads/<default> <branch>``: exit 0 → shares history (normal
+            logic); exit 1 (git's "no merge base") → UNRELATED/orphan → keep;
+            any other exit → can't verify → keep (mirrors "could not verify
+            remote branch protection"). Wired into _classify_branch_by_pr right
+            after the open-PR-head gate and BEFORE the closed-PR network lookup,
+            so an orphan short-circuits the gh call. It runs only when the
+            default branch is known; the precision is high because a normal
+            feature branch ALWAYS descends from the default branch's history, so
+            only deliberately-orphaned special-purpose branches lack a merge
+            base (near-zero false positives). One cheap local merge-base per
+            surviving candidate, negligible next to the per-branch
+            closed_prs_for_head network call already made.
+            (2) NAME-BASED — ``gh-pages`` and ``tick`` JOIN the
+            universally-sacred SACRED_BRANCH_NAMES set in _common (chosen
+            2026-06-13 by the user over a separate config key, since the existing
+            sacred mechanism already exists and is shared with prune-branches, so
+            the names are protected from REMOTE deletion too). This is the
+            fallback for the two gaps the structural layer leaves: a NON-orphan
+            ``gh-pages`` that was branched off the default (shares history), and
+            the case where the default branch can't be resolved so merge-base
+            cannot run. No opt-out flag: harvesting an unrelated-history branch
+            is never desired; the user removes such a branch by hand if ever
+            needed.
+
+            EXTENDED TO prune-branches 2026-06-13 (user: "do the same for
+            prune-branches"), but proportionate to its DIFFERENT architecture.
+            prune-branches is clone-free (no local git), so the structural check
+            uses the GitHub compare API, whose "No common ancestor" 404 is the
+            orphan signal (verified live: compare main...tick on dhh1128/gitbulk
+            returns HTTP 404 "No common ancestor"). Crucially, prune-branches has
+            NO no-PR delete path — unlike prune-worktrees' State-2a, it deletes a
+            branch ONLY when that branch has a merged/closed UPSTREAM PR
+            (guard 6). So the real orphan branches (tick, gh-pages) — which carry
+            NO PR — are already kept at guard 6, and now ALSO at the cheap
+            sacred-name guard (gh-pages/tick added to SACRED_BRANCH_NAMES, which
+            prune-branches shares), which is the primary, zero-cost protection.
+            The structural addition: the existing ``branch_ahead_by`` compare
+            call's "No common ancestor" GHError is mapped to an explicit
+            "orphan branch — never auto-pruned" skip (helper
+            ``_is_no_common_ancestor``) instead of the generic "could not verify
+            merge state" — clearer report, true structural recognition, ZERO
+            extra API cost (reuses a call already made).
+            DELIBERATELY NOT gated: the tip-unchanged "merged PR" shortcut
+            (``pr.merged and branch.sha == pr.head_sha``), which deletes without
+            a compare call. Gating it would add a compare call to the HOTTEST
+            delete path (every routine merged-branch cleanup) to defend a case
+            that cannot arise for a real orphan: a tick/gh-pages branch never has
+            a merged PR into the default. The only branch reaching that shortcut
+            as an orphan is one a user deliberately PR-merged into the default
+            (merge-commit merge => shares history afterwards, safe to delete;
+            squash merge => the diff landed on the default and the deleted SHA is
+            audit-logged and recoverable via create_branch_ref). Adding the call
+            would also regress the prnpf8nq-optimized scan and the prnsh5kp SHA
+            cache for no real-world gain. Recorded as the one accepted residual.
+          approved-by: daniel, 2026-06-13
+
     Prune Grace Period = decision:
       id: prgrc3kp
       why: >

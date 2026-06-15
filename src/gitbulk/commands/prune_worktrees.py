@@ -56,6 +56,7 @@ from gitbulk.worktree import (
     WorktreeError,
     branch_ahead_behind,
     branch_contained_in,
+    branch_shares_history,
     branch_unpushed_commit_count,
     delete_branch_all_commits_remote,
     delete_branch_trusting_local_default,
@@ -178,10 +179,14 @@ def _classify_branch_by_pr(
     ``protected_upstreams`` is ``None`` the remote protection could not be
     fetched, so we refuse (bias to safe). A name-based backstop runs first and
     unconditionally keeps any branch whose LOCAL name is the repo's GitHub
-    default branch or a sacred default name (``main``/``master``), since the
-    remote-driven guard keys off the upstream and silently misses default-ish
-    branches with no upstream or a stale one (see
-    :func:`gitbulk.commands._common.sacred_branch_names`).
+    default branch or a sacred default name (``main``/``master`` plus the
+    orphan-convention names ``gh-pages``/``tick``), since the remote-driven
+    guard keys off the upstream and silently misses default-ish branches with no
+    upstream or a stale one (see
+    :func:`gitbulk.commands._common.sacred_branch_names`). A STRUCTURAL backstop
+    then keeps any branch that shares NO history with the default branch — an
+    orphan branch (node prnorph7,
+    :func:`gitbulk.worktree.branch_shares_history`).
 
     Returns a ``delete`` when, after the protection/open-PR gates, the branch
     HAS a merged/closed upstream PR past the grace period and no unpushed
@@ -223,6 +228,39 @@ def _classify_branch_by_pr(
 
     if branch in open_heads:
         return {**base, "decision": "skip", "reason": "branch is head of an open PR"}
+
+    # Structural backstop (defense in depth): never auto-prune a branch that
+    # shares NO history with the repo's default branch — an ORPHAN branch with
+    # no common ancestor (the ``tick`` defect ledger, an orphan ``gh-pages``
+    # site, a standalone build/artifact branch). These are deliberately
+    # detached, long-lived, special-purpose branches, not stale feature work;
+    # harvesting one (it can satisfy State-2a once every commit is on
+    # ``origin/<branch>`` and it goes stale) destroys a working setup the user
+    # maintains on purpose (node prnorph7). Like the sacred-name backstop above
+    # this is additive — it can only ever KEEP a branch. Short-circuits ahead of
+    # the closed-PR network lookup. When the default branch is unknown we cannot
+    # run the check and fall through; the sacred-name set (which now includes
+    # gh-pages/tick) is the name-based fallback for that case. An unverifiable
+    # result (None: e.g. the local default ref is absent) biases to keep,
+    # mirroring "could not verify remote branch protection" above.
+    if default_branch is not None:
+        shares = branch_shares_history(clone_path, branch, default_branch)
+        if shares is False:
+            return {
+                **base, "decision": "skip",
+                "reason": (
+                    f"unrelated history to default branch '{default_branch}' "
+                    f"(orphan branch — never auto-pruned)"
+                ),
+            }
+        if shares is None:
+            return {
+                **base, "decision": "skip",
+                "reason": (
+                    "could not verify shared history with default branch "
+                    f"'{default_branch}'"
+                ),
+            }
 
     try:
         closed = gh.closed_prs_for_head(slug, branch)

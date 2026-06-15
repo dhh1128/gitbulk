@@ -329,6 +329,44 @@ def test_classify_skips_when_ahead_by_errors():
     assert out["decision"] == "skip" and "could not verify merge state" in out["reason"]
 
 
+def test_classify_keeps_orphan_branch_no_common_ancestor():
+    # An orphan branch (no commit in common with the default) carrying a stray
+    # closed PR: the compare API answers "No common ancestor" (HTTP 404), which
+    # is recognised as an orphan and KEPT, not deleted (node prnorph7). Tip
+    # differs from the PR head so the shortcut is not taken and ahead_by runs.
+    pr = _closed("o/r", 1, head_ref="ledger", head_sha="z" * 40, days_ago=30)
+    fake = FakeGHClient(
+        closed_prs_for_head={("o/r", "ledger"): [pr]},
+        branch_ahead_by={
+            ("o/r", "main", "ledger"): GHError(
+                "gh failed: No common ancestor between main and ledger. "
+                "(HTTP 404)"
+            )
+        },
+    )
+    out = _classify_branch(
+        fake, _policy(), "o/r", "main", _br(name="ledger", sha="a" * 40),
+        set(), set(), NOW,
+    )
+    assert out["decision"] == "skip"
+    assert "unrelated history to default 'main'" in out["reason"]
+    assert "orphan branch" in out["reason"]
+
+
+def test_classify_keeps_gh_pages_and_tick_by_sacred_name():
+    # gh-pages and tick are now universally-sacred (node prnorph7), so a remote
+    # branch of either name is kept at the cheap guard with no PR lookup — the
+    # primary protection for the real orphan branches, since they have no PR.
+    for name in ("gh-pages", "tick"):
+        fake = FakeGHClient()
+        out = _classify_branch(
+            fake, _policy(), "o/r", "main", _br(name=name), set(), set(), NOW
+        )
+        assert out["decision"] == "skip", name
+        assert "never auto-pruned" in out["reason"], name
+        assert fake.call_count["closed_prs_for_head"] == 0, name
+
+
 def test_classify_closed_unmerged_fully_merged_is_deletable():
     # A closed-but-unmerged PR whose branch turns out fully merged anyway.
     pr = _closed("o/r", 1, head_ref="feat", head_sha="z" * 40, merged=False, days_ago=30)

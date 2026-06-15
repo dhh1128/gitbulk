@@ -37,7 +37,18 @@ from gitbulk.invariants.base import Invariant, InvariantKind
 #: own default branch (and ``prune-branches`` also honours GitHub branch
 #: protection), so this set is purely additive — it only ever keeps MORE
 #: branches and can never cause a deletion.
-SACRED_BRANCH_NAMES: frozenset[str] = frozenset({"main", "master"})
+#:
+#: ``gh-pages`` and ``tick`` join the universally-sacred set (node prnorph7):
+#: both are well-known ORPHAN-branch conventions — a GitHub Pages publish
+#: branch and the ``tick`` defect-ledger branch — that are deliberately
+#: long-lived and detached from the default branch, never stale feature work.
+#: The structural orphan guard (:func:`gitbulk.worktree.branch_shares_history`)
+#: already protects any unrelated-history branch, but these names are the
+#: name-based backstop that also covers a NON-orphan ``gh-pages`` and the case
+#: where the default branch can't be resolved to run the structural check.
+SACRED_BRANCH_NAMES: frozenset[str] = frozenset(
+    {"main", "master", "gh-pages", "tick"}
+)
 
 
 def apply_prune_min_age_override(
