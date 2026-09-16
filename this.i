@@ -1250,6 +1250,43 @@ Gitbulk Triage Tool = goal:
         closed → skip.
       approved-by: daniel, 2026-06-03
 
+    Prune Never Cleans Up After Other People = decision:
+      id: prathun7
+      why: >
+        prdls2nq asks "would deleting this ref lose work?" That is the only
+        question the guards asked, and it is the wrong question to ask alone,
+        because it is answered entirely from the repo's own history and never
+        from whose repo it is. A branch can be provably redundant and still not
+        be ours to delete. Observed on a real fleet 2026-09-16: a dry run
+        proposed 205 deletions, 66 of them in repos the user does not own —
+        SmithSamuelM-patch-1/6/7/13 on WebOfTrust/keripy (Sam Smith's), the
+        long-lived `development` branch on WebOfTrust/signify-ts (a CLOSED,
+        never-merged PR by lenkan that the fully-merged-into-default arm
+        accepted), plus branches on martinthomson/i-d-template, w3c, GLEIF-IT
+        and keri-foundation. Every one passed the data-loss guard. Deleting
+        another maintainer's branch in their repo at 3am is not recoverable by
+        `recover-branch` in the way that matters: the ref comes back, the
+        standing does not.
+
+        So the governing PR's author is now a guard of its own. A branch is
+        prunable only when the merged-or-closed PR that justifies deleting it
+        was authored by the authenticated viewer. gitbulk cleans up after
+        itself and after nobody else. The rule is deliberately about
+        AUTHORSHIP, not permission: viewer_repo_permission would answer "may
+        I?" when the question is "is this mine?", and on a repo where the user
+        holds write access — which is exactly where the hazard is real, since
+        without it the delete merely fails — permission answers yes. It is
+        also deliberately not an owner/org allowlist: the CLI --org/--repo
+        filters already express scope, a list would need maintaining, and the
+        common safe case (the user's own merged branch in a shared org repo
+        like provenant-dev, 380 of those 205-run candidates) should keep
+        working without configuration.
+
+        Fails closed, per prdls2nq: an unknown or absent author is a skip, not
+        a delete. The reason string names the author so the kept-item line
+        explains itself.
+      approved-by: daniel, 2026-09-16
+
     Prune Deletes Remote Branch Via Ref API = decision:
       id: prdel4rq
       why: >
@@ -2203,6 +2240,67 @@ Gitbulk Triage Tool = goal:
         daily-glyph channel and reserves email for things that are actually
         broken (consistent with tmlk5pq3's "stuck lock is a structural issue
         surfaced via cron's failure channel, not the daily attention glyph").
+
+    Report Surfaces Unresolved Review Threads = decision:
+      id: rpthr2sv
+      why: >
+        The count of unresolved review threads is already fetched for every PR
+        the report sees — reviewThreads(first: 100) rides in the shared GraphQL
+        document and is parsed into PRInfo.unresolved_thread_count — and the
+        report then throws it away. It is not in state.yaml, not in summary.md,
+        and not in the exit code. Only `merge` consulted it, via the merge-only
+        pr.no_unresolved_threads invariant, which writes the finding to
+        invariants.log and nowhere a human looks. On a real fleet 2026-09-16
+        that hid 11 unresolved threads across 6 PRs behind a line reading "0
+        eligible PRs to merge".
+
+        That is the single most actionable fact the report can carry. It is the
+        one signal on a PR that is unambiguously waiting on the user
+        specifically — checks turn green by themselves, review decisions arrive
+        on someone else's schedule, but an unresolved thread stays unresolved
+        until its author answers it. It is also bounded (6 PRs, not the 35 the
+        ATTENTION tag covers), which is what makes it mailable at all.
+
+        Explicitly NOT done: adding pr.no_unresolved_threads to the report
+        chain. It is a Skip-producing invariant, so a PR with unresolved
+        threads would stop counting as ATTENTION and drop out of the triage
+        list — the change would hide precisely the PRs it was meant to raise.
+        The invariant chain is a merge gate; the report is a display surface,
+        and the right move is to display the number, not to gate on it. The
+        field is therefore carried on the PR record and rendered, leaving
+        ATTENTION semantics untouched.
+      approved-by: daniel, 2026-09-16
+
+    Actionable Digest Is A Third Email Channel = decision:
+      id: dgcha7vv
+      why: >
+        Extends tp4kq2nr, which split cron's channels two ways: email for
+        structural failure, sentinel/glyph for routine attention. That split
+        assumed attention is unbounded ("fires ~nightly for a large fleet") and
+        therefore unmailable, and for the 35-PR ATTENTION list it is right.
+        rpthr2sv produces something the split has no bucket for: a set that is
+        both actionable and small. Sending it by mail is not a regression to
+        the noisy channel, it is a different set.
+
+        Precedent is gitbulk-merge-notify, which already mails on a positive
+        event (a run that acted) by testing summary.md for a section header.
+        Rather than repeat that grep — AGENTS.md wants bin/ scripts trivial and
+        section-extraction in shell is where that erodes — the digest is its
+        own run artifact, digest.md, written only when there is something to
+        say and absent otherwise. The wrapper reduces to "if the file is
+        non-empty, cat it", which is the whole of its logic, and the decision
+        about what is worth waking someone for stays in Python under test.
+
+        Sized for the medium: digest.md is a mail body, so it is the PR list
+        and nothing else — no repo counts, no skip inventory, no filter line.
+        summary.md remains the full picture for `gitbulk show`.
+
+        Why this matters now: the user is deleting the GitHub notification
+        email that used to carry Copilot review comments. That channel was the
+        de-facto backstop for "a review is waiting on you", and removing it
+        without replacing it would leave the signal computed nightly and
+        delivered nowhere.
+      approved-by: daniel, 2026-09-16
 
     Semantic Terminal Color And Glyphs = decision:
       id: clr7sgqm
