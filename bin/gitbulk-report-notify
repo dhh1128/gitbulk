@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Nightly `gitbulk report` with an ACTIONABLE-DIGEST email channel.
+#
+# Companion to `gitbulk-cron`, and the sibling of `gitbulk-merge-notify`. It
+# runs `gitbulk-cron report` (so all of the wrapper's logging, locking,
+# log-retention and exit-code symlinks still apply) and then decides what --
+# if anything -- to put on stdout, which is what cron mails to MAILTO.
+#
+# Email policy (a superset of gitbulk-cron's failure-only policy):
+#   * Structural failure (gitbulk-cron exit 1 / unexpected): gitbulk-cron
+#     already writes a one-line status to stdout; we pass it through, so the
+#     existing failure email still fires.
+#   * A run that found something WAITING ON THE USER: `report` writes
+#     digest.md into the run dir only when there are unresolved review
+#     threads or a recent merge broke CI (this.i nodes rpthr2sv, dgcha7vv).
+#     We mail it verbatim. Exit 2 keeps that email-silent on its own, which
+#     is why the ATTENTION list alone was never enough: it covers nearly
+#     every open PR, while the digest is the bounded subset.
+#   * A quiet night: report writes no digest -> nothing on stdout -> no email.
+#
+# Deliberately trivial (AGENTS.md: "no Bash logic of consequence"). All of
+# the judgment about what is worth mailing lives in Python under test; this
+# script only asks whether the file exists and is non-empty. It does NOT
+# grep or slice summary.md -- that is what the separate artifact buys.
+#
+# Staleness is a non-issue by construction: digest.md lives inside the run
+# directory, and latest-report is repointed by this run, so an absent digest
+# can never be shadowed by a previous night's file.
+#
+# Exit code is gitbulk-cron's, untouched, so the exit-code-aware symlinks and
+# any downstream interpretation stay consistent.
+#
+# Usage from crontab (mail only when something needs you):
+#   30 3 * * 1-5 /home/daniel/code/gitbulk/bin/gitbulk-report-notify
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WRAPPER="${HERE}/gitbulk-cron"
+CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/gitbulk"
+DIGEST="${CACHE_DIR}/runs/latest-report/digest.md"
+
+if [ ! -x "${WRAPPER}" ]; then
+    echo "gitbulk-report-notify: cannot find executable gitbulk-cron at ${WRAPPER}" >&2
+    exit 1
+fi
+
+# Run the report through the standard cron wrapper. Capture its stdout (which
+# the wrapper only writes on a structural failure) so we can re-emit it and
+# preserve the failure-only email path. Do NOT let a non-zero rc abort us.
+set +e
+cron_stdout="$("${WRAPPER}" report "$@")"
+rc=$?
+set -e 2>/dev/null || true
+
+# 1. Pass through gitbulk-cron's failure-only stdout verbatim.
+if [ -n "${cron_stdout}" ]; then
+    printf '%s\n' "${cron_stdout}"
+fi
+
+# 2. Actionable-digest channel: present and non-empty means the run found
+#    something waiting on the user. Mail it as-is; it is already written as
+#    a mail body rather than a report.
+if [ -s "${DIGEST}" ]; then
+    echo
+    cat "${DIGEST}"
+    echo
+    echo "full report: gitbulk show report"
+fi
+
+exit "${rc}"

@@ -279,6 +279,18 @@ class RunState:
     def write_summary(self, markdown: str) -> None:
         _atomic_write_text(self._run_dir / "summary.md", markdown)
 
+    def write_digest(self, markdown: str) -> None:
+        """Write ``digest.md`` — the mail-sized, actionable-only artifact
+        (node ``dgcha7vv``).
+
+        Distinct from ``summary.md``, which is the full picture for
+        ``gitbulk show``. A run with nothing worth waking someone for
+        never calls this, so the *absence* of the file is the signal the
+        cron wrapper tests; that keeps the wrapper's logic to "if it is
+        non-empty, mail it" and the editorial judgment here, under test.
+        """
+        _atomic_write_text(self._run_dir / "digest.md", markdown)
+
     def complete(self, exit_code: int, *, retain_runs: int | None = None) -> None:
         """Finalize the run.
 

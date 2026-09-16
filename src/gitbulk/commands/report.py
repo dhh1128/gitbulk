@@ -159,6 +159,74 @@ def _runid_from_run_dir(run_dir: Path) -> str:
     return head
 
 
+def _unresolved_thread_prs(
+    passing_repos: list[RepoEntry],
+    prs_by_repo: dict[str, list[PRInfo]],
+) -> list[PRInfo]:
+    """The PRs carrying at least one unresolved review thread, sorted by
+    (repo, number) — node ``rpthr2sv``.
+
+    Bot threads count, because Copilot's review comments are the bulk of
+    them and answering one is the same chore either way (the merge-gate
+    already takes that position; see ``pr.no_unresolved_threads``).
+    """
+    out = [
+        pr
+        for repo in passing_repos
+        for pr in prs_by_repo.get(repo.slug, [])
+        if pr.unresolved_thread_count > 0
+    ]
+    out.sort(key=lambda pr: (pr.slug, pr.number))
+    return out
+
+
+def _thread_lines(prs: list[PRInfo]) -> list[str]:
+    """Render the shared "N unresolved thread(s)" list used by both
+    summary.md and digest.md, so the two never drift."""
+    lines = []
+    for pr in prs:
+        n = pr.unresolved_thread_count
+        plural = "" if n == 1 else "s"
+        lines.append(f"{pr.url}  {n} unresolved thread{plural}  — {pr.title}")
+    return lines
+
+
+def _build_digest_md(
+    passing_repos: list[RepoEntry],
+    prs_by_repo: dict[str, list[PRInfo]],
+    watchdog_records: list[dict] | None = None,
+) -> str | None:
+    """The mail body (node ``dgcha7vv``), or ``None`` when the run found
+    nothing worth sending.
+
+    Deliberately narrow: the two things that are both bounded and waiting
+    specifically on the user — review threads nobody but the author can
+    answer, and CI that yesterday's merge broke. Everything else the run
+    knows stays in summary.md. Counts, skip inventories and the filter
+    line are omitted on purpose; this is a mail, not a report.
+    """
+    threads_prs = _unresolved_thread_prs(passing_repos, prs_by_repo)
+    broken = [r for r in (watchdog_records or []) if r.get("has_failure")]
+    if not threads_prs and not broken:
+        return None
+
+    lines = ["# gitbulk: waiting on you", ""]
+    if threads_prs:
+        lines.append(f"## Unresolved review threads ({len(threads_prs)})")
+        lines.extend(_thread_lines(threads_prs))
+        lines.append("")
+    if broken:
+        lines.append(f"## CI broken by a recent merge ({len(broken)})")
+        for rec in broken:
+            names = ", ".join(c.name for c in rec.get("failures", []))
+            lines.append(
+                f"https://github.com/{rec['slug']}/pull/{rec['number']}  "
+                f"failing: {names}  — {rec['title']}"
+            )
+        lines.append("")
+    return "\n".join(lines)
+
+
 def _build_summary_md(
     policy: Policy,
     all_repos: list[RepoEntry],
@@ -180,11 +248,13 @@ def _build_summary_md(
         lines.append("")
         return "\n".join(lines)
 
+    threads_prs = _unresolved_thread_prs(passing_repos, prs_by_repo)
     lines.append(
         f"Configured repos: {len(all_repos)}  "
         f"Reachable: {len(passing_repos)}  "
         f"Skipped: {len(skipped_repos)}  "
-        f"PRs needing attention: {attention_count}"
+        f"PRs needing attention: {attention_count}  "
+        f"PRs with unresolved review threads: {len(threads_prs)}"
     )
     if filter_line:
         lines.append(filter_line)
@@ -210,6 +280,15 @@ def _build_summary_md(
                 f"- `{rec['slug']}` #{rec['number']} *{rec['title']}* "
                 f"(merge={sha7}) — {tag}"
             )
+        lines.append("")
+
+    # Unresolved review threads (node rpthr2sv). Sits high, directly after
+    # the watchdog, for the same reason: it is the subset of the open-PR
+    # list that is waiting on the user rather than on CI or a reviewer, and
+    # it is short enough to read. The PRs still appear in full below.
+    if threads_prs:
+        lines.append(f"## Unresolved review threads ({len(threads_prs)})")
+        lines.extend(_thread_lines(threads_prs))
         lines.append("")
 
     if skipped_repos:
@@ -263,6 +342,7 @@ def _build_summary_md(
             f"base={pr.base_ref} "
             f"checks={pr.checks_status or 'n/a'} "
             f"review={pr.review_decision or 'n/a'} "
+            f"threads={pr.unresolved_thread_count} "
             f"mergeable={pr.mergeable_state or 'n/a'}{draft}  "
             f"{status}  — {pr.title}"
         )
@@ -750,6 +830,8 @@ def _run_under_lock(
                     "mergeable_state": pr.mergeable_state,
                     "review_decision": pr.review_decision,
                     "checks_status": pr.checks_status,
+                    # node rpthr2sv — fetched for every PR, previously dropped
+                    "unresolved_thread_count": pr.unresolved_thread_count,
                     "labels": list(pr.labels),
                     "invariants_passed": is_attention,
                     "invariants_skips": [
@@ -799,6 +881,15 @@ def _run_under_lock(
         filter_line=fline,
     )
     rs.write_summary(summary_md)
+
+    # 9b. digest.md — written only when the run has something that is
+    # actually waiting on the user (node dgcha7vv). Its absence is what
+    # keeps the cron wrapper quiet, so do not write an empty file.
+    digest_md = _build_digest_md(
+        passing_repos, prs_by_repo, watchdog_records=watchdog_records
+    )
+    if digest_md is not None:
+        rs.write_digest(digest_md)
 
     # 10. Compute exit code. Skipped repos.txt entries count toward
     # EXIT_INVARIANT_SKIPPED (3) — they're things the user can fix that

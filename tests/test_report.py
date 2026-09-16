@@ -26,6 +26,7 @@ from gitbulk.commands.report import (
     EXIT_OK,
     EXIT_OVERRIDES_APPLIED,
     EXIT_STRUCTURAL_FAILURE,
+    _build_digest_md,
     _build_summary_md,
     _runid_from_run_dir,
     report_handler,
@@ -101,8 +102,10 @@ def _make_pr(
     author: str = "dhh1128",
     base_ref: str = "main",
     title: str | None = None,
+    unresolved_threads: int = 0,
 ) -> PRInfo:
     return PRInfo(
+        unresolved_thread_count=unresolved_threads,
         slug=slug,
         number=number,
         title=title or f"PR #{number} title",
@@ -937,6 +940,145 @@ def test_build_summary_md_with_pr_skip_lines(
     assert "[DRAFT]" in md
     assert "pr.base_is_default" in md
     assert "wrong base" in md
+
+
+# ─── Unresolved review threads + digest.md (nodes rpthr2sv, dgcha7vv) ──────
+
+
+def _threads_fixture(code_root, write_config):
+    """A one-repo policy plus two PRs, one of which has unresolved threads."""
+    from gitbulk.config.policy import load_policy
+    from gitbulk.config.repos import RepoEntry
+
+    write_config(repos_slugs=["x/a"])
+    repo = RepoEntry(
+        slug="x/a", owner="x", name="a", local_path=code_root / "a",
+        source_line=1,
+    )
+    noisy = _make_pr(slug="x/a", number=7, unresolved_threads=3,
+                     title="Has feedback")
+    quiet = _make_pr(slug="x/a", number=8, title="All answered")
+    return load_policy(), repo, noisy, quiet
+
+
+def _record_for(pr) -> dict:
+    return {
+        "number": pr.number, "title": pr.title, "url": pr.url,
+        "author": pr.author, "state": "OPEN", "is_draft": False,
+        "base_ref": pr.base_ref, "head_ref": pr.head_ref,
+        "mergeable_state": pr.mergeable_state,
+        "review_decision": pr.review_decision,
+        "checks_status": pr.checks_status,
+        "unresolved_thread_count": pr.unresolved_thread_count,
+        "labels": [], "invariants_passed": True,
+        "invariants_skips": [], "invariants_fail_reason": None,
+    }
+
+
+def test_summary_md_surfaces_unresolved_threads(
+    isolated_xdg, code_root, write_config
+):
+    """The count is fetched for every PR; the report must show it rather
+    than drop it (node rpthr2sv)."""
+    policy, repo, noisy, quiet = _threads_fixture(code_root, write_config)
+    md = _build_summary_md(
+        policy, [repo], passing_repos=[repo], skipped_repos=[],
+        prs_by_repo={"x/a": [noisy, quiet]},
+        pr_records_by_repo={"x/a": [_record_for(noisy), _record_for(quiet)]},
+        attention_count=2,
+    )
+    assert "PRs with unresolved review threads: 1" in md
+    assert "## Unresolved review threads (1)" in md
+    assert f"{noisy.url}  3 unresolved threads  — Has feedback" in md
+    # Every PR line carries the field, so `grep threads=` is complete.
+    assert "threads=3" in md and "threads=0" in md
+    # The quiet PR is not listed in the dedicated section.
+    section = md.split("## Unresolved review threads")[1].split("##")[0]
+    assert quiet.url not in section
+
+
+def test_summary_md_singular_thread_wording(
+    isolated_xdg, code_root, write_config
+):
+    policy, repo, _, _ = _threads_fixture(code_root, write_config)
+    one = _make_pr(slug="x/a", number=9, unresolved_threads=1, title="One")
+    md = _build_summary_md(
+        policy, [repo], passing_repos=[repo], skipped_repos=[],
+        prs_by_repo={"x/a": [one]},
+        pr_records_by_repo={"x/a": [_record_for(one)]},
+        attention_count=1,
+    )
+    assert "1 unresolved thread  — One" in md
+
+
+def test_summary_md_omits_thread_section_when_all_resolved(
+    isolated_xdg, code_root, write_config
+):
+    policy, repo, _, quiet = _threads_fixture(code_root, write_config)
+    md = _build_summary_md(
+        policy, [repo], passing_repos=[repo], skipped_repos=[],
+        prs_by_repo={"x/a": [quiet]},
+        pr_records_by_repo={"x/a": [_record_for(quiet)]},
+        attention_count=1,
+    )
+    assert "PRs with unresolved review threads: 0" in md
+    assert "## Unresolved review threads" not in md
+
+
+def test_digest_is_none_when_nothing_waits(isolated_xdg, code_root, write_config):
+    """A quiet night writes no digest at all — its absence is what keeps
+    the cron wrapper silent (node dgcha7vv)."""
+    _, repo, _, quiet = _threads_fixture(code_root, write_config)
+    assert _build_digest_md([repo], {"x/a": [quiet]}) is None
+    assert _build_digest_md([repo], {"x/a": [quiet]}, watchdog_records=[]) is None
+    # A watchdog record that did NOT fail is not a reason to mail.
+    ok = [{"slug": "x/a", "number": 1, "title": "t", "has_failure": False}]
+    assert _build_digest_md([repo], {"x/a": [quiet]}, watchdog_records=ok) is None
+
+
+def test_digest_lists_unresolved_threads(isolated_xdg, code_root, write_config):
+    _, repo, noisy, quiet = _threads_fixture(code_root, write_config)
+    digest = _build_digest_md([repo], {"x/a": [noisy, quiet]})
+    assert digest is not None
+    assert "## Unresolved review threads (1)" in digest
+    assert f"{noisy.url}  3 unresolved threads  — Has feedback" in digest
+    assert quiet.url not in digest
+    # A mail body, not a report: no counts/skips/filter furniture.
+    assert "Configured repos" not in digest
+
+
+def test_digest_includes_ci_broken_by_recent_merge(
+    isolated_xdg, code_root, write_config
+):
+    from gitbulk.pr_info import CheckRun
+
+    _, repo, _, quiet = _threads_fixture(code_root, write_config)
+    wd = [{
+        "slug": "x/a", "number": 42, "title": "Merged yesterday",
+        "has_failure": True,
+        "failures": [CheckRun(name="deploy", status="completed", conclusion="failure",
+                          details_url="https://ci.example/1", completed_at=None)],
+    }]
+    digest = _build_digest_md([repo], {"x/a": [quiet]}, watchdog_records=wd)
+    assert digest is not None
+    assert "## CI broken by a recent merge (1)" in digest
+    assert "https://github.com/x/a/pull/42  failing: deploy" in digest
+    assert "## Unresolved review threads" not in digest
+
+
+def test_digest_carries_both_sections(isolated_xdg, code_root, write_config):
+    from gitbulk.pr_info import CheckRun
+
+    _, repo, noisy, _ = _threads_fixture(code_root, write_config)
+    wd = [{
+        "slug": "x/a", "number": 42, "title": "Merged yesterday",
+        "has_failure": True,
+        "failures": [CheckRun(name="deploy", status="completed", conclusion="failure",
+                          details_url="https://ci.example/1", completed_at=None)],
+    }]
+    digest = _build_digest_md([repo], {"x/a": [noisy]}, watchdog_records=wd)
+    assert "## Unresolved review threads (1)" in digest
+    assert "## CI broken by a recent merge (1)" in digest
 
 
 # ─── CLI smoke: report subcommand invoked through main() ───────────────────

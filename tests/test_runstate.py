@@ -378,6 +378,14 @@ def test_write_summary(isolated_cache):
     assert (rs.run_dir / "summary.md").read_text().startswith("# Run Summary")
 
 
+def test_write_digest(isolated_cache):
+    rs = RunState.begin("report", [], {})
+    # Absent until written — the cron wrapper reads that absence as "quiet".
+    assert not (rs.run_dir / "digest.md").exists()
+    rs.write_digest("# waiting on you\n")
+    assert (rs.run_dir / "digest.md").read_text() == "# waiting on you\n"
+
+
 # ─── record_actor() ──────────────────────────────────────────────────────────
 
 

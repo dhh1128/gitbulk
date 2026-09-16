@@ -32,6 +32,21 @@ nightly; it's safe to run alongside local work and refreshes the
 [`ATTENTION` sentinel](running-unattended.md#surfacing-attention-in-your-shell)
 when a PR needs a look.
 
+Each PR line carries `threads=<n>`, the number of unresolved review threads on
+that PR, and any PR with `n > 0` is also listed in a short `## Unresolved
+review threads` section near the top of `summary.md`. Bot threads count, so
+this is where a Copilot review that nobody has answered shows up. Unlike
+`checks=` or `review=`, which resolve on someone else's schedule, an unresolved
+thread stays unresolved until you answer it — it is the one field on the line
+that is unambiguously waiting on you.
+
+When a run finds something in that category — unresolved threads, or CI broken
+by a merge in the last 24 hours — it also writes a third artifact, `digest.md`:
+a short, mail-sized list of just those PRs. A run with nothing waiting writes
+no digest at all. That absence is what
+[`bin/gitbulk-report-notify`](running-unattended.md#mailing-yourself-only-what-is-waiting-on-you)
+uses to stay quiet on ordinary nights.
+
 ### `summarize`
 
 Feeds a recent `report` run through a coding agent (Claude by default) with a

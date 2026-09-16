@@ -37,7 +37,9 @@ MAILTO=you@example.com
 
 # Read-only report at 03:00 on weekdays (Mon-Fri here; drop the `1-5` for every
 # day). Safe alongside local work; exit 2/3 refreshes ~/.cache/gitbulk/ATTENTION
-# for your shell prompt to flag.
+# for your shell prompt to flag. Swap `gitbulk-cron report` for
+# `gitbulk-report-notify` to also get mail on the nights something is actually
+# waiting on you -- see "Mailing yourself only what is waiting on you" below.
 0 3 * * 1-5 /home/you/code/gitbulk/bin/gitbulk-cron report
 
 # Weekly Claude-assisted triage at 04:00 Mondays. Reads the latest report,
@@ -93,6 +95,33 @@ The exit code drives both your inbox and the `ATTENTION` sentinel:
 Email is reserved for exit 1 / unexpected. Exit 2/3 would fire almost nightly
 for a large fleet, so they don't email; they refresh the `ATTENTION` sentinel,
 which your shell prompt can surface instead.
+
+## Mailing yourself only what is waiting on you
+
+The exit-code split above is deliberately coarse. Exit 2 means "at least one PR
+needs attention", which on a large fleet is nearly every open PR you have — too
+many to mail, which is why it doesn't. But a smaller, sharper set hides inside
+it: PRs with unresolved review threads, and PRs whose merge broke CI in the last
+24 hours. Those are bounded, and they are waiting on you specifically.
+
+`report` writes that set to `digest.md` in the run directory, and writes nothing
+when the set is empty. [`bin/gitbulk-report-notify`](#the-cron-entry-point) runs
+`report` through the normal cron wrapper and then mails the digest if there is
+one:
+
+```cron
+30 3 * * 1-5 /home/you/code/gitbulk/bin/gitbulk-report-notify
+```
+
+Use it *instead of* `gitbulk-cron report` — it is a superset, so the
+structural-failure email still fires unchanged. Quiet nights send nothing. This
+matters most if you are turning off GitHub's own notification email: that
+channel was probably what told you a review comment was waiting, and this is the
+replacement.
+
+`bin/gitbulk-merge-notify` is the same pattern for `merge --apply`: silent on a
+no-op night, mails the run summary when the merge run actually acted (including
+when a merge *failed*, which exit 2 would otherwise keep quiet).
 
 ## Surfacing attention in your shell
 
