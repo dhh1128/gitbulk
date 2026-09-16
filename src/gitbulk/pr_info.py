@@ -138,6 +138,12 @@ class ClosedPRRef:
     head_sha: str
     head_repo_slug: str | None
     closed_at: datetime
+    #: The PR author's login, or ``None`` when GitHub no longer reports it
+    #: (a deleted account). Load-bearing for the prune author guard (node
+    #: ``prathun7``): a branch is ours to delete only when the PR that
+    #: justifies deleting it was ours. ``None`` fails closed → keep.
+    #: Defaults so existing fixtures stay ergonomic.
+    author: str | None = None
 
     @property
     def state(self) -> str:

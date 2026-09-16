@@ -280,6 +280,16 @@ class GHClient(Protocol):
         """
         ...
 
+    def viewer_login(self, *, timeout: float | None = None) -> str:
+        """Return the authenticated user's GitHub login.
+
+        Read-only. gitbulk otherwise never learns it — ``my_open_prs``
+        passes the ``author:@me`` qualifier and lets GitHub resolve it
+        server-side — but the prune author guard (node ``prathun7``) has
+        to compare a PR's author against "me" locally.
+        """
+        ...
+
     def fetch_pr_comments(
         self,
         slug: str,
@@ -485,6 +495,7 @@ class FakeGHClient:
             tuple[str, int], "dict[str, Any] | Exception"
         ] | None = None,
         repo_permissions: Mapping[str, str] | None = None,
+        viewer_login: str = "dhh1128",
         archived: Mapping[str, "bool | Exception"] | None = None,
         branches: Mapping[str, "list[BranchRef] | Exception"] | None = None,
         closed_prs_for_head: Mapping[
@@ -540,6 +551,10 @@ class FakeGHClient:
         self._approve_responses = (
             dict(approve_responses) if approve_responses is not None else None
         )
+        #: The identity the prune author guard (node prathun7) compares
+        #: PR authors against. A plain default keeps existing fixtures
+        #: ergonomic; tests that exercise the guard set it explicitly.
+        self._viewer_login = viewer_login
         self._repo_permissions = (
             dict(repo_permissions) if repo_permissions is not None else None
         )
@@ -600,6 +615,7 @@ class FakeGHClient:
             "fetch_check_runs": 0,
             "prefetch_default_branches": 0,
             "approve_pr": 0,
+            "viewer_login": 0,
             "viewer_repo_permission": 0,
             "is_archived": 0,
             "list_branches": 0,
@@ -790,6 +806,10 @@ class FakeGHClient:
         if isinstance(outcome, Exception):
             raise outcome
         return dict(outcome)
+
+    def viewer_login(self, *, timeout: float | None = None) -> str:
+        self.call_count["viewer_login"] += 1
+        return self._viewer_login
 
     def viewer_repo_permission(
         self, slug: str, *, timeout: float | None = None
@@ -1240,6 +1260,9 @@ class ProductionGHClient:
         #: fall back to a per-slug REST call. Per-process only — not
         #: persisted to disk in this stage.
         self._default_branch_cache: dict[str, str] = {}
+        #: Memoized ``viewer_login()`` — one identity per process, asked
+        #: once per branch candidate by the prune author guard.
+        self._viewer_login: str | None = None
         #: Archived status, populated by the same coalesced prefetch
         #: (``isArchived`` is selected alongside ``defaultBranchRef``).
         #: ``is_archived`` consults this first and falls back to REST on
@@ -1773,6 +1796,19 @@ class ProductionGHClient:
             return "read"
         return "none"
 
+    def viewer_login(self, *, timeout: float | None = None) -> str:
+        # verified non-deprecated against gh CLI 2026-09-16
+        # (`gh api user --jq .login`; no warning on stderr. GraphQL
+        # `{viewer{login}}` is equally clean and is the fallback if the
+        # REST endpoint is ever flagged.)
+        # Cached for the process: one login per run, consulted once per
+        # branch candidate by the prune author guard (node prathun7).
+        if self._viewer_login is None:
+            self._viewer_login = self._run(
+                ("api", "user", "--jq", ".login"), timeout=timeout
+            ).strip()
+        return self._viewer_login
+
     def fetch_pr_comments(
         self,
         slug: str,
@@ -2005,7 +2041,8 @@ class ProductionGHClient:
                 "--jq",
                 ".[] | {number, title, url: .html_url, merged_at, "
                 "closed_at, base_ref: .base.ref, head_ref: .head.ref, "
-                "head_sha: .head.sha, head_repo: .head.repo.full_name}",
+                "head_sha: .head.sha, head_repo: .head.repo.full_name, "
+                "author: .user.login}",
             ),
             timeout=timeout,
         )
@@ -2039,6 +2076,7 @@ class ProductionGHClient:
                     head_sha=row.get("head_sha") or "",
                     head_repo_slug=row.get("head_repo"),
                     closed_at=_parse_iso8601(stamp),
+                    author=row.get("author"),
                 )
             )
         return out

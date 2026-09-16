@@ -110,12 +110,21 @@ def _open_pr(slug, number, *, head_ref, base_ref="main"):
     )
 
 
-def _closed(slug, number, *, head_ref, head_sha, merged=True, days_ago=30):
+#: The login FakeGHClient reports from viewer_login(). Fixtures default to
+#: authoring their PRs as this user so the author guard (node prathun7)
+#: passes; tests that exercise the guard pass ``author=`` explicitly.
+ME = "dhh1128"
+
+
+def _closed(
+    slug, number, *, head_ref, head_sha, merged=True, days_ago=30, author=ME
+):
     return ClosedPRRef(
         number=number, title=f"closed {number}", url="u", merged=merged,
         base_ref="main", head_ref=head_ref, head_sha=head_sha,
         head_repo_slug=slug,
         closed_at=NOW - timedelta(days=days_ago),
+        author=author,
     )
 
 
@@ -290,6 +299,90 @@ def test_classify_deletes_merged_with_matching_head_sha():
     )
     assert out["decision"] == "delete"
     assert fake.call_count["branch_ahead_by"] == 0  # short-circuited
+
+
+# ─── author guard (node prathun7) ─────────────────────────────────────────
+
+
+def test_classify_keeps_branch_whose_pr_someone_else_authored():
+    """The case that produced the guard: another maintainer's merged branch
+    on a repo we merely contribute to. It passes the data-loss guard — the
+    work is safely in main — and is still not ours to delete."""
+    pr = _closed(
+        "WebOfTrust/keripy", 1028, head_ref="SmithSamuelM-patch-1",
+        head_sha="a" * 40, days_ago=300, author="SmithSamuelM",
+    )
+    fake = FakeGHClient(
+        closed_prs_for_head={("WebOfTrust/keripy", "SmithSamuelM-patch-1"): [pr]},
+    )
+    out = _classify_branch(
+        fake, _policy(), "WebOfTrust/keripy", "main",
+        _br(name="SmithSamuelM-patch-1", sha="a" * 40), set(), set(), NOW,
+    )
+    assert out["decision"] == "skip"
+    assert "@SmithSamuelM" in out["reason"]
+    assert "not you" in out["reason"]
+    # Guard runs BEFORE the expensive compare call.
+    assert fake.call_count["branch_ahead_by"] == 0
+
+
+def test_classify_keeps_fully_merged_branch_from_another_authors_closed_pr():
+    """The signify-ts `development` shape: a long-lived branch whose only
+    PR was CLOSED (never merged) by someone else, which the fully-merged
+    arm would otherwise accept."""
+    pr = _closed(
+        "WebOfTrust/signify-ts", 248, head_ref="development",
+        head_sha="z" * 40, merged=False, days_ago=100, author="lenkan",
+    )
+    fake = FakeGHClient(
+        closed_prs_for_head={("WebOfTrust/signify-ts", "development"): [pr]},
+        branch_ahead_by={("WebOfTrust/signify-ts", "main", "development"): 0},
+    )
+    out = _classify_branch(
+        fake, _policy(), "WebOfTrust/signify-ts", "main",
+        _br(name="development", sha="a" * 40), set(), set(), NOW,
+    )
+    assert out["decision"] == "skip"
+    assert "@lenkan" in out["reason"]
+
+
+def test_classify_keeps_branch_when_author_is_unknown():
+    """Fails closed, per prdls2nq: a deleted account is not a licence."""
+    pr = _closed("o/r", 1, head_ref="feat", head_sha="a" * 40, author=None)
+    fake = FakeGHClient(closed_prs_for_head={("o/r", "feat"): [pr]})
+    out = _classify_branch(
+        fake, _policy(), "o/r", "main", _br(sha="a" * 40), set(), set(), NOW
+    )
+    assert out["decision"] == "skip"
+    assert "an unknown account" in out["reason"]
+
+
+def test_classify_keeps_branch_when_viewer_login_unavailable(monkeypatch):
+    """If we cannot establish who we are, we cannot establish what is ours."""
+    pr = _closed("o/r", 1, head_ref="feat", head_sha="a" * 40)
+    fake = FakeGHClient(closed_prs_for_head={("o/r", "feat"): [pr]})
+
+    def _boom(*a, **k):
+        raise GHError("gh auth token expired")
+
+    monkeypatch.setattr(fake, "viewer_login", _boom)
+    out = _classify_branch(
+        fake, _policy(), "o/r", "main", _br(sha="a" * 40), set(), set(), NOW
+    )
+    assert out["decision"] == "skip"
+    assert "could not determine the authenticated user" in out["reason"]
+
+
+def test_classify_records_author_on_a_delete_verdict():
+    """The verdict carries its own evidence, which is also what makes it
+    distinguishable from a pre-guard cached plan (see _is_cacheable)."""
+    pr = _closed("o/r", 1, head_ref="feat", head_sha="a" * 40)
+    fake = FakeGHClient(closed_prs_for_head={("o/r", "feat"): [pr]})
+    out = _classify_branch(
+        fake, _policy(), "o/r", "main", _br(sha="a" * 40), set(), set(), NOW
+    )
+    assert out["decision"] == "delete"
+    assert out["pr_author"] == ME
 
 
 def test_classify_deletes_when_fully_merged_into_default():
@@ -1045,7 +1138,11 @@ def test_is_fresh_cases():
 @pytest.mark.parametrize(
     "row,cacheable",
     [
-        ({"decision": "delete"}, True),
+        ({"decision": "delete", "pr_author": ME}, True),
+        # A delete verdict from a gitbulk that predates the author guard
+        # (node prathun7) carries no pr_author and must be re-derived
+        # rather than replayed inside the plan's freshness window.
+        ({"decision": "delete"}, False),
         ({"decision": "skip"}, True),                       # no PR → stable
         ({"decision": "skip", "pr_number": 1}, False),      # grace/data-loss
         ({"decision": "error"}, False),

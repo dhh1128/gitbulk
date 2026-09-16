@@ -274,6 +274,35 @@ def _classify_deep(
     base["pr_number"] = pr.number
     base["pr_state"] = pr.state
 
+    # Author guard (node prathun7). Everything below this point asks only
+    # "would deleting this ref lose work?", which is answered from the
+    # repo's own history and never from whose repo it is. A branch can be
+    # provably redundant and still not be ours to delete. gitbulk cleans up
+    # after itself and after nobody else, so the governing PR must be ours.
+    # Fails closed: an unknown author (deleted account) keeps the branch.
+    try:
+        me = gh.viewer_login()
+    except GHError as e:
+        return {
+            **base,
+            "decision": "skip",
+            "reason": f"could not determine the authenticated user: {e}",
+        }
+    if pr.author != me:
+        whose = f"@{pr.author}" if pr.author else "an unknown account"
+        return {
+            **base,
+            "decision": "skip",
+            "reason": (
+                f"PR #{pr.number} was authored by {whose}, not you — "
+                "gitbulk only prunes branches from its own PRs"
+            ),
+        }
+    # Recorded so the verdict carries its own evidence, and so a cached
+    # plan written before this guard existed is not replayable (see
+    # _is_cacheable).
+    base["pr_author"] = pr.author
+
     grace = policy_for(policy, slug).prune_min_age_days
     age_days = (now - pr.closed_at).days
     if age_days < grace:
@@ -573,7 +602,12 @@ def _is_cacheable(row: dict) -> bool:
     (node prnsh5kp)."""
     decision = row.get("decision")
     if decision == "delete":
-        return True
+        # A delete verdict is reusable only if it was reached with the
+        # author guard in force (node prathun7), which every such verdict
+        # records as ``pr_author``. A plan written by an older gitbulk has
+        # no such field, and replaying it inside the plan's freshness
+        # window would smuggle a pre-guard delete past the upgrade.
+        return "pr_author" in row
     if decision == "skip" and "pr_number" not in row:
         return True
     return False
@@ -593,6 +627,8 @@ def _reuse_classification(slug: str, branch, prior_row: dict) -> dict:
         out["pr_number"] = prior_row["pr_number"]
     if "pr_state" in prior_row:
         out["pr_state"] = prior_row["pr_state"]
+    if "pr_author" in prior_row:
+        out["pr_author"] = prior_row["pr_author"]
     return out
 
 

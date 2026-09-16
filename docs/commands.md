@@ -166,6 +166,22 @@ base of an open PR (the stacked-PR case), and never touches fork branches.
 Deletion goes through the GitHub ref API (not `git push --delete`), and the
 deleted SHA is recorded for recovery.
 
+It also **only prunes branches from its own PRs**: the merged-or-closed PR that
+justifies deleting a branch must have been authored by you. The other guards all
+ask "would deleting this lose work?", which is answered from the repo's history
+and never from whose repo it is — so without this one, a fleet that includes
+repos you merely contribute to will happily propose deleting another
+maintainer's merged branches, and every such proposal looks perfectly safe. An
+unknown author (a deleted account) keeps the branch, and so does a failure to
+establish who you are.
+
+Note what this rule is *not*. It is not a permission check: on a repo where you
+hold write access — exactly where the hazard is real, since without it the
+delete simply fails — "may I?" answers yes while "is this mine?" answers no. And
+it is not an owner allowlist; use `--org`/`--repo` if you want to narrow the
+fleet further. Your own merged branch in a shared org's repo still gets cleaned
+up, which is the common case and needs no configuration.
+
 ### `prune-worktrees`
 
 Removes local *linked* worktrees whose branch's only PRs are merged/closed,

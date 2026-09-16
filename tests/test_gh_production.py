@@ -2246,6 +2246,39 @@ def test_approve_pr_respects_timeout_kwarg():
     assert kwargs["timeout"] == 9.0
 
 
+# ─── viewer_login (node prathun7) ──────────────────────────────────────────
+
+
+def test_viewer_login_argv_and_strips_newline():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout="dhh1128\n"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        result = client.viewer_login()
+    assert result == "dhh1128"
+    args, _ = mock_run.call_args
+    assert args[0] == ["gh", "api", "user", "--jq", ".login"]
+
+
+def test_viewer_login_is_memoized():
+    """One identity per process: the author guard asks once per branch
+    candidate, and a 400-branch fleet must not mean 400 round trips."""
+    side_effect = _make_run_mock(_CompletedFake(0, stdout="dhh1128\n"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        assert client.viewer_login() == "dhh1128"
+        assert client.viewer_login() == "dhh1128"
+    assert mock_run.call_count == 1
+
+
+def test_viewer_login_respects_timeout_kwarg():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout="dhh1128\n"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        client = ProductionGHClient()
+        client.viewer_login(timeout=9.0)
+    _, kwargs = mock_run.call_args
+    assert kwargs["timeout"] == 9.0
+
+
 # ─── viewer_repo_permission (node aprmn5kq) ────────────────────────────────
 
 
