@@ -464,7 +464,11 @@ def _scan_branches(
         )
         if max_age <= 0:
             to_scan.append((repo, None))            # forced full re-verify
-        elif prior is not None and _is_fresh(prior, max_age, now):
+        elif (
+            prior is not None
+            and _is_fresh(prior, max_age, now)
+            and not _predates_author_guard(prior)
+        ):
             reuse.append((repo, prior))             # fresh: skip the repo
         else:
             to_scan.append((repo, prior))           # stale: rescan, SHA-reuse
@@ -595,6 +599,27 @@ def _is_fresh(entry: dict, max_age_minutes: int, now: datetime) -> bool:
         return False
     age_minutes = (now - analyzed).total_seconds() / 60.0
     return 0 <= age_minutes <= max_age_minutes
+
+
+def _predates_author_guard(entry: dict) -> bool:
+    """True if this repo's cached plan was written before the author guard
+    (node ``prathun7``) existed, and so must be re-scanned rather than
+    reused wholesale.
+
+    Whole-repo reuse copies prior rows verbatim and never re-runs
+    classification, so it is the one path ``_is_cacheable`` cannot police.
+    Evidence is the same either way: a delete verdict reached under the
+    guard records ``pr_author``, and one reached without it cannot. Caught
+    the hard way — the first live run after adding the guard still
+    proposed all 205 deletions, because every repo's plan was under an
+    hour old and the whole fleet took this branch.
+
+    Self-healing: one re-scan rewrites the plan with the field present.
+    """
+    return any(
+        row.get("decision") == "delete" and "pr_author" not in row
+        for row in entry.get("branches", [])
+    )
 
 
 def _is_cacheable(row: dict) -> bool:

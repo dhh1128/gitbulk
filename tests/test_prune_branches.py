@@ -939,6 +939,13 @@ def _corrupt_latest_state(text):
     (paths.latest_run_symlink("prune-branches").resolve() / "state.yaml").write_text(text)
 
 
+def _rewrite_latest_state(state):
+    import yaml as _yaml
+    (paths.latest_run_symlink("prune-branches").resolve() / "state.yaml").write_text(
+        _yaml.safe_dump(state, sort_keys=False)
+    )
+
+
 def _seed_one_repo_plan(monkeypatch, code_root, write_config, fresh_org_cache):
     """Run a dry-run that produces a one-repo plan, returning the fake."""
     write_config(repos_slugs=["dhh1128/alpha"])
@@ -1150,6 +1157,58 @@ def test_is_fresh_cases():
 )
 def test_is_cacheable(row, cacheable):
     assert pb._is_cacheable(row) is cacheable
+
+
+@pytest.mark.parametrize(
+    "entry,predates",
+    [
+        ({"branches": [{"decision": "delete", "pr_author": ME}]}, False),
+        ({"branches": [{"decision": "delete"}]}, True),
+        # A skip row has no pr_author and never needed one.
+        ({"branches": [{"decision": "skip", "pr_number": 1}]}, False),
+        ({"branches": []}, False),
+        ({}, False),
+        # One tainted row is enough to re-scan the whole repo.
+        (
+            {"branches": [
+                {"decision": "delete", "pr_author": ME},
+                {"decision": "delete"},
+            ]},
+            True,
+        ),
+    ],
+)
+def test_predates_author_guard(entry, predates):
+    assert pb._predates_author_guard(entry) is predates
+
+
+def test_fresh_plan_from_before_the_guard_is_rescanned(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache,
+):
+    """The bug the first live run exposed: whole-repo reuse copies prior
+    rows verbatim and never re-classifies, so a plan written under an hour
+    earlier by a pre-guard gitbulk kept every delete verdict and the guard
+    appeared to do nothing. Freshness alone is not enough — the plan has to
+    have been produced under the guard."""
+    fake = _seed_one_repo_plan(monkeypatch, code_root, write_config,
+                               fresh_org_cache)
+    assert fake.call_count["closed_prs_for_head"] == 1
+
+    # Strip pr_author from the plan on disk to simulate one written before
+    # the guard existed, leaving it perfectly fresh by the clock.
+    state = _latest_state()
+    for row in state["repos"]["dhh1128/alpha"]["branches"]:
+        row.pop("pr_author", None)
+    _rewrite_latest_state(state)
+
+    prune_branches_handler(_args(code_root=code_root))
+    # Rescanned rather than reused, despite being inside the 12h window.
+    assert fake.call_count["closed_prs_for_head"] == 2
+    # And the rewritten plan now carries the evidence, so the NEXT run may
+    # reuse it (self-healing).
+    assert _latest_state()["repos"]["dhh1128/alpha"]["branches"][0][
+        "pr_author"
+    ] == ME
 
 
 def test_second_dry_run_reuses_fresh_repo(
