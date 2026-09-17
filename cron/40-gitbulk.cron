@@ -1,0 +1,31 @@
+# cron-name: gitbulk PR automation and fleet hygiene
+# cron-boxes: kelun
+# cron-mailto: daniel.hardman@bakobo.com
+#
+# The fleet mail: the digest spans bakobo, WebOfTrust and provenant work, so it goes to the
+# bakobo address. msmtp still SENDS as daniel@provenant.net (that is the relay account); only
+# the recipient changes. Under the fragment mechanism this recipient applies to THIS block and
+# nothing else — cron-assemble emits a MAILTO per block precisely so a change here cannot run
+# downhill onto unrelated jobs, which is what it used to do.
+#
+# Staged automatically by `cron-sync` on any box named in cron-boxes above.
+# Run on ONE machine only — two boxes auto-merging the same PRs at 03:00 contend.
+
+# merge stays weekdays: landing a PR on a Saturday is a surprise nobody asked for.
+0 3 * * 1-5  /home/daniel/code/me/gitbulk/bin/gitbulk-merge-notify
+
+# report is NIGHTLY, and via -report-notify rather than -cron: reviews arrive on weekends too,
+# and the notify wrapper mails the run's digest.md when something is actually waiting
+# (unresolved review threads, or CI a merge broke). Silent otherwise -- exit 2 alone stays
+# email-silent exactly as before. This is the replacement for GitHub's own notification mail.
+30 3 * * * /home/daniel/code/me/gitbulk/bin/gitbulk-report-notify
+
+# Fleet hygiene, nightly. prune-worktrees is LOCAL-only and safe unattended: it removes linked
+# worktrees and local branches whose commits are provably already on a remote, git's own
+# dirty/lock refusals stand, and an untracked file blocks removal. prune-branches touches
+# REMOTE refs, so it is scoped to the two orgs Daniel owns. gitbulk's author guard is the
+# second layer, not the only one -- without --org this would reach WebOfTrust and trustoverip.
+# Spaced 30min apart because gitbulk-cron's flock makes an overlapping firing skip silently
+# rather than queue.
+0 4 * * * /home/daniel/code/me/gitbulk/bin/gitbulk-cron prune-worktrees --apply
+30 4 * * * /home/daniel/code/me/gitbulk/bin/gitbulk-cron prune-branches --apply --org dhh1128 --org bakobo
