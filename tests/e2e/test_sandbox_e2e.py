@@ -107,4 +107,9 @@ def test_linked_worktree_is_broken_in_sandbox(tmp_path):
     )
     result = _run_in_sandbox(wt, SANDBOX_FS_ONLY)
     assert result.returncode != 0
-    assert "not a git repository" in result.stderr.lower()
+    # git's wording for a .git file whose target is missing changed: older
+    # releases say "not a git repository", newer ones "gitfile does not point
+    # to a valid repository". Either is the failure this test controls for.
+    stderr = result.stderr.lower()
+    assert ("not a git repository" in stderr
+            or "gitfile does not point to a valid repository" in stderr), stderr
