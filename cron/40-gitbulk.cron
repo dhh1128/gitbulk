@@ -1,6 +1,6 @@
 # cron-name: gitbulk PR automation and fleet hygiene
 # cron-boxes: kelun
-# cron-mailto: daniel.hardman@bakobo.com
+# cron-mailto: daniel.hardman@gmail.com
 #
 # The fleet mail: the digest spans bakobo, WebOfTrust and provenant work, so it goes to the
 # bakobo address. msmtp still SENDS as daniel@provenant.net (that is the relay account); only
