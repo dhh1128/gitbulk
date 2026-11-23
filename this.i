@@ -2302,6 +2302,42 @@ Gitbulk Triage Tool = goal:
         delivered nowhere.
       approved-by: daniel, 2026-09-16
 
+    Review Requests From Others Join The Digest = decision:
+      id: rvrq7mkp
+      why: >
+        Extends dgcha7vv. Until now every PR report sees came from one search,
+        author:@me, so the digest could say "a reviewer is waiting on your
+        answer" but never "a colleague is waiting on your review". On
+        2026-11-23 a Tessera PR had requested the user's review for four days
+        and no run mentioned it. A review request is the clearest case of work
+        that is both small and waiting on one person, which is the test
+        dgcha7vv set for the digest.
+
+        It is a second search (is:pr is:open review-requested:@me
+        archived:false), separate from the fleet search and deliberately NOT
+        scoped to repos.txt. repos.txt lists where the user's own PRs live; a
+        colleague can ask for a review in any repo, and a request missed
+        because its repo was never listed is the failure this node exists to
+        stop. --org and --repo still narrow it, so a filtered run stays about
+        what it was filtered to. The qualifier matches requests made to a team
+        the user belongs to as well as direct ones, which is wanted: a team
+        request is also waiting on the user.
+
+        Bot-authored PRs are dropped (dependabot asks for review through
+        CODEOWNERS and is not a colleague waiting). Drafts are kept and
+        marked, because someone asked anyway.
+
+        The lookup is additive, so its failure is not a structural failure:
+        the report finishes, records a WARNING, and both summary.md and
+        digest.md say the lookup failed. Saying so in the digest means a
+        failed lookup sends mail. The alternative is silence that reads
+        exactly like "nobody is waiting on you", the one wrong answer this
+        channel must not give.
+
+        A pending request makes the run exit 2 (attention), consistent with
+        how the watchdog's findings count.
+      approved-by: daniel, 2026-11-23
+
     Semantic Terminal Color And Glyphs = decision:
       id: clr7sgqm
       why: >

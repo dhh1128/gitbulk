@@ -94,6 +94,22 @@ def _matches_repo(slug: str, spec: FilterSpec) -> bool:
     return True
 
 
+def slug_selected(slug: str, spec: FilterSpec) -> bool:
+    """True if ``slug`` passes the repo-level constraints, ignoring case.
+
+    For slugs that come from GitHub rather than repos.txt (node rvrq7mkp):
+    GitHub reports an owner in its canonical casing, which need not match
+    how the user typed ``--org``, and GitHub slugs are case-insensitive.
+    """
+    if not spec.constrains_repos:
+        return True
+    folded = FilterSpec(
+        orgs=tuple(o.casefold() for o in spec.orgs),
+        repo_globs=tuple(g.casefold() for g in spec.repo_globs),
+    )
+    return _matches_repo(slug.casefold(), folded)
+
+
 def select_repos(
     repos: list[RepoEntry], spec: FilterSpec
 ) -> tuple[list[RepoEntry], int]:
@@ -226,4 +242,5 @@ __all__ = [
     "resolve_filter_spec",
     "select_prs",
     "select_repos",
+    "slug_selected",
 ]

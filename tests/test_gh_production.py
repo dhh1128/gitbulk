@@ -2543,3 +2543,58 @@ def test_create_branch_ref_propagates_gherror():
     with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
         with pytest.raises(GHError):
             ProductionGHClient().create_branch_ref("o/r", "dup", "deadbeef")
+
+
+# ─── review_requested_prs (node rvrq7mkp) ──────────────────────────────────
+
+
+def _rr_node(number, *, typename="User", login="colleague", draft=False,
+             created="2026-11-19T19:15:15Z", slug="Org/Repo"):
+    return {
+        "number": number,
+        "title": f"PR {number}",
+        "url": f"https://github.com/{slug}/pull/{number}",
+        "isDraft": draft,
+        "createdAt": created,
+        "author": {"login": login, "__typename": typename},
+        "repository": {"nameWithOwner": slug},
+    }
+
+
+def test_review_requested_prs_sends_unscoped_review_requested_search():
+    side_effect = _make_run_mock(
+        _CompletedFake(0, stdout=json.dumps({"data": {"search": {"nodes": []}}}))
+    )
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect) as mock_run:
+        assert ProductionGHClient().review_requested_prs() == []
+
+    argv = mock_run.call_args[0][0]
+    q_value = argv[argv.index("-F") + 1]
+    assert q_value == "q=is:pr is:open review-requested:@me archived:false"
+    assert "repo:" not in q_value and "author:" not in q_value
+    query_doc = argv[argv.index("-f") + 1]
+    assert "__typename" in query_doc and "createdAt" in query_doc
+
+
+def test_review_requested_prs_parses_drops_bots_and_sorts_oldest_first():
+    payload = {"data": {"search": {"nodes": [
+        _rr_node(2, created="2026-11-20T00:00:00Z", draft=True),
+        _rr_node(9, typename="Bot", login="dependabot"),
+        None,
+        {},
+        _rr_node(1, created="2018-04-20T23:08:07Z", slug="Old/Repo"),
+        {**_rr_node(3), "author": None},
+    ]}}}
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        got = ProductionGHClient().review_requested_prs()
+
+    assert [(r.slug, r.number) for r in got] == [
+        ("Old/Repo", 1), ("Org/Repo", 3), ("Org/Repo", 2),
+    ]
+    old, ghost, draft = got
+    assert old.created_at == datetime(2018, 4, 20, 23, 8, 7, tzinfo=timezone.utc)
+    assert old.author == "colleague" and not old.is_draft
+    assert old.title == "PR 1" and old.url == "https://github.com/Old/Repo/pull/1"
+    assert ghost.author == ""
+    assert draft.is_draft

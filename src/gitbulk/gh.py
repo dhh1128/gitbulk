@@ -46,6 +46,7 @@ from gitbulk.pr_info import (
     ClosedPRRef,
     PRComment,
     PRInfo,
+    ReviewRequest,
     TimelineEvent,
 )
 from gitbulk.util.gitref import UnsafeGitValue, ensure_safe_ref, ensure_valid_sha
@@ -185,6 +186,17 @@ class GHClient(Protocol):
         several sequential multi-second GraphQL searches and otherwise
         looks like a hang (node 6bm7). Mirrors
         :meth:`prefetch_default_branches`.
+        """
+        ...
+
+    def review_requested_prs(
+        self, *, timeout: float | None = None
+    ) -> list[ReviewRequest]:
+        """Return open PRs, in any repo, whose review is requested from the
+        authenticated user, directly or through a team (node rvrq7mkp).
+
+        Not scoped to a slug list: a colleague can ask for a review in a
+        repo gitbulk does not track. Bot-authored PRs are dropped.
         """
         ...
 
@@ -513,8 +525,16 @@ class FakeGHClient:
         create_branch_responses: Mapping[
             tuple[str, str], "None | Exception"
         ] | None = None,
+        review_requested: "list[ReviewRequest] | Exception | None" = None,
     ) -> None:
         self._user = user
+        # Unlike the other canned responses, an unset review_requested means
+        # "nobody is waiting" rather than "raise": report calls this on every
+        # run, and its failure path is non-fatal, so raising by default would
+        # make every report test silently exercise the failure branch.
+        self._review_requested: "list[ReviewRequest] | Exception" = (
+            [] if review_requested is None else review_requested
+        )
         self._org_members = dict(org_members) if org_members is not None else None
         self._default_branches = (
             dict(default_branches) if default_branches is not None else None
@@ -624,6 +644,7 @@ class FakeGHClient:
             "branch_ref_sha": 0,
             "delete_branch_ref": 0,
             "create_branch_ref": 0,
+            "review_requested_prs": 0,
         }
 
     def authenticated_user(self, *, timeout: float | None = None) -> dict[str, Any]:
@@ -719,6 +740,14 @@ class FakeGHClient:
             for start in range(0, total, _OPEN_PRS_REPO_CHUNK):
                 on_progress(min(start + _OPEN_PRS_REPO_CHUNK, total), total)
         return result
+
+    def review_requested_prs(
+        self, *, timeout: float | None = None
+    ) -> list[ReviewRequest]:
+        self.call_count["review_requested_prs"] += 1
+        if isinstance(self._review_requested, Exception):
+            raise self._review_requested
+        return list(self._review_requested)
 
     def open_pr_heads(
         self,
@@ -1195,6 +1224,37 @@ query($q: String!, $after: String) {
 }
 """
 
+#: Search for review requests (node rvrq7mkp). Lean: only what the digest
+#: line needs, plus the author's __typename so bots can be dropped.
+_REVIEW_REQUESTED_GRAPHQL = """\
+query($q: String!, $after: String) {
+  search(query: $q, type: ISSUE, first: 100, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    nodes {
+      ... on PullRequest {
+        number
+        title
+        url
+        isDraft
+        createdAt
+        author { login __typename }
+        repository { nameWithOwner }
+      }
+    }
+  }
+}
+"""
+
+#: The search terms for :meth:`ProductionGHClient.review_requested_prs`.
+#: ``review-requested`` (not ``user-review-requested``) so a request made to
+#: one of the user's teams counts too.
+_REVIEW_REQUESTED_TERMS: tuple[str, ...] = (
+    "is:pr",
+    "is:open",
+    "review-requested:@me",
+    "archived:false",
+)
+
 
 def _parse_iso8601(value: str) -> datetime:
     """Parse a GitHub ISO-8601 timestamp (always ends in ``Z``) into an
@@ -1652,6 +1712,36 @@ class ProductionGHClient:
             pr = _pr_info_from_graphql_node(node)
             grouped.setdefault(pr.slug, []).append(pr)
         return grouped
+
+    def review_requested_prs(
+        self, *, timeout: float | None = None
+    ) -> list[ReviewRequest]:
+        # verified non-deprecated against gh CLI 2026-11-23
+        nodes = self._search_all_pages(
+            list(_REVIEW_REQUESTED_TERMS),
+            timeout=timeout,
+            query=_REVIEW_REQUESTED_GRAPHQL,
+        )
+        out: list[ReviewRequest] = []
+        for node in nodes:
+            if not node or "number" not in node:
+                continue
+            author_obj = node.get("author") or {}
+            if author_obj.get("__typename") == "Bot":
+                continue
+            out.append(
+                ReviewRequest(
+                    slug=node["repository"]["nameWithOwner"],
+                    number=int(node["number"]),
+                    title=node.get("title", ""),
+                    url=node["url"],
+                    author=author_obj.get("login", ""),
+                    is_draft=bool(node.get("isDraft")),
+                    created_at=_parse_iso8601(node["createdAt"]),
+                )
+            )
+        out.sort(key=lambda r: (r.created_at, r.slug, r.number))
+        return out
 
     def open_pr_heads(
         self,

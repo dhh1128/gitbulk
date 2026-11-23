@@ -34,7 +34,7 @@ from gitbulk.commands.report import (
 from gitbulk.gh import FakeGHClient, GHError
 from gitbulk.locks import LockTimeoutError
 from gitbulk.org_members_cache import CachedMembers, save_cache
-from gitbulk.pr_info import CheckRun, PRInfo
+from gitbulk.pr_info import CheckRun, PRInfo, ReviewRequest
 
 
 # ─── Fixtures ──────────────────────────────────────────────────────────────
@@ -1819,3 +1819,153 @@ def test_report_draft_marker_on_pr_line(
         ln for ln in summary.splitlines() if ln.startswith("https://github.com/")
     )
     assert "[DRAFT]" in pr_line
+
+
+# ─── Review requested from you (node rvrq7mkp) ─────────────────────────────
+
+
+def _review_request(
+    *, slug="Other-Org/elsewhere", number=357, author="colleague",
+    is_draft=False, title="Durable escrows",
+) -> ReviewRequest:
+    return ReviewRequest(
+        slug=slug,
+        number=number,
+        title=title,
+        url=f"https://github.com/{slug}/pull/{number}",
+        author=author,
+        is_draft=is_draft,
+        created_at=datetime(2026, 11, 19, 19, 15, tzinfo=timezone.utc),
+    )
+
+
+def _quiet_fake(**kw) -> FakeGHClient:
+    """One tracked repo with none of the user's own PRs, so anything in the
+    digest came from the review-request search."""
+    return FakeGHClient(
+        user={"login": "dhh1128"},
+        org_members={"provenant-dev": ["dhh1128"]},
+        default_branches={"dhh1128/alpha": "main"},
+        my_open_prs={"dhh1128/alpha": []},
+        **kw,
+    )
+
+
+def test_digest_review_requests_lead_and_render(
+    isolated_xdg, code_root, write_config
+):
+    _, repo, noisy, _ = _threads_fixture(code_root, write_config)
+    reqs = [
+        _review_request(),
+        _review_request(number=8, author="", is_draft=True, title="Ghostly"),
+    ]
+    digest = _build_digest_md([repo], {"x/a": [noisy]}, review_requests=reqs)
+    assert digest is not None
+    assert "## Review requested from you (2)" in digest
+    assert (
+        "https://github.com/Other-Org/elsewhere/pull/357  from colleague, "
+        "opened 2026-11-19  — Durable escrows"
+    ) in digest
+    assert "from a deleted account, opened 2026-11-19 [DRAFT]  — Ghostly" in digest
+    # Someone else is blocked, so it comes before the user's own threads.
+    assert digest.index("## Review requested") < digest.index(
+        "## Unresolved review threads"
+    )
+
+
+def test_digest_review_requests_alone_are_worth_mailing(
+    isolated_xdg, code_root, write_config
+):
+    _, repo, _, quiet = _threads_fixture(code_root, write_config)
+    digest = _build_digest_md(
+        [repo], {"x/a": [quiet]}, review_requests=[_review_request()]
+    )
+    assert digest is not None
+    assert "## Unresolved review threads" not in digest
+    assert _build_digest_md([repo], {"x/a": [quiet]}, review_requests=[]) is None
+
+
+def test_digest_says_when_review_lookup_failed(
+    isolated_xdg, code_root, write_config
+):
+    """Silence would read as 'nobody is waiting on you', so a failed lookup
+    is mailed rather than dropped (rvrq7mkp)."""
+    _, repo, _, quiet = _threads_fixture(code_root, write_config)
+    digest = _build_digest_md(
+        [repo], {"x/a": [quiet]}, review_lookup_error="gh failed: 502"
+    )
+    assert digest is not None
+    assert "## Review requested from you (lookup failed)" in digest
+    assert "Could not check for review requests: gh failed: 502" in digest
+
+
+def test_report_mails_review_request_from_untracked_repo(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = _quiet_fake(review_requested=[_review_request()])
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    rc = report_handler(_make_args(code_root=code_root))
+
+    assert rc == EXIT_ATTENTION_NEEDED
+    assert "1 review request(s)" in sentinel.parse_attention()["summary"]
+    latest = paths.latest_run_symlink("report").resolve()
+    digest = (latest / "digest.md").read_text()
+    assert "https://github.com/Other-Org/elsewhere/pull/357" in digest
+    summary = (latest / "summary.md").read_text()
+    assert "## Review requested from you (1)" in summary
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    assert state["review_requested"] == [{
+        "slug": "Other-Org/elsewhere",
+        "number": 357,
+        "title": "Durable escrows",
+        "url": "https://github.com/Other-Org/elsewhere/pull/357",
+        "author": "colleague",
+        "is_draft": False,
+        "created_at": "2026-11-19T19:15:00+00:00",
+    }]
+
+
+def test_report_org_filter_narrows_review_requests(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = _quiet_fake(review_requested=[_review_request()])
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    rc = report_handler(_make_args(code_root=code_root, org=["dhh1128"]))
+
+    assert rc == EXIT_OK
+    latest = paths.latest_run_symlink("report").resolve()
+    assert not (latest / "digest.md").exists()
+    state = yaml.safe_load((latest / "state.yaml").read_text())
+    assert "review_requested" not in state
+
+
+def test_report_review_lookup_failure_is_a_warning_not_a_failure(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = _quiet_fake(review_requested=GHError("search backend 502"))
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    rc = report_handler(_make_args(code_root=code_root))
+
+    assert rc == EXIT_OK
+    latest = paths.latest_run_symlink("report").resolve()
+    digest = (latest / "digest.md").read_text()
+    assert "lookup failed" in digest and "search backend 502" in digest
+    assert "lookup failed" in (latest / "summary.md").read_text()
+    errors = (latest / "errors.log").read_text()
+    assert "review_requested_prs failed" in errors
+    assert "WARNING" in errors
