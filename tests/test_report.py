@@ -2002,3 +2002,20 @@ def test_report_repo_filter_matching_only_a_review_request(
     latest = paths.latest_run_symlink("report").resolve()
     assert "pull/357" in (latest / "summary.md").read_text()
     assert "pull/357" in (latest / "digest.md").read_text()
+
+
+def test_summary_puts_review_requests_ahead_of_recent_merges(
+    isolated_xdg, code_root, write_config
+):
+    """Both artifacts lead with review requests, including when the watchdog
+    has something to say (Copilot on #31)."""
+    policy, repo, _, quiet = _threads_fixture(code_root, write_config)
+    wd = [{"slug": "x/a", "number": 42, "title": "Merged yesterday",
+           "merge_commit_sha": "b" * 40, "has_failure": False}]
+    md = _build_summary_md(
+        policy, [repo], [repo], [], {"x/a": [quiet]}, {"x/a": []}, 0,
+        watchdog_records=wd, review_requests=[_review_request()],
+    )
+    assert md.index("## Review requested from you") < md.index(
+        "## Recent merges"
+    )

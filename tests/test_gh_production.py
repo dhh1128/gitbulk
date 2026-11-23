@@ -2641,3 +2641,19 @@ def test_my_open_prs_still_tolerates_null_search():
     side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
     with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
         assert ProductionGHClient().my_open_prs(["a/x"]) == {"a/x": []}
+
+
+def test_review_requested_prs_turns_non_json_output_into_gherror():
+    """gh can exit 0 with a non-JSON body; on the strict path that must be a
+    GHError the report can show, not a JSONDecodeError (Copilot on #31)."""
+    side_effect = _make_run_mock(_CompletedFake(0, stdout="<html>502</html>"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        with pytest.raises(GHError, match="non-JSON"):
+            ProductionGHClient().review_requested_prs()
+
+
+def test_my_open_prs_non_json_output_behavior_unchanged():
+    side_effect = _make_run_mock(_CompletedFake(0, stdout="<html>502</html>"))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        with pytest.raises(json.JSONDecodeError):
+            ProductionGHClient().my_open_prs(["a/x"])

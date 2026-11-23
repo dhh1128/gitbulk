@@ -1633,7 +1633,17 @@ class ProductionGHClient:
                 argv.extend(["-f", f"after={cursor}"])
             argv.extend(["-f", f"query={query}"])
             stdout = self._run(tuple(argv), timeout=timeout)
-            payload = json.loads(stdout)
+            try:
+                payload = json.loads(stdout)
+            except json.JSONDecodeError as e:
+                if not strict:
+                    raise
+                # gh can exit 0 with a non-JSON body; on the strict path that
+                # is a failed lookup like any other, not an uncaught crash.
+                raise GHError(
+                    f"GraphQL search returned non-JSON output: {e}",
+                    command=tuple(argv),
+                ) from e
             if strict:
                 # node rvrq7mkp: a caller that reports an empty result as
                 # "nothing found" must not get [] from a failed search. gh

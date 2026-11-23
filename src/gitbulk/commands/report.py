@@ -312,6 +312,10 @@ def _build_summary_md(
         lines.append(f"Humans org: {policy.humans.org}")
     lines.append("")
 
+    # Review requests from other people (node rvrq7mkp) lead, as they do in
+    # digest.md: someone else is blocked until the user acts.
+    lines.extend(_review_section(review_requests or [], review_lookup_error))
+
     # Post-merge watchdog: surface CD failures BEFORE the open-PR list,
     # because they represent breakage from yesterday's merges and the
     # user likely cares about them first.
@@ -336,10 +340,6 @@ def _build_summary_md(
     # the watchdog, for the same reason: it is the subset of the open-PR
     # list that is waiting on the user rather than on CI or a reviewer, and
     # it is short enough to read. The PRs still appear in full below.
-    # Review requests from other people (node rvrq7mkp): same reasoning as
-    # the threads below, and ahead of them because someone else is blocked.
-    lines.extend(_review_section(review_requests or [], review_lookup_error))
-
     if threads_prs:
         lines.append(f"## Unresolved review threads ({len(threads_prs)})")
         lines.extend(_thread_lines(threads_prs))
