@@ -1969,3 +1969,36 @@ def test_report_review_lookup_failure_is_a_warning_not_a_failure(
     errors = (latest / "errors.log").read_text()
     assert "review_requested_prs failed" in errors
     assert "WARNING" in errors
+
+
+def test_summary_keeps_review_requests_when_no_repos_remain(
+    isolated_xdg, code_root, write_config
+):
+    """A filter can exclude every configured repo while a review request in an
+    untracked repo still matches; summary.md must not hide it behind the
+    'no repos' early return (hostile finding 4 on #31)."""
+    policy, _, _, _ = _threads_fixture(code_root, write_config)
+    md = _build_summary_md(
+        policy, [], [], [], {}, {}, 0,
+        review_requests=[_review_request()],
+    )
+    assert "No repos configured" in md
+    assert "https://github.com/Other-Org/elsewhere/pull/357" in md
+
+
+def test_report_repo_filter_matching_only_a_review_request(
+    monkeypatch, isolated_xdg, code_root, write_config, fresh_org_cache
+):
+    write_config(repos_slugs=["dhh1128/alpha"])
+    fresh_org_cache("provenant-dev", ["dhh1128"])
+    fake = _quiet_fake(review_requested=[_review_request()])
+    monkeypatch.setattr(
+        "gitbulk.commands.report.ProductionGHClient", lambda: fake
+    )
+
+    rc = report_handler(_make_args(code_root=code_root, org=["other-org"]))
+
+    assert rc == EXIT_ATTENTION_NEEDED
+    latest = paths.latest_run_symlink("report").resolve()
+    assert "pull/357" in (latest / "summary.md").read_text()
+    assert "pull/357" in (latest / "digest.md").read_text()

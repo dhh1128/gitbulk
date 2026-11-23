@@ -2598,3 +2598,46 @@ def test_review_requested_prs_parses_drops_bots_and_sorts_oldest_first():
     assert old.title == "PR 1" and old.url == "https://github.com/Old/Repo/pull/1"
     assert ghost.author == ""
     assert draft.is_draft
+
+
+@pytest.mark.parametrize("payload, match", [
+    ({"data": {"search": None}, "errors": [{"message": "Search backend failed"}]},
+     "Search backend failed"),
+    ({"data": {"search": {"nodes": []}}, "errors": ["bare string error"]},
+     "bare string error"),
+    ({"data": None}, "no search result"),
+    ([], "no search result"),
+])
+def test_review_requested_prs_raises_on_graphql_level_failure(payload, match):
+    """gh exits 0 on a GraphQL error; an empty list there would read as
+    'nobody is waiting' (hostile finding 1 on #31)."""
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        with pytest.raises(GHError, match=match):
+            ProductionGHClient().review_requested_prs()
+
+
+@pytest.mark.parametrize("node", [
+    {k: v for k, v in _rr_node(1).items() if k != "number"},
+    {**_rr_node(1), "repository": None},
+    {**_rr_node(1), "createdAt": "not a date"},
+    {**_rr_node(1), "author": "not-an-object"},
+])
+def test_review_requested_prs_fails_on_malformed_pr_node(node):
+    """A PR node that cannot be parsed fails the lookup as GHError, which the
+    report turns into 'lookup failed', instead of vanishing or escaping as a
+    TypeError (hostile findings 2 and 3 on #31)."""
+    payload = {"data": {"search": {"nodes": [node]}}}
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        with pytest.raises(GHError, match="malformed review-request"):
+            ProductionGHClient().review_requested_prs()
+
+
+def test_my_open_prs_still_tolerates_null_search():
+    """strict is opt-in: the fleet search keeps its old reading of a null
+    search as empty, so this PR does not change my_open_prs."""
+    payload = {"data": {"search": None}}
+    side_effect = _make_run_mock(_CompletedFake(0, stdout=json.dumps(payload)))
+    with patch("gitbulk.gh.subprocess.run", side_effect=side_effect):
+        assert ProductionGHClient().my_open_prs(["a/x"]) == {"a/x": []}

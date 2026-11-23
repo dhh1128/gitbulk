@@ -1256,6 +1256,20 @@ _REVIEW_REQUESTED_TERMS: tuple[str, ...] = (
 )
 
 
+def _raise_on_failed_search(payload: Any, argv: list[str]) -> None:
+    """Raise :class:`GHError` when a GraphQL search response carries errors
+    or no ``data.search`` object (node rvrq7mkp)."""
+    errors = payload.get("errors") if isinstance(payload, dict) else None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    search = data.get("search") if isinstance(data, dict) else None
+    if errors or not isinstance(search, dict):
+        detail = "; ".join(
+            str(e.get("message", e)) if isinstance(e, dict) else str(e)
+            for e in (errors or [])
+        ) or "no search result in response"
+        raise GHError(f"GraphQL search failed: {detail}", command=tuple(argv))
+
+
 def _parse_iso8601(value: str) -> datetime:
     """Parse a GitHub ISO-8601 timestamp (always ends in ``Z``) into an
     aware UTC ``datetime``. Kept local to gh.py because the rest of
@@ -1587,6 +1601,7 @@ class ProductionGHClient:
         *,
         timeout: float | None,
         query: str = _MY_OPEN_PRS_GRAPHQL,
+        strict: bool = False,
     ) -> list[dict[str, Any]]:
         """Run a search query, following ``pageInfo`` until exhausted.
 
@@ -1618,7 +1633,13 @@ class ProductionGHClient:
                 argv.extend(["-f", f"after={cursor}"])
             argv.extend(["-f", f"query={query}"])
             stdout = self._run(tuple(argv), timeout=timeout)
-            search = json.loads(stdout).get("data", {}).get("search", {}) or {}
+            payload = json.loads(stdout)
+            if strict:
+                # node rvrq7mkp: a caller that reports an empty result as
+                # "nothing found" must not get [] from a failed search. gh
+                # exits 0 on a GraphQL-level error, so read the payload.
+                _raise_on_failed_search(payload, argv)
+            search = payload.get("data", {}).get("search", {}) or {}
             nodes.extend(search.get("nodes", []) or [])
             page_info = search.get("pageInfo") or {}
             if not page_info.get("hasNextPage"):
@@ -1721,16 +1742,22 @@ class ProductionGHClient:
             list(_REVIEW_REQUESTED_TERMS),
             timeout=timeout,
             query=_REVIEW_REQUESTED_GRAPHQL,
+            strict=True,
         )
         out: list[ReviewRequest] = []
         for node in nodes:
-            if not node or "number" not in node:
+            if not node:
+                # null, or {} for a non-PR hit: not a review request.
                 continue
-            author_obj = node.get("author") or {}
-            if author_obj.get("__typename") == "Bot":
-                continue
-            out.append(
-                ReviewRequest(
+            # A node that is a PR but cannot be parsed fails the lookup
+            # instead of vanishing: the report turns GHError into a visible
+            # "lookup failed", and a dropped node would read as "nobody is
+            # waiting" (node rvrq7mkp).
+            try:
+                author_obj = node.get("author") or {}
+                if author_obj.get("__typename") == "Bot":
+                    continue
+                req = ReviewRequest(
                     slug=node["repository"]["nameWithOwner"],
                     number=int(node["number"]),
                     title=node.get("title", ""),
@@ -1739,7 +1766,11 @@ class ProductionGHClient:
                     is_draft=bool(node.get("isDraft")),
                     created_at=_parse_iso8601(node["createdAt"]),
                 )
-            )
+            except (AttributeError, KeyError, TypeError, ValueError) as e:
+                raise GHError(
+                    f"malformed review-request search result: {e!r}"
+                ) from e
+            out.append(req)
         out.sort(key=lambda r: (r.created_at, r.slug, r.number))
         return out
 

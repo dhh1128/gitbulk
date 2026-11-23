@@ -291,6 +291,11 @@ def _build_summary_md(
     if not all_repos:
         lines.append("No repos configured in repos.txt.")
         lines.append("")
+        # Review requests do not depend on repos.txt (node rvrq7mkp), so an
+        # empty or fully-filtered fleet must not hide them.
+        lines.extend(
+            _review_section(review_requests or [], review_lookup_error)
+        )
         return "\n".join(lines)
 
     threads_prs = _unresolved_thread_prs(passing_repos, prs_by_repo)
