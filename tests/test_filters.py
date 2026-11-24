@@ -18,6 +18,7 @@ from gitbulk.filters import (
     resolve_filter_spec,
     select_prs,
     select_repos,
+    slug_selected,
 )
 from gitbulk.pr_info import PRInfo
 
@@ -249,3 +250,22 @@ def test_resolve_cli_narrows_named_set():
 def test_resolve_unknown_filter_name_raises():
     with pytest.raises(ConfigError, match="not found"):
         resolve_filter_spec(_args(filter="nope"), Policy())
+
+
+# ─── slug_selected (node rvrq7mkp) ─────────────────────────────────────────
+
+
+def test_slug_selected_unconstrained_spec_keeps_everything():
+    assert slug_selected("Anyone/Anything", FilterSpec())
+
+
+def test_slug_selected_org_ignores_case():
+    spec = FilterSpec(orgs=("tessera-defense-systems-inc",))
+    assert slug_selected("Tessera-Defense-Systems-Inc/keri-oxidized", spec)
+    assert not slug_selected("WebOfTrust/keripy", spec)
+
+
+def test_slug_selected_repo_glob_ignores_case():
+    spec = FilterSpec(repo_globs=("*/KERI-*",))
+    assert slug_selected("Tessera-Defense-Systems-Inc/keri-oxidized", spec)
+    assert not slug_selected("Tessera-Defense-Systems-Inc/vanguard", spec)

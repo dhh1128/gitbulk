@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 import pytest
 
 from gitbulk.gh import FakeGHClient, GHClient, GHError, GHTimeoutError
-from gitbulk.pr_info import PRInfo
+from gitbulk.pr_info import PRInfo, ReviewRequest
 
 
 def _pr(
@@ -817,3 +817,39 @@ def test_fake_branch_ref_sha_unknown_branch_is_none():
 def test_fake_branch_ref_sha_errored_branches_entry_is_none():
     fake = FakeGHClient(branches={"o/r": GHError("listing failed")})
     assert fake.branch_ref_sha("o/r", "feat") is None
+
+
+# ─── review_requested_prs (node rvrq7mkp) ──────────────────────────────────
+
+
+def _review_request(number: int = 7) -> ReviewRequest:
+    return ReviewRequest(
+        slug="org/repo",
+        number=number,
+        title="Please look",
+        url=f"https://github.com/org/repo/pull/{number}",
+        author="colleague",
+        is_draft=False,
+        created_at=datetime(2026, 11, 19, tzinfo=timezone.utc),
+    )
+
+
+def test_fake_review_requested_defaults_to_nobody_waiting():
+    fake = FakeGHClient()
+    assert fake.review_requested_prs() == []
+    assert fake.call_count["review_requested_prs"] == 1
+
+
+def test_fake_review_requested_returns_configured_copy():
+    req = _review_request()
+    fake = FakeGHClient(review_requested=[req])
+    got = fake.review_requested_prs()
+    assert got == [req]
+    got.clear()
+    assert fake.review_requested_prs() == [req]
+
+
+def test_fake_review_requested_raises_configured_error():
+    fake = FakeGHClient(review_requested=GHError("search down"))
+    with pytest.raises(GHError, match="search down"):
+        fake.review_requested_prs()

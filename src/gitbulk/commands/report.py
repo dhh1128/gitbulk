@@ -50,6 +50,7 @@ from gitbulk.filters import (
     filter_summary_line,
     resolve_filter_spec,
     select_repos,
+    slug_selected,
 )
 from gitbulk.gh import GHClient, GHError, ProductionGHClient
 from gitbulk.commands._common import (
@@ -67,7 +68,7 @@ from gitbulk.org_members_cache import (
     OrgMembersRefreshError,
     ensure_org_members_fresh,
 )
-from gitbulk.pr_info import CheckRun, PRInfo
+from gitbulk.pr_info import CheckRun, PRInfo, ReviewRequest
 from gitbulk.runstate import RunState
 from gitbulk.util.progress import Progress
 from gitbulk.util.style import error_line, summary_line
@@ -191,10 +192,47 @@ def _thread_lines(prs: list[PRInfo]) -> list[str]:
     return lines
 
 
+def _review_lines(requests: list[ReviewRequest]) -> list[str]:
+    """Render the "review requested from you" list shared by summary.md and
+    digest.md (node rvrq7mkp), oldest request first as the caller sorted it."""
+    lines = []
+    for req in requests:
+        who = req.author or "a deleted account"
+        draft = " [DRAFT]" if req.is_draft else ""
+        lines.append(
+            f"{req.url}  from {who}, opened {req.created_at:%Y-%m-%d}{draft}"
+            f"  — {req.title}"
+        )
+    return lines
+
+
+def _review_section(
+    requests: list[ReviewRequest], lookup_error: str | None
+) -> list[str]:
+    """The whole review-request section, or ``[]`` when there is nothing to
+    say. A failed lookup is said out loud rather than shown as an empty
+    list, because silence would read as "nobody is waiting" (rvrq7mkp)."""
+    if lookup_error is not None:
+        return [
+            "## Review requested from you (lookup failed)",
+            f"Could not check for review requests: {lookup_error}",
+            "",
+        ]
+    if not requests:
+        return []
+    return [
+        f"## Review requested from you ({len(requests)})",
+        *_review_lines(requests),
+        "",
+    ]
+
+
 def _build_digest_md(
     passing_repos: list[RepoEntry],
     prs_by_repo: dict[str, list[PRInfo]],
     watchdog_records: list[dict] | None = None,
+    review_requests: list[ReviewRequest] | None = None,
+    review_lookup_error: str | None = None,
 ) -> str | None:
     """The mail body (node ``dgcha7vv``), or ``None`` when the run found
     nothing worth sending.
@@ -204,13 +242,18 @@ def _build_digest_md(
     answer, and CI that yesterday's merge broke. Everything else the run
     knows stays in summary.md. Counts, skip inventories and the filter
     line are omitted on purpose; this is a mail, not a report.
+
+    Review requests from other people lead (node rvrq7mkp): they are the
+    one item where someone else is blocked until the user acts.
     """
     threads_prs = _unresolved_thread_prs(passing_repos, prs_by_repo)
     broken = [r for r in (watchdog_records or []) if r.get("has_failure")]
-    if not threads_prs and not broken:
+    review = _review_section(review_requests or [], review_lookup_error)
+    if not threads_prs and not broken and not review:
         return None
 
     lines = ["# gitbulk: waiting on you", ""]
+    lines.extend(review)
     if threads_prs:
         lines.append(f"## Unresolved review threads ({len(threads_prs)})")
         lines.extend(_thread_lines(threads_prs))
@@ -238,6 +281,8 @@ def _build_summary_md(
     watchdog_records: list[dict] | None = None,
     skipped_entries: list[SkippedEntry] | None = None,
     filter_line: str | None = None,
+    review_requests: list[ReviewRequest] | None = None,
+    review_lookup_error: str | None = None,
 ) -> str:
     """Human-readable summary.md (this.i tp4kq2nr layer 3)."""
     watchdog_records = watchdog_records or []
@@ -246,6 +291,11 @@ def _build_summary_md(
     if not all_repos:
         lines.append("No repos configured in repos.txt.")
         lines.append("")
+        # Review requests do not depend on repos.txt (node rvrq7mkp), so an
+        # empty or fully-filtered fleet must not hide them.
+        lines.extend(
+            _review_section(review_requests or [], review_lookup_error)
+        )
         return "\n".join(lines)
 
     threads_prs = _unresolved_thread_prs(passing_repos, prs_by_repo)
@@ -261,6 +311,10 @@ def _build_summary_md(
     if policy.humans.org:
         lines.append(f"Humans org: {policy.humans.org}")
     lines.append("")
+
+    # Review requests from other people (node rvrq7mkp) lead, as they do in
+    # digest.md: someone else is blocked until the user acts.
+    lines.extend(_review_section(review_requests or [], review_lookup_error))
 
     # Post-merge watchdog: surface CD failures BEFORE the open-PR list,
     # because they represent breakage from yesterday's merges and the
@@ -850,6 +904,37 @@ def _run_under_lock(
 
     timer.mark("per_pr")
 
+    # 8a. Review requests from other people (node rvrq7mkp). A separate
+    # search, not scoped to repos.txt but narrowed by --org/--repo. Additive,
+    # so a failure is a WARNING and a visible line, never a structural exit.
+    review_requests: list[ReviewRequest] = []
+    review_lookup_error: str | None = None
+    try:
+        review_requests = [
+            r for r in gh.review_requested_prs() if slug_selected(r.slug, spec)
+        ]
+    except GHError as e:
+        review_lookup_error = str(e)
+        rs.record_error(
+            f"review_requested_prs failed: {e}", level="WARNING"
+        )
+    if review_requests:
+        rs.record_extra(
+            "review_requested",
+            [
+                {
+                    "slug": r.slug,
+                    "number": r.number,
+                    "title": r.title,
+                    "url": r.url,
+                    "author": r.author,
+                    "is_draft": r.is_draft,
+                    "created_at": r.created_at.isoformat(),
+                }
+                for r in review_requests
+            ],
+        )
+
     # 8b. Post-merge watchdog: scan recent merge runs for CD failures
     # on the resulting merge commits. Surfaces them in the summary and
     # forces ATTENTION if any are red.
@@ -879,6 +964,8 @@ def _run_under_lock(
         watchdog_records=watchdog_records,
         skipped_entries=skipped_entries,
         filter_line=fline,
+        review_requests=review_requests,
+        review_lookup_error=review_lookup_error,
     )
     rs.write_summary(summary_md)
 
@@ -886,7 +973,11 @@ def _run_under_lock(
     # actually waiting on the user (node dgcha7vv). Its absence is what
     # keeps the cron wrapper quiet, so do not write an empty file.
     digest_md = _build_digest_md(
-        passing_repos, prs_by_repo, watchdog_records=watchdog_records
+        passing_repos,
+        prs_by_repo,
+        watchdog_records=watchdog_records,
+        review_requests=review_requests,
+        review_lookup_error=review_lookup_error,
     )
     if digest_md is not None:
         rs.write_digest(digest_md)
@@ -894,7 +985,7 @@ def _run_under_lock(
     # 10. Compute exit code. Skipped repos.txt entries count toward
     # EXIT_INVARIANT_SKIPPED (3) — they're things the user can fix that
     # gitbulk routed around rather than acted on.
-    if attention_count > 0 or any_watchdog_failure:
+    if attention_count > 0 or any_watchdog_failure or review_requests:
         exit_code = EXIT_ATTENTION_NEEDED
     elif skipped_repos or skipped_entries:
         exit_code = EXIT_INVARIANT_SKIPPED
@@ -908,7 +999,8 @@ def _run_under_lock(
         f"{attention_count} PRs need attention; "
         f"{len(skipped_repos)} repos skipped; "
         f"{len(skipped_entries)} entries skipped; "
-        f"{wd_failed} recent-merge CD failure(s)"
+        f"{wd_failed} recent-merge CD failure(s); "
+        f"{len(review_requests)} review request(s)"
     )
     if fline:
         summary_text = f"{summary_text}; {fline}"

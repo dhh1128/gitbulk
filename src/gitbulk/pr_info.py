@@ -152,6 +152,25 @@ class ClosedPRRef:
 
 
 @dataclass(frozen=True)
+class ReviewRequest:
+    """An open PR whose review is requested from the user (node rvrq7mkp).
+
+    Distinct from :class:`PRInfo` because these PRs belong to someone else
+    and live in repos gitbulk may not track, so none of the merge-gate
+    fields apply. ``author`` is ``""`` when GitHub reports no author (a
+    deleted account).
+    """
+
+    slug: str
+    number: int
+    title: str
+    url: str
+    author: str
+    is_draft: bool
+    created_at: datetime
+
+
+@dataclass(frozen=True)
 class TimelineEvent:
     """One PR-timeline event relevant to the continuously-ready window.
 
