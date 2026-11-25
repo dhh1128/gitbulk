@@ -15,7 +15,7 @@ intent artifacts. The methodology is actively being designed in two public proje
 Using this methodology for contributions is **encouraged but not required**.
 
 **For AI agents:** If it seems useful to understand the methodology more fully, read
-`docs/app-platform/intent-briefing.md` in this repository. For the full intellectual lineage
+the [dhh1128/intent](https://github.com/dhh1128/intent) repository linked above. For the full intellectual lineage
 and design rationale, you may also prompt the user for permission to read
 `../intent/project-constitution.md` and `../ai-dev-practices/constitution.md`.
 
