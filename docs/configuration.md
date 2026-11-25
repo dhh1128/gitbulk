@@ -32,8 +32,8 @@ Three forms can be mixed freely:
 
 ```text
 # Provenant
-provenant-dev/origin-platform
-https://github.com/provenant-dev/origin-agent-svc
+provenant-dev/app-platform
+https://github.com/provenant-dev/app-agent-svc
 ~/code/work/special/nested-clone
 ```
 
@@ -78,10 +78,10 @@ matching `defaults.` value; list fields (`skip_checks`, `extra_checks`,
 
 ```yaml
 repos:
-  provenant-dev/origin-experimental-svc:
+  provenant-dev/app-lab-svc:
     merge_policy: ci-only
     min_business_days: 1
-  provenant-dev/origin-platform:
+  provenant-dev/app-platform:
     unresolved_burden: other   # acting as maintainer here, not contributor
     sacred_branches: [release/prod]   # never let prune-worktrees sweep this one
 ```

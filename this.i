@@ -89,7 +89,7 @@ Gitbulk Triage Tool = goal:
       id: nh4kp2rq
       why: >
         gitbulk follows the development methodology defined in
-        docs/methodology.md (copied from origin-platform): structured intent
+        docs/methodology.md (copied from app-platform): structured intent
         in this.i, the speculative interview before each phase of
         implementation, this.i commits ordered before the code commits they
         justify, named adversarial reviewer roles at gate boundaries,
@@ -301,7 +301,7 @@ Gitbulk Triage Tool = goal:
         operating against state we KNOW is about to change.
 
         Discovered the hard way 2026-05-28: PR #93 was merged by hand
-        into provenant-dev/origin-shim-svc; sibling PR #95 immediately
+        into provenant-dev/app-shim-svc; sibling PR #95 immediately
         went DIRTY. gitbulk's pr.mergeable_state_clean correctly
         Skipped it, but only because we hadn't already tried both in a
         single run. Without the guardrail, a multi-PR cron tick would
@@ -375,7 +375,7 @@ Gitbulk Triage Tool = goal:
         returns. CD workflows (cd.yml, deploy.yml, package-publish)
         often run AFTER the merge and can fail invisibly to gitbulk.
         Discovered 2026-05-28: a manual merge of #93 in
-        provenant-dev/origin-shim-svc broke cd.yml; gitbulk had no
+        provenant-dev/app-shim-svc broke cd.yml; gitbulk had no
         record. Two-call cost (one extra ``gh pr view`` per merged PR,
         one ``gh api check-runs`` per recent merge per report run) is
         small.
@@ -598,7 +598,7 @@ Gitbulk Triage Tool = goal:
       id: aprmn5kq
       why: >
         Problem surfaced by a 2026-05-30 smoke test against a green
-        Dependabot PR (provenant-dev/origin-sip-policy-lib#15): under the
+        Dependabot PR (provenant-dev/app-policy-lib#15): under the
         default ``strict`` merge_policy, ``pr.approved_per_policy`` requires
         an APPROVED review, so a perfectly green bot PR NEVER auto-merges —
         a maintainer must click "approve" by hand, forever. The user asked
@@ -3077,7 +3077,7 @@ Gitbulk Triage Tool = goal:
             primitive, packaging adds churn without leverage.
 
         (3) **Dependency hazard.** Option (a) would force gitbulk to
-            shell out to ../origin-platform/scripts/multiprompt.py,
+            shell out to ../app-platform/scripts/multiprompt.py,
             making gitbulk's cron health depend on a sibling repo's
             checkout state. Option (b) needs multiprompt to first do
             its own packaging work (per the now-also-resolved
@@ -3939,8 +3939,8 @@ Gitbulk Triage Tool = goal:
             effectively realized by the stale-decision logic (2aefqte7,
             e4yuzip6) rather than as named invariants; revisit only if a
             chain-level expression is wanted.
-          - Dispatch-only: repo.agentprep_verified,
-            repo.agentprep_initialized, system.resources_available
+          - Dispatch-only: repo.app-tools_verified,
+            repo.app-tools_initialized, system.resources_available
             (currently handler-validated, not invariants).
 
         TWO ADJACENT GAPS from the same gaps.md section:
@@ -4157,13 +4157,13 @@ Gitbulk Triage Tool = goal:
     Install And Distribution Strategy = decision:
       id: dstbr5kq
       why: >
-        Adopt a hybrid distribution model ported from agentprep: gitbulk
+        Adopt a hybrid distribution model ported from app-tools: gitbulk
         stays pip-installable (contributors, pipx users) AND ships a single
         self-contained zipapp executable fetched from a GitHub release.
         This SUPERSEDES the design-notes §10 "out of scope for v1" line that
         deferred a bundled executable — end-user install friction (clone +
         venv + pip) is the thing stopping gitbulk from being usable on a
-        fresh machine or by anyone but its author, and the agentprep model
+        fresh machine or by anyone but its author, and the app-tools model
         is already proven and maintained by the same author, so the
         marginal cost is a near-mechanical port. Cost: two distribution
         channels to keep coherent; mitigated by a single version source
@@ -4176,7 +4176,7 @@ Gitbulk Triage Tool = goal:
           why: >
             The end-user artifact is a stdlib `zipapp` (shebang
             /usr/bin/env python3) named `gitbulk`, built by a `bundle`
-            subcommand — same mechanism as agentprep's bundle.py. Chosen
+            subcommand — same mechanism as app-tools's bundle.py. Chosen
             over PyInstaller/shiv/pex because it needs no per-platform build
             matrix and no compiler: it is a portable archive that runs on
             any POSIX box with Python 3.10+, which the user already has
@@ -4232,7 +4232,7 @@ Gitbulk Triage Tool = goal:
             bin/gitbulk-cron sets that env var belt-and-suspenders; the
             self-management commands (update/install/bundle) skip the notice
             since it is pointless before them. This is stricter than
-            agentprep (which prints the notice even non-interactively)
+            app-tools (which prints the notice even non-interactively)
             BECAUSE gitbulk's primary runtime is a 3 a.m. cron job: a nightly
             notice is log noise, and swapping a running zipapp underneath a
             long cron run risks lazy-import failures. apply_update still
@@ -4253,7 +4253,7 @@ Gitbulk Triage Tool = goal:
             inside a site-packages tree / is not a zip). If it looks
             pip-installed it refuses to self-replace and tells the user to
             `pip install -U` / `pipx upgrade gitbulk` instead. Chosen over
-            agentprep's unconditional "replace sys.argv[0]" because
+            app-tools's unconditional "replace sys.argv[0]" because
             overwriting a venv entry-point shim with a downloaded zipapp
             would corrupt that install. Cost: a little detection logic and
             an extra branch to test; cheap insurance against bricking a
@@ -4263,7 +4263,7 @@ Gitbulk Triage Tool = goal:
           id: shano4kp
           why: >
             update.json carries the binary's sha256 and apply_update rejects
-            a mismatch; the optional HMAC manifest signature agentprep
+            a mismatch; the optional HMAC manifest signature app-tools
             supports (AGENTPREP_UPDATE_SECRET) is intentionally NOT ported.
             For a single-user tool fetched over authenticated gh from the
             author's own repo, the residual threat HMAC addresses — a
@@ -4296,7 +4296,7 @@ Gitbulk Triage Tool = goal:
             zipapp's __init__.py because a zipapp has no .dist-info for
             importlib.metadata to read at runtime. Chosen over the current
             duplicated literal (which silently drifts between pyproject and
-            __init__.py) — this is exactly agentprep's pattern and removes a
+            __init__.py) — this is exactly app-tools's pattern and removes a
             class of "reported version is wrong" bugs. Cost: __version__ is
             no longer a grep-able literal in source; accepted.
 
@@ -4309,7 +4309,7 @@ Gitbulk Triage Tool = goal:
             .github/workflows/release.yml on the tag, which
             pip-installs, builds the bundle, generates update.json
             (latest_version / script_url / sha256), and publishes both as
-            release assets. Chosen as a direct port of agentprep's proven
+            release assets. Chosen as a direct port of app-tools's proven
             release path so the author maintains one mental model across
             both tools. release.py is human-run (AGENTS.md reserves pushes
             to main and tags for humans; AI never runs it). The `uv lock`

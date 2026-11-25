@@ -46,7 +46,7 @@ def readme_url():
     Derived from ``git remote get-url origin`` (never hard-coded) so it stays
     correct if the repo is renamed or moved. Returns None for a non-GitHub
     remote, a missing remote, or a non-repo checkout — the caller then omits
-    the epilog. Unlike agentprep's version we do NOT consult
+    the epilog. Unlike app-tools's version we do NOT consult
     importlib.metadata: this script lives in scripts/, is never shipped in the
     package or placed on PATH, and only ever runs from this source checkout,
     so the git remote is the one reliable source.

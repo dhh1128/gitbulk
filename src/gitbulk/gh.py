@@ -1901,7 +1901,7 @@ class ProductionGHClient:
         # verified non-deprecated against gh CLI 2026-05-30
         # (`gh api repos/<slug> --jq .permissions` returns the current
         # {admin,maintain,push,triage,pull} boolean shape; verified live
-        # against provenant-dev/origin-sip-policy-lib with no deprecation
+        # against provenant-dev/app-policy-lib with no deprecation
         # warning on stderr.)
         stdout = self._run(
             ("api", f"repos/{slug}", "--jq", ".permissions"),

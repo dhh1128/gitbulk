@@ -21,7 +21,7 @@ def _write_repos(tmp_path: Path, content: str) -> Path:
 
 
 def test_basic_load(tmp_path):
-    path = _write_repos(tmp_path, "dhh1128/gitbulk\nprovenant-dev/origin-platform\n")
+    path = _write_repos(tmp_path, "dhh1128/gitbulk\nprovenant-dev/app-platform\n")
     code_root = tmp_path / "code"
     entries, _skipped = load_repos(path, code_root=code_root)
     assert len(entries) == 2
@@ -32,8 +32,8 @@ def test_basic_load(tmp_path):
         local_path=code_root / "gitbulk",
         source_line=1,
     )
-    assert entries[1].slug == "provenant-dev/origin-platform"
-    assert entries[1].local_path == code_root / "origin-platform"
+    assert entries[1].slug == "provenant-dev/app-platform"
+    assert entries[1].local_path == code_root / "app-platform"
 
 
 def test_comments_and_blank_lines_ignored(tmp_path):
@@ -43,7 +43,7 @@ def test_comments_and_blank_lines_ignored(tmp_path):
 dhh1128/gitbulk
    # indented comment
 
-provenant-dev/origin-platform   # trailing comment with whitespace
+provenant-dev/app-platform   # trailing comment with whitespace
 # trailing comment
 
 """
@@ -51,7 +51,7 @@ provenant-dev/origin-platform   # trailing comment with whitespace
     entries, _skipped = load_repos(path, code_root=tmp_path / "code")
     assert [e.slug for e in entries] == [
         "dhh1128/gitbulk",
-        "provenant-dev/origin-platform",
+        "provenant-dev/app-platform",
     ]
     # Source lines reflect the original file lines, not the de-commented sequence
     assert entries[0].source_line == 4
@@ -149,7 +149,7 @@ def test_security_hardened_slug_regex_skips_in_repos(tmp_path):
 def test_duplicate_slug_keeps_first_silently(tmp_path, caplog):
     """First-wins dedup is silent (DEBUG-only) per the design that
     duplicates are harmless and don't warrant a WARNING."""
-    content = "dhh1128/gitbulk\nprovenant-dev/origin-platform\ndhh1128/gitbulk\n"
+    content = "dhh1128/gitbulk\nprovenant-dev/app-platform\ndhh1128/gitbulk\n"
     path = _write_repos(tmp_path, content)
     with caplog.at_level(logging.WARNING, logger="gitbulk.config"):
         entries, _skipped = load_repos(path, code_root=tmp_path / "code")
@@ -360,7 +360,7 @@ def test_mixed_forms_in_one_repos_txt(tmp_path):
     )
     content = (
         "dhh1128/gitbulk\n"  # canonical
-        "https://github.com/provenant-dev/origin-platform\n"  # URL
+        "https://github.com/provenant-dev/app-platform\n"  # URL
         f"{repo}\n"  # path
     )
     path = _write_repos(tmp_path, content)
@@ -368,12 +368,12 @@ def test_mixed_forms_in_one_repos_txt(tmp_path):
     entries, _skipped = load_repos(path, code_root=code_root)
     assert [e.slug for e in entries] == [
         "dhh1128/gitbulk",
-        "provenant-dev/origin-platform",
+        "provenant-dev/app-platform",
         "dhh1128/intent",
     ]
     # path-form entry uses the explicit path, the others use code_root.
     assert entries[0].local_path == code_root / "gitbulk"
-    assert entries[1].local_path == code_root / "origin-platform"
+    assert entries[1].local_path == code_root / "app-platform"
     assert entries[2].local_path == repo.resolve()
 
 

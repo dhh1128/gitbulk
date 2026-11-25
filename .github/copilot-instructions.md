@@ -4,9 +4,9 @@ These rules apply to every PR. Path-scoped files in `.github/instructions/` add 
 
 ## Repository context — read before reviewing
 
-- **Sibling-repo references in AGENTS.md are intentional.** Paths like `../origin-platform/`, `../origin-sip-policy-admin/`, or any other `../sibling/` pattern are cross-repository references to sibling repos on disk and on GitHub. They are not broken local links. Do not flag them.
+- **Sibling-repo references in AGENTS.md are intentional.** Paths like `../app-platform/`, `../app-policy-admin/`, or any other `../sibling/` pattern are cross-repository references to sibling repos on disk and on GitHub. They are not broken local links. Do not flag them.
 - **`docs/methodology.md` and `this.i` may be absent.** AGENTS.md instructs that these files be created or copied from a sibling repo over time. Their absence in a newly initialized repository is expected and is not a finding.
-- **The pre-commit hook in `.githooks/pre-commit` requires no `core.hooksPath` setting and is not inactive.** `agentprep init` and `agentprep certify` copy it to `.git/hooks/pre-commit` outside of version control; `.githooks/pre-commit` is the committed source of that copy. Do **not** flag `.githooks/pre-commit` as unconfigured, inactive, unregistered, or lacking a `core.hooksPath` entry — the install mechanism is agentprep tooling, not git config.
+- **The pre-commit hook in `.githooks/pre-commit` requires no `core.hooksPath` setting and is not inactive.** `app-tools init` and `app-tools certify` copy it to `.git/hooks/pre-commit` outside of version control; `.githooks/pre-commit` is the committed source of that copy. Do **not** flag `.githooks/pre-commit` as unconfigured, inactive, unregistered, or lacking a `core.hooksPath` entry — the install mechanism is app-tools tooling, not git config.
 
 ## Light mode
 

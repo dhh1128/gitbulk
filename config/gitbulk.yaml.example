@@ -42,14 +42,14 @@ bots:                            # known non-human accounts; extend as needed
 # (skip_checks, extra_checks) are APPENDED to the defaults list rather
 # than replacing it.
 repos: {}
-  # provenant-dev/origin-experimental-svc:
+  # provenant-dev/app-lab-svc:
   #   merge_policy: ci-only
   #   min_business_days: 1
   # someorg/personal-project:
-  #   skip_checks: [repo.agentprep_verified]
-  # provenant-dev/origin-platform:
+  #   skip_checks: [repo.app-tools_verified]
+  # provenant-dev/app-platform:
   #   unresolved_burden: other     # acting as maintainer here, not contributor
-  # provenant-dev/origin-canonical-history-svc:
+  # provenant-dev/app-history-svc:
   #   merge_method: squash         # this repo wants squash, not the default merge commit
 
 # Disposable worktree root. Defaults to ~/.cache/gitbulk/worktrees/

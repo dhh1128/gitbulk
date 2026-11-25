@@ -4,7 +4,7 @@
 ``gitbulk update`` fetches ``update.json`` from the latest GitHub release,
 compares versions, downloads the new binary (over authenticated ``gh`` when
 the URL is a GitHub release asset), verifies its sha256, and atomically
-replaces the running binary in place. Distinctive choices vs agentprep:
+replaces the running binary in place. Distinctive choices vs app-tools:
 
 * **sha256 only** — no HMAC manifest signature (node ``shano4kp``).
 * **refuse to clobber a pip install** — :func:`running_as_zipapp` lets the
