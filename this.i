@@ -2308,7 +2308,7 @@ Gitbulk Triage Tool = goal:
         Extends dgcha7vv. Until now every PR report sees came from one search,
         author:@me, so the digest could say "a reviewer is waiting on your
         answer" but never "a colleague is waiting on your review". On
-        2026-11-23 a Tessera PR had requested the user's review for four days
+        2026-11-23 a PR in another org had requested the user's review for four days
         and no run mentioned it. A review request is the clearest case of work
         that is both small and waiting on one person, which is the test
         dgcha7vv set for the digest.

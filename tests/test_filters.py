@@ -260,12 +260,12 @@ def test_slug_selected_unconstrained_spec_keeps_everything():
 
 
 def test_slug_selected_org_ignores_case():
-    spec = FilterSpec(orgs=("tessera-defense-systems-inc",))
-    assert slug_selected("Tessera-Defense-Systems-Inc/keri-oxidized", spec)
+    spec = FilterSpec(orgs=("example-org",))
+    assert slug_selected("Example-Org/keri-widget", spec)
     assert not slug_selected("WebOfTrust/keripy", spec)
 
 
 def test_slug_selected_repo_glob_ignores_case():
     spec = FilterSpec(repo_globs=("*/KERI-*",))
-    assert slug_selected("Tessera-Defense-Systems-Inc/keri-oxidized", spec)
-    assert not slug_selected("Tessera-Defense-Systems-Inc/vanguard", spec)
+    assert slug_selected("Example-Org/keri-widget", spec)
+    assert not slug_selected("Example-Org/billing", spec)
