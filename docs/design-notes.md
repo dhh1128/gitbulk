@@ -183,8 +183,8 @@ so an audit can find every loosened operation.
   persistent state across runs)
 
 **Dispatch-only:**
-- `repo.agentprep_verified` — runs `agentprep verify` in the clone
-- `repo.agentprep_initialized`
+- `repo.app-tools_verified` — runs `app-tools verify` in the clone
+- `repo.app-tools_initialized`
 - `prompt.exists_and_nonempty`
 - `system.resources_available`
 
@@ -244,7 +244,7 @@ to `~/.cache/gitbulk/cron/<timestamp>-<subcommand>.log` and symlinks
   `claude -p`, write LLM output into the run dir.
 - **Phase 4 — `dispatch`**: per-PR worktree, headless `claude`,
   log capture, concurrency cap of 2 (matches user's subagent rule).
-  `repo.agentprep_verified` wired in.
+  `repo.app-tools_verified` wired in.
 - **Phase 5 — Mutating subcommands**: `rebase-onto-default` first
   (teaches the push/lease patterns), then `merge`, then `close-stale`
   (which depends on persistent state for the `pr.previously_warned`
@@ -260,7 +260,7 @@ discipline per phase.
 - A web UI.
 - External notification adapters (ntfy, slack, desktop). Layers 5+ in
   the design — explicitly deferred.
-- ~~A bundled single-file executable like agentprep ships. `pip install
+- ~~A bundled single-file executable like app-tools ships. `pip install
   -e .` is fine for v1.~~ **Superseded 2026-05-29** (`this.i` node
   `dstbr5kq`): gitbulk now ships a hybrid distribution — it stays
   pip-installable AND ships a single self-contained zipapp fetched from a

@@ -8,7 +8,7 @@ triage is auditable.*
 Last updated: 2026-06-03 · Scope: gitbulk as built at `8ecc50a` (v0.6.2),
 the workstation it runs on, the GitHub fleet it acts against, and the project's
 own software supply chain. Cross-references
-`../origin-platform/docs/github-supply-chain-security-standards.md` (cited below
+`../app-platform/docs/github-supply-chain-security-standards.md` (cited below
 as **SC §n**).
 
 ---

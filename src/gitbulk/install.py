@@ -6,7 +6,7 @@
 ``bin/gitbulk-cron`` searches), marks it executable, and prints a
 shell-specific PATH hint if that directory is not already on ``PATH``.
 This is the second half of the bootstrap one-liner
-(``gh release download … && ./gitbulk install``). Ported from agentprep.
+(``gh release download … && ./gitbulk install``). Ported from app-tools.
 """
 
 from __future__ import annotations

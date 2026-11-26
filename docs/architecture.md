@@ -149,7 +149,7 @@ Tensions (deferred decisions, do not resolve silently):
 - `mp7kn4qz` Dispatch execution kernel — **resolved** in Phase 4 via
   `execk7nm` (in-tree reimplementation, not subprocess multiprompt).
 - `fw5kq6np` Multiprompt packaging future — **resolved** via `mprmpkg4`
-  (multiprompt stays in origin-platform; gitbulk does not depend on it).
+  (multiprompt stays in app-platform; gitbulk does not depend on it).
 - `ck7n4pqr` Scan / findings artifact convention — still open; deferred
   to whenever a `scan` subcommand is actually built.
 - `jw3kpn4q` Repo cleanup subcommand scope — **resolved**: shipped as
@@ -416,7 +416,7 @@ same §7 skeleton with their own per-PR/per-branch action step):
      from AGENTS.md: if `git worktree add` silently failed, the
      `is_relative_to(worktree_root)` check rejects the fallback eagerly
      before any write happens.
-   - `agentprep verify` runs in the worktree before claude is invoked
+   - `app-tools verify` runs in the worktree before claude is invoked
      (AGENTS.md managed block).
 4. **`exec.execute_targets(targets, ...)`** — bounded ThreadPoolExecutor
    (`--concurrency`, default 2), per-target wall-clock timeout
@@ -538,7 +538,7 @@ Crossed-out phases are landed and verified.
   / `--model` overrides~~ ✓
 - ~~**Phase 4** — `dispatch`: `worktree.py`, `exec.py` bounded
   parallel kernel, `commands/dispatch.py`, dry-run default,
-  agentprep integration~~ ✓
+  app-tools integration~~ ✓
 - ~~**Phase 5** — Mutating subcommands: `rebase-pr`, `merge`,
   `close-stale`. Added the mutating methods on the `GHClient` Protocol
   (`merge_pr`, `close_pr`, `delete_branch_ref`, …) and per-repo exclusive

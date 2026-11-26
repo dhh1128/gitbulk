@@ -3,13 +3,13 @@
 # ACCEPTED FORMS (mix freely):
 #
 #   1. Canonical slug: owner/repo
-#        provenant-dev/origin-platform
+#        provenant-dev/app-platform
 #      Local clone assumed at <code-root>/<repo-name>.
 #
 #   2. GitHub URL (HTTPS or SSH): gitbulk parses the slug from the URL.
-#        https://github.com/provenant-dev/origin-platform
-#        git@github.com:provenant-dev/origin-platform.git
-#        ssh://git@github.com/provenant-dev/origin-platform
+#        https://github.com/provenant-dev/app-platform
+#        git@github.com:provenant-dev/app-platform.git
+#        ssh://git@github.com/provenant-dev/app-platform
 #      Local clone still assumed at <code-root>/<repo-name>.
 #
 #   3. Local path: gitbulk runs `git -C <path> remote get-url origin` to
@@ -17,7 +17,7 @@
 #      location (overriding <code-root>/<repo-name>). Useful when your
 #      clones aren't organized by basename (nested categories, duplicate
 #      basenames across owners, etc.).
-#        /home/daniel/code/origin-platform
+#        /home/daniel/code/app-platform
 #        ~/code/work/special/nested-clone
 #
 # REJECTED (these will fail with a friendly error message):
@@ -37,10 +37,10 @@
 #     forms 1 or 2; form 3 already pins the clone location explicitly.
 
 # Provenant
-provenant-dev/origin-platform
-provenant-dev/origin-agent-svc
-provenant-dev/origin-clerk-svc
-provenant-dev/agentprep
+provenant-dev/app-platform
+provenant-dev/app-agent-svc
+provenant-dev/app-clerk-svc
+provenant-dev/app-tools
 
 # Open source
 # hyperledger/aries-cloudagent-python

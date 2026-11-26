@@ -369,13 +369,13 @@ Adopt this stance toward it:
 
 For the full context of what `.i` files are, the intellectual lineage of this system, what makes
 a `why` field adequate, and what triggers a required `this.i` update, read `docs/methodology.md`
-(or, if none is present, copy it into this repo from `../origin-platform/docs/origin-platform` and then read it).
+(or, if none is present, copy it into this repo from `../app-platform/docs/app-platform` and then read it).
 DO NOT modify code here without understanding the methodology. You should have a clear idea of
 what a "speculative interview" is, how it's done, and where its output is recorded; what a "tension"
 is in intent; how "marks" work; how we use Fowler's _Refactoring_ discipline to continually improve DRY, encapsulation, and names in code.
 
 If you don't see a `this.i` in this repo's root, you must create one. To understand how, study one in
-a sibling repo (`../origin-sip-policy-admin` has an excellent example). Notice how it relates to code
+a sibling repo (`../app-policy-admin` has an excellent example). Notice how it relates to code
 but explains things that are often missing from the code. Then use sources like the code, `README.md`,
 and `docs/*.md` (possibly creating `docs/architecture.md` using the `generate-arch-doc.md` prompt if
 needed) to form theories about design decisions in this codebase. Then interview the user to confirm

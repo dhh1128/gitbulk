@@ -12,7 +12,7 @@ Schema::
 
     schema_version: 1
     branches:
-      provenant-dev/origin-platform:
+      provenant-dev/app-platform:
         branch: main
         fetched_at: 2026-05-29T14:02:00+00:00
       dhh1128/gitbulk:

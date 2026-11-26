@@ -2,7 +2,7 @@
 
 Per this.i node ``execk7nm`` (resolves tension mp7kn4qz), this module
 reimplements the bounded-parallel claude executor that
-``../origin-platform/scripts/multiprompt.py`` provides for its own use
+``../app-platform/scripts/multiprompt.py`` provides for its own use
 case. The in-tree implementation lets gitbulk's dispatch subcommand
 ship without taking a cross-repo dependency.
 
